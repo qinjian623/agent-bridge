@@ -34,7 +34,7 @@ def priced_usage(usage, price):
     result["actual_billed_usd"] = None
     if price and result.get("priced_models") and set(result["priced_models"]) != {price.get("model")}:
         price = None
-    if not price:
+    if not price or result.get("pricing_supported") is False:
         return result
     validate_price(price)
     tokens = {key: result.get(key) for key in TOKEN_FIELDS}

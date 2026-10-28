@@ -29,7 +29,7 @@ def main(args):
         for record in records:
             session = store.get_session(record["session_id"]) if record.get("session_id") else None
             runtime = session["profile"]["runtime"] if session else record["runtime"]
-            if runtime == "pi":
+            if runtime in {"pi", "antigravity"}:
                 continue
             native = ("claude:" if runtime == "claude" else "") + (
                 session["native_id"] if session else record["native_session_id"]

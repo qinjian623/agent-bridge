@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def register_child(database, runtime, native_id):
-    if not database or runtime == "pi":
+    if not database or runtime in {"pi", "antigravity"}:
         return
     db = sqlite3.connect(Path(database).expanduser().resolve().as_uri() + "?mode=rw", uri=True, timeout=5)
     try:

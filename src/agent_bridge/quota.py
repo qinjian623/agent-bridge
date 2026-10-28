@@ -7,7 +7,7 @@ def provider_limit(error):
     """Read only terminal provider errors, never user prompts or successful answers."""
     text = json.dumps(error, ensure_ascii=False).lower()
     if not re.search(
-        r"\b429\b|rate[ _-]?limit|too many requests|quota[ _-]?(exceeded|exhausted)|insufficient_quota|usagelimitexceeded",
+        r"\b429\b|rate[ _-]?limit|too many requests|quota[ _-]?(exceeded|exhausted)|insufficient_quota|usagelimitexceeded|resource[ _-]exhausted",
         text,
     ):
         return None

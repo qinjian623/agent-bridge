@@ -12,7 +12,7 @@ from .errors import BridgeError
 
 def main():
     os.umask(0o077)
-    parser = argparse.ArgumentParser(description="Persistent local Codex / Claude Code / Pi sessions")
+    parser = argparse.ArgumentParser(description="Persistent local Codex / Claude Code / Pi / Antigravity sessions")
     parser.add_argument("--state")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Write a private example config; never overwrite existing config")

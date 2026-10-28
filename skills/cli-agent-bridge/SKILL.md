@@ -1,11 +1,12 @@
 ---
 name: cli-agent-bridge
-description: 通过本机服务让 Codex、Claude Code、Pi 分别执行子任务，管理独立模型会话、暂停恢复和检查结果。适用于跨程序分工或同程序多模型任务；单纯定时提醒仍使用 codex-async。
+description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别执行子任务，管理独立模型会话、暂停恢复和检查结果。适用于跨程序分工或同程序多模型任务；单纯定时提醒仍使用 codex-async。
 ---
 
 本机源码在 `/home/user/gits/cli-agent-bridge`，命令为 `agent-bridge`。优先使用已注册的九个 MCP 工具；工具尚未加载时用 `agent-bridge call <工具名>`，JSON 从标准输入传入。服务状态用 `systemctl --user is-active cli-agent-bridge`，配置检查用 `agent-bridge doctor`。
 
 - 先读 `agent_catalog`。程序、供应商和模型分别核对；本机 Claude Code 当前连接 DeepSeek 兼容接口。指定的模型不得自动替换。
+- Antigravity 需要 `runtime=antigravity`、`provider=google-antigravity` 和完整 `agy models` ID，即使选 Claude 也不能填 anthropic。仅支持文本与 workspace-write，read-only 明确拒绝。headless 无逐次审批，原生工具被拒绝不能当作执行成功；不要加跳过权限参数。消费套餐目前不支持封装进第三方编码代理，使用前查项目 README 的账号限制。原生累计 token 在进程恢复后缺少可靠基数时只报观察到的步骤量并标不完整；不能当实际账单。新增接口的离线测试和真实 CLI 握手已验证，真实推理/工具/中断仍需单独验证。
 - `agent_catalog` 会自主查询已配置供应商的模型，缓存 5 分钟；需要最新结果时传 `refresh=true`，也可用 `profile` 只查一个配置。读 `discovery` 中的准确 `model`、来源、时间和错误；目录可见不代表推理成功。查询失败或 `stale=true` 时，不能选择其中的新模型。
 - 主 agent 可按任务选择目录中的模型，通过 `agent_open/agent_dispatch(profile=已有配置名, model=准确ID)` 执行，无需先改配置。原认证、供应商、权限、并发组和推理强度继续生效；已有 session 不能换模型。新模型不会继承旧模型的价格或验证标记。省略目标时，服务的均衡打分仍只使用已验证配置；不会自动付费测试整个目录。
 - 简单工作在主会话直接完成。分配任务时给出具体目标、完成条件、相关文件和测试，避免复制整段聊天。

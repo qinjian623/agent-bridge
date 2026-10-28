@@ -164,6 +164,8 @@ class Broker:
             access = args.get("access", "read-only")
             if access not in {"read-only", "workspace-write"}:
                 raise BridgeError("invalid_access", "access must be read-only or workspace-write")
+            if profile.runtime == "antigravity" and access != "workspace-write":
+                raise BridgeError("unsupported_access", "Antigravity requires workspace-write; plan mode is not read-only enforcement")
             mode = args.get("workspace_mode", "git")
             if mode not in {"git", "copy"} or access == "read-only" and (mode != "git" or args.get("snapshot_files")):
                 raise BridgeError(

@@ -1,8 +1,48 @@
 # cli-agent-bridge
 
-在本机通过 MCP 或命令行管理 Codex、Claude Code 和 Pi 的独立会话。会话可以多次追问、暂停、中断、关闭和重新打开；任务和结果保存在 SQLite，运行任务的进程独立于 MCP 客户端和任务服务。
+在本机通过 MCP 或命令行管理 Codex、Claude Code、Pi 和 Antigravity 的独立会话。会话可以多次追问、暂停、中断、关闭和重新打开；任务和结果保存在 SQLite，运行任务的进程独立于 MCP 客户端和任务服务。
 
 当前为可运行的开发版本。三个程序的真实执行、中断、重开，以及 Astra 父进程退出后继续处理 Sol、Pi、Claude 结果均已通过检查。包含主会话开销的小型比较见 [报告](docs/benchmark.md)。真实 Telegram 消息测试仍待授权，详见 [检查记录](docs/verification.md)。
+
+Antigravity 是新增运行时：离线 CLI 协议与 broker/worker 测试覆盖连续追问、取消、恢复、权限拒绝和 token 统计；真实 `agy 1.4.3` 已验证模型目录与零推理启动握手。真实模型推理、工具执行及取消尚未联调。
+
+## Antigravity
+
+在私有 `config.json` 的 `profiles` 中加入配置，已有的其他配置继续保留：
+
+```json
+"agy-sonnet": {
+  "runtime": "antigravity",
+  "provider": "google-antigravity",
+  "model": "claude-sonnet-5-5-medium",
+  "quota_group": "antigravity-account",
+  "billing_mode": "subscription",
+  "verified": false
+}
+```
+
+默认可执行文件为 `agy`，可用 `executable` 覆盖。即使选择 Claude 模型，供应商仍为 `google-antigravity`，不能填写 `anthropic`。模型使用 `agy models` 返回的完整 ID；若设置 `effort`，必须与 ID 的 low/medium/high 档一致。未验证配置不参与自动选择，但可以显式指定。
+
+broker 在启动时读取配置。新增配置后需重启 broker 才可查询新 profile；现有独立 worker 不随 broker 重启，已有会话也不会换程序或模型。本次代码修改没有执行这一步：
+
+```bash
+systemctl --user restart cli-agent-bridge
+```
+
+```bash
+agent-bridge call agent_catalog --json '{"profile":"agy-sonnet","refresh":true}'
+agent-bridge call agent_open --json '{"profile":"agy-sonnet","cwd":"/absolute/project","access":"workspace-write","request_id":"agy-open-1"}'
+# 后续用返回的 session_id 调用 agent_dispatch、agent_cancel、agent_control。
+```
+
+- 仅支持文本和 `workspace-write`。只读请求在创建会话前拒绝；`--mode plan` 不被当作只读文件访问保证。写入会话继续使用独立 worktree/副本。
+- 原生 headless 模式不支持 bridge 的逐次工具审批，也不接受 Claude SDK 的控制消息。调用使用原生权限策略和 `--sandbox`，不使用 `--dangerously-skip-permissions`。需要审批且被拒绝的工具会使 bridge 将任务记为失败，即使 CLI 的最终状态为 SUCCESS。`tools` 是路由能力描述，不是 Antigravity 的工具白名单。
+- 每个任务使用独立的 `--input-format stream-json --output-format stream-json` 进程，发送一条提示后关闭输入；后续任务用同一 conversation ID 恢复。只有确认当前 conversation 的终态 `result`、进程退出及错误输出读完后才结束任务。进程退出、文本输出和 RUNNING/WAITING 状态均不证明执行完成。
+- SIGINT 请求中断。只有原生 INTERRUPTED/CANCELED 结果确认后才记录中断；进程消失而没有结果进入 `recovery_needed`。确认中断后关闭该原生进程，下一轮通过 `--conversation` 恢复。
+- 首个新会话任务使用原生累计计数，思考不重复计入输出。每轮重开的进程缺少可靠累计基数或计数重置时，不把历史累计量计入新任务；改报本轮观察到的步骤用量，`complete=false`。缓存写入及计费换算未知，不自动生成美元估价；它不是订阅额度总量。
+- `RESOURCE_EXHAUSTED` 等终态错误进入既有额度等待处理，不自动换模型或重试。
+
+账号限制：Google [官方 FAQ](https://www.antigravity.google/docs/faq#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) 当前说明，消费套餐不支持把 `agy` 封装到第三方编码代理或应用。实现这些接口不表示消费订阅支持该用途；请按具体账号授权使用。本项目不会自动加入 Antigravity 配置或切换账号。协议参考 [Headless mode](https://www.antigravity.google/docs/cli/headless)。
 
 ## 安装与调用
 

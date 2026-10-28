@@ -104,6 +104,8 @@ def choose(config, store, requirements, profile_name=None, access="read-only"):
         if profile_name and name != profile_name:
             continue
         reasons = []
+        if access == "read-only" and profile.runtime == "antigravity":
+            reasons.append("Antigravity has no enforced read-only tool policy; use workspace-write")
         if not profile_name and profile.quota_group in cooldowns:
             reasons.append("provider quota is waiting; inspect quota_cooldowns")
         if not profile.verified and not profile_name:

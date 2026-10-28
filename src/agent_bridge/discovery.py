@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
+import signal
 import time
 from dataclasses import asdict, replace
 from urllib.error import HTTPError
@@ -47,6 +50,44 @@ async def reject_question(_):
 
 
 async def native_models(profile: Profile, cwd):
+    if profile.runtime == "antigravity":
+        process = await asyncio.create_subprocess_exec(
+            profile.command(), "models", cwd=str(cwd), env=profile.environment(),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
+        )
+        async def read_limited(stream, limit):
+            chunks, size = [], 0
+            while chunk := await stream.read(65536):
+                size += len(chunk)
+                if size > limit:
+                    raise BridgeError("discovery_failed", "Antigravity directory output exceeds the limit")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        stderr = asyncio.create_task(read_limited(process.stderr, 2_000_000))
+        try:
+            async with asyncio.timeout(20):
+                stdout = await read_limited(process.stdout, 2_000_000)
+                await process.wait()
+                await stderr
+            if process.returncode != 0:
+                raise BridgeError("discovery_failed", "Antigravity model directory failed")
+            rows = []
+            for line in stdout.decode().splitlines():
+                if not line.strip() or line.startswith("Fetching "):
+                    continue
+                slug, *label = line.split("\t", 1)
+                tier = slug.rsplit("-", 1)[-1]
+                rows.append(model_record(slug, label[0] if label else slug, ["text"],
+                                         reasoning_efforts=[tier] if tier in {"low", "medium", "high"} else []))
+            return rows, "Antigravity CLI agy models"
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.wait()
+            process._transport.close()
+            stderr.cancel()
+            await asyncio.gather(stderr, return_exceptions=True)
     if profile.runtime == "claude":
         environment = claude_environment(profile)
         host = urlsplit(environment.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).hostname

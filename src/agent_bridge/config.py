@@ -33,12 +33,25 @@ class Profile:
     verified_at: str | None = None
 
     def validate(self):
-        if self.runtime not in {"codex", "claude", "pi"}:
-            raise BridgeError("invalid_runtime", "runtime must be codex, claude or pi")
-        if not self.name or not self.model:
+        if self.runtime not in {"codex", "claude", "pi", "antigravity"}:
+            raise BridgeError("invalid_runtime", "runtime must be codex, claude, pi or antigravity")
+        if not self.name or not isinstance(self.model, str) or not self.model:
             raise BridgeError("invalid_profile", "profile name and exact model ID are required")
         if self.runtime == "pi" and not self.provider:
             raise BridgeError("invalid_profile", "Pi requires an explicit provider")
+        if self.runtime == "antigravity":
+            if self.provider != "google-antigravity":
+                raise BridgeError("invalid_profile", "Antigravity requires provider=google-antigravity, including Claude models")
+            if self.endpoint_host is not None:
+                raise BridgeError("invalid_profile", "Antigravity uses the native CLI's authentication and endpoint settings")
+            if self.input_types != ["text"]:
+                raise BridgeError("invalid_profile", "Antigravity streaming input supports text only")
+            if self.effort is not None and (
+                not isinstance(self.effort, str) or self.effort not in {"low", "medium", "high"}
+                or self.model.rsplit("-", 1)[-1] in {"low", "medium", "high"}
+                and self.model.rsplit("-", 1)[-1] != self.effort
+            ):
+                raise BridgeError("invalid_profile", "Antigravity effort must match the exact model slug's low/medium/high tier")
         if self.context_window is not None and self.context_window <= 0:
             raise BridgeError("invalid_profile", "context_window must be positive")
         if self.service_tier is not None and (
@@ -49,7 +62,7 @@ class Profile:
         return self
 
     def command(self):
-        command = self.executable or self.runtime
+        command = self.executable or ("agy" if self.runtime == "antigravity" else self.runtime)
         resolved = shutil.which(command)
         if not resolved:
             raise BridgeError("cli_missing", f"Executable not found: {command}")

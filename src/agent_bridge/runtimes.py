@@ -628,6 +628,10 @@ class ClaudeRuntime:
 
 
 def runtime(profile, session, state, on_question):
+    if profile.runtime == "antigravity":
+        from .antigravity import AntigravityRuntime
+
+        return AntigravityRuntime(profile, session, state, on_question)
     return {"codex": CodexRuntime, "pi": PiRuntime, "claude": ClaudeRuntime}[profile.runtime](
         profile, session, state, on_question
     )
