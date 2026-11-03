@@ -72,7 +72,7 @@ Codex MCP 配置可通过本机 CLI 注册：
 codex mcp add cli-agent-bridge -- /absolute/path/cli-agent-bridge/.venv/bin/agent-bridge mcp
 ```
 
-命令行与 MCP 使用相同的九个接口。例如：
+命令行与 MCP 使用相同的接口。例如：
 
 ```bash
 agent-bridge call agent_catalog --json '{}'
@@ -85,7 +85,7 @@ agent-bridge call agent_dispatch --json '{"session_id":"返回的 ID","instructi
 
 非 Git 目录可用 `workspace_mode=copy`，必须同时列出 `snapshot_files`；只复制这些文件。结果保留独立目录及文件变化清单，包含内容和权限变化；仅修改可执行位也会记录。同一 `request_id` 重试使用原快照，不会覆盖子任务已做的修改。worktree 和副本都不是操作系统沙箱。
 
-## 九个工具
+## 工具接口
 
 | 工具 | 行为 |
 | --- | --- |
@@ -98,8 +98,54 @@ agent-bridge call agent_dispatch --json '{"session_id":"返回的 ID","instructi
 | `agent_wait` | 按事件序号等待，单次最多 50 秒 |
 | `agent_result` | 读取回答摘要、补丁、attempt、usage，或按字节分页读取完整原始结果 |
 | `agent_review` | 接受或拒绝当前 attempt，附实际检查记录 |
+| `agent_groups` | 列出分组，或查询某组的 revision、成员和会话状态 |
+| `agent_group` | 创建、删除分组，添加或移除成员 |
+| `agent_broadcast` | 向明确指定组的成员各派发一条任务，返回每个成员的任务 ID 或跳过原因 |
 
-写操作都需要稳定的 `request_id`。重试相同请求返回原结果，复用 ID 改变内容会报错。控制和检查结果操作需要 `expected_revision`，从 `agent_inspect` 或 `agent_result.session_revision` 取得。
+写操作都需要稳定的 `request_id`。重试相同请求返回原结果，复用 ID 改变内容会报错。会话控制和结果检查操作需要 `expected_revision`，从 `agent_inspect` 或 `agent_result.session_revision` 取得。
+
+### 分组与广播
+
+组成员可以是 bridge 管理的 `session_id`，也可以是登记的原生会话，同一会话可以加入多个组。分组不按目录、模型、父会话或 `quota_group` 自动添加成员，不改变现有父会话通知。原有接口继续使用。
+
+以下示例先查询成员，再使用返回的组 revision 广播。将示例会话 ID 换成要接收消息的会话；创建分组需要 revision 0。
+
+```bash
+agent-bridge call agent_group --json '{"group_id":"backend","action":"create","session_ids":["session-a","session-b"],"expected_revision":0,"request_id":"backend-create-1"}'
+agent-bridge call agent_groups --json '{}'
+agent-bridge call agent_groups --json '{"group_id":"backend"}'
+agent-bridge call agent_broadcast --json '{"group_id":"backend","message":"检查各自任务的接口变更并返回结果","expected_revision":0,"reservation":8000,"request_id":"backend-update-1"}'
+```
+
+`agent_group` 的 `add`、`remove` 使用非空 `session_ids` 列表；`delete` 不传成员列表。修改时使用最新组 revision；添加已有成员、移除已不在组内的成员不会重复记录成员或增加 revision。未知会话会使整次成员修改失败。删除后保留组 ID 以防旧请求误发给同名新组；需要重建时使用新 ID。
+
+广播必须提供一个存在且非空的 `group_id` 和查询得到的 `expected_revision`，不支持省略目标或用通配符发送给所有会话。成员有变化时拒绝旧 revision。组的成员快照、各接收方的任务和重试记录在同一次 SQLite 事务中保存：只会给该快照里的成员创建任务，组外会话不会收到广播。加入、移出成员或删除组只影响之后的新广播；已排队的任务需要用现有 `agent_cancel` 单独取消。
+
+广播沿用任务队列，会让成员执行消息内容并可能产生推理费用。一个成员繁忙时，新任务会排队；暂停、正在排空、已关闭或等待恢复的成员会返回 `skipped` 和原因，不会自动恢复。返回的 `queued_count` 只表示已入队，`recipients` 中每条已入队记录含 `task_id`；用 `agent_result` 检查实际完成或失败，用 `agent_wait` 查看执行事件。`reservation` 是每个成员的预留量，预算、并发和配额限制仍由原队列执行。
+
+响应丢失或重复调用时保留相同的 `request_id` 和参数，将返回原收件人及原任务 ID，即使之后组成员或会话状态改变也不会补发。更换请求 ID 表示一次新广播，可能再次执行同一指令。某个成员执行失败不会自动重发，也不影响其他成员；按原有检查、恢复和重试接口处理。广播生成的任务带有 `details.group_id`、`group_revision` 和 `broadcast_id`，不用于自动模型选择的质量统计；它们完成后的父会话通知仍发送到各自原有的 `parent`。
+
+已有的原生 Codex / Antigravity 会话可以通过 `native_members` 加入组，无需创建替代会话或 bridge worker。每个成员提供 `runtime`、原生 UUID `native_id`、原会话绝对目录 `cwd` 和可选 `label`；移除时只需 `runtime`、`native_id`。同一个原生会话重复添加不会重复发送，成员信息不一致时拒绝修改。已由 bridge 管理的原生会话仍使用其 bridge `session_id`。
+
+```bash
+agent-bridge call agent_group --json '{"group_id":"native-team","action":"create","native_members":[{"runtime":"codex","native_id":"原会话UUID","cwd":"/absolute/project","label":"负责人"}],"expected_revision":0,"request_id":"native-team-create-1"}'
+agent-bridge call agent_broadcast --json '{"group_id":"native-team","message":"组内通知","expected_revision":0,"request_id":"native-team-notice-1"}'
+agent-bridge call agent_broadcast_status --json '{"broadcast_id":"上一步返回的ID","refresh":true}'
+```
+
+原生 Codex 消息使用已经运行的共享服务的 `thread/queue/add`，不调用 `thread/resume`、`turn/start`、`turn/steer` 或中断接口，也不启动 daemon。正在运行的原生终端保持原有写锁，队列由原生程序处理；关闭的 Codex 会话不会被本功能唤醒。发送前检查原生 ID 和目录，并继续遵守 Telegram 暂停、删除状态。
+
+原生 Antigravity 支持关闭后按组消息自动恢复。新广播先保存为 `pending`；bridge 与 Telegram 共用 `antigravity-locks/<native_id>.lock`，并检查原生 presence 锁、进程参数的两种 `--conversation` 写法及 `-c/--continue`。同一会话仍活动、存在重复实例或无法确认进程所属时，消息等待，不写活动终端。确认关闭后，核对原生记录存在，再用原 ID 启动一次 stream-json 进程；启动后及写入前再次检查其他实例。原会话的模型、认证、MCP 和权限设置沿用原生配置，不传跳过权限参数。历史 `skipped` 通知保持原样，不自动补发旧通知。
+
+`agent_broadcast_status` 列出每个目标的当前结果：`pending` 只表示 bridge 本地待发送；`enqueued` 表示已取得 Codex 原生队列回执。Codex 的 `received` 表示原生历史中出现了匹配消息 ID 的用户消息；AGY 的 `received` 要求原 ID 返回新的 `user_input/DONE` 事件，过滤恢复时重放的历史步骤。`native_turn_id` 对 AGY 是这条原生用户输入的步骤编号。收到后立即保存，后续推理通过 `processing_status=running/completed/failed` 单独记录，其他会话可以继续发送。原生审批拒绝会记录失败，不放宽权限重试。
+
+`refresh=true` 对 Codex 只读取队列和最近 100 轮历史，消息离开队列但找不到对应记录时为 `unconfirmed`；AGY 显示保存的真实回执，不通过查询再次启动进程。发送回执丢失或服务在发送时退出会记为 `uncertain`，不会自动重发；只能通过读取原生记录核实。收到后服务退出，收件状态仍保留，未确认的执行结果单独记为 `processing_status=uncertain`。连接失败、活动实例等待等明确发生在发送前的情况可以重试。每次恢复完成后清理本次启动的进程及其 MCP 子进程。
+
+原生会话的费用和执行次数不由 bridge worker 统计，启用了 bridge token 预算时拒绝包含原生成员的广播。移除成员或删除组不撤回已保存的广播；原生消息没有 bridge task_id，不能用 `agent_cancel` 撤销。分组也不改变工具权限：本机具有 bridge 管理权限的原生会话可以调用组广播；受限的 bridge 子会话仍不能管理其他会话。通知时只把实际支持的收发方式告诉组员，收到广播后不要自动再次广播确认，避免互相重复触发。
+
+原生会话也可以用 `agent_group_inbox(group_id,runtime,native_id,after,limit)` 主动读取发给自己的组消息，Antigravity 推送被跳过的消息也保留在这里。必须指定组和当前原生成员；结果只含该成员在该组的收件记录。保存返回的 `cursor`，下次作为 `after` 传入，避免重复处理；每页最多 10 条。这个只读工具不启动、恢复或中断任何会话，不修改发送回执，协调者代查不能当作目标会话已收到。
+
+Antigravity 的 MCP 可用 `agy mcp add cli-agent-bridge /absolute/path/cli-agent-bridge/.venv/bin/agent-bridge mcp` 登记，之后恢复时由原生程序自动加载。`agy mcp list` 只证明配置存在，独立 MCP 握手只证明服务可用，都不能证明正在运行的 AGY 已加载工具。现有窗口可用 `/mcp` 手动重载；实际工具调用与原生收件记录分别检查。MCP 本身不提供向活动终端推送消息的入口，因此自动恢复只在原实例关闭后执行。参见 [官方 MCP 说明](https://www.antigravity.google/docs/cli/mcp/)。
 
 暂停会中断当前轮次并停止后续派发；`pause_drain` 等当前轮次结束，没有正在执行的任务时立即暂停。`resume` 默认只允许后续排队任务运行；仅在明确提供 `continue_task_id` 时重试那条中断任务。关闭会取消未执行任务，保留历史和 worktree，只有 `reopen` 能重新打开。
 

@@ -15,6 +15,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+from . import groups, native_broadcast
 from .config import Config, Profile, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
@@ -47,6 +48,12 @@ class Broker:
             db.execute(
                 "UPDATE deliveries SET status='uncertain',error='Broker restarted before queue acknowledgement' WHERE status='sending'"
             )
+            db.execute(
+                "UPDATE native_broadcast_deliveries SET status='uncertain',error='Broker restarted before queue acknowledgement' WHERE status='sending'"
+            )
+            db.execute(
+                "UPDATE native_broadcast_deliveries SET processing_status='uncertain',error='Broker stopped after native receipt; execution outcome is unknown' WHERE status='received' AND processing_status='running'"
+            )
 
     async def notifications(self):
         from .notifications import deliver
@@ -58,6 +65,20 @@ class Broker:
                 await asyncio.wait_for(self.stopping.wait(), 2)
             except TimeoutError:
                 pass
+
+    async def native_notifications(self):
+        running = set()
+        try:
+            while not self.stopping.is_set():
+                await native_broadcast.deliver(self.store, self.config, tasks=running)
+                try:
+                    await asyncio.wait_for(self.stopping.wait(), 2)
+                except TimeoutError:
+                    pass
+        finally:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
 
     async def launch(self, session_id):
         args = [sys.executable, "-m", "agent_bridge.cli", "--state", str(self.state), "worker", session_id]
@@ -134,6 +155,27 @@ class Broker:
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def call(self, method, args):
+        if method == "agent_groups":
+            return groups.inspect_groups(self.store, args.get("group_id"))
+        if method == "agent_group":
+            return groups.control_group(
+                self.store, args["group_id"], args["action"], args["expected_revision"],
+                args["request_id"], args.get("session_ids"), args.get("native_members"),
+            )
+        if method == "agent_broadcast":
+            return groups.broadcast(
+                self.store, args["group_id"], args["message"], args["expected_revision"],
+                args["request_id"], args.get("reservation", 0), token_budget=self.config.token_budget,
+            )
+        if method == "agent_broadcast_status":
+            return await native_broadcast.inspect(
+                self.store, self.config, args["broadcast_id"], refresh=args.get("refresh", False),
+            )
+        if method == "agent_group_inbox":
+            return native_broadcast.inbox(
+                self.store, args["group_id"], args["runtime"], args["native_id"],
+                args.get("after", 0), args.get("limit", 10),
+            )
         if method == "agent_catalog":
             if not isinstance(args.get("refresh", False), bool):
                 raise BridgeError("invalid_request", "refresh must be a boolean")
@@ -387,7 +429,7 @@ class Broker:
         raise BridgeError("unknown_method", method)
 
     async def api_call(self, method, args):
-        if method not in {"agent_open", "agent_dispatch", "agent_control", "agent_cancel", "agent_review"}:
+        if method not in {"agent_open", "agent_dispatch", "agent_control", "agent_cancel", "agent_review", "agent_group", "agent_broadcast"}:
             return {"result": await self.call(method, args)}
         key = args.get("request_id")
         if not isinstance(key, str) or not key or len(key) > 200:
@@ -462,12 +504,14 @@ class Broker:
             loop.add_signal_handler(sig, self.stopping.set)
         scheduler = asyncio.create_task(self.scheduler())
         notifications = asyncio.create_task(self.notifications())
+        native_notifications = asyncio.create_task(self.native_notifications())
         try:
             async with server:
                 await self.stopping.wait()
         finally:
             await scheduler
             await notifications
+            await native_notifications
             path.unlink(missing_ok=True)
             lock.close()
 

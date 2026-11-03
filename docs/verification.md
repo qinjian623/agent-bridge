@@ -197,3 +197,92 @@ Codex CLI、Claude Code、Pi 的独立评审中，确认并修复了以下 13 �
 只重启了 `cli-agent-bridge.service`；Telegram、codex-async 的进程未变化，未重启共享 Codex daemon。Codex、Claude 测试子会话已登记过滤；Pi 使用禁用扩展的 RPC。已检查三个测试子会话均无 Telegram outbox 记录，没有主动发送 Telegram 消息。
 
 修复前副本、差异、数据库备份、测试日志和逐项报告保存在 `<private-validation-state>/report`。代码尚未提交或推送。供应商故障使用模拟输入检查，未在真实服务上制造故障；真实 Telegram 发信、长期压力测试和实际账单核对未执行。
+
+## 2026-11-02 分组与指定组广播
+
+新增 `agent_groups`、`agent_group`、`agent_broadcast`，保留原有九个接口及父会话通知。成员使用现有 bridge 会话 ID；广播需要明确的 group_id 和组 revision，各接收方进入原任务队列。使用方法见 [README](../README.md#分组与广播)。
+
+新增 14 项检查，涵盖分组增删、成员增删及重复成员、组外不接收、多个组共享成员、并发重复请求、改变请求内容被拒绝、组成员改变后的原请求重试、服务重启后取回原任务 ID、空组及未知组、暂停与关闭状态、预算限制、写入失败时全部撤销，以及旧数据库升级后保留任务和父通知。
+
+独立进程测试启动三个隔离的模拟 CLI 会话，只将两个加入目标组。组外会话没有收到执行指令；组内一个 worker 被杀后，该任务进入 `recovery_needed`，另一个仍完成。重试原广播没有增加任一成员的执行次数。另有实际 MCP stdio、Unix socket 和 CLI 调用检查，测试不连接真实模型供应商。
+
+```text
+uv run --locked --with pytest python -m pytest -q
+226 passed, 42 subtests passed in 26.39s
+.venv/bin/ruff check src tests scripts
+All checks passed!
+skill-creator/scripts/quick_validate.py skills/cli-agent-bridge
+Skill is valid!
+```
+
+完整检查使用临时 pytest 环境，未修改项目依赖或 uv.lock；原有未跟踪的 tiering 文件保持不变。
+
+本机更新前确认没有活动子会话、未完成的管理请求或发送中的通知，使用 SQLite backup 保存数据库后只重启 bridge 服务。更新后查询 `agent_groups` 返回空组列表；现有会话、任务、attempt、事件、父通知及请求记录的数量和内容哈希保持一致。没有在线创建测试组或测试会话，也没有向任何真实会话广播；Telegram 和 codex-async 服务进程未变化。
+
+本次差异、检查日志和数据库备份位于 `<private-validation-state>/report`。未做真实模型广播或大规模压力测试，代码尚未提交或推送。实际广播会创建执行任务，可能产生推理费用；移除成员或删除组不撤回已排队任务。
+
+## 2026-11-02 原生会话分组与非打断队列
+
+`agent_group` 新增可选 `native_members`，直接登记现有 Codex / Antigravity 原生 ID、目录和名称，不创建替代会话、bridge session 或 worker。原有 `session_ids` 参数和父通知继续使用。新建的两张表保存原生成员及每个目标的发送记录；广播仍在一个事务内保存成员快照与重试记录。
+
+Codex 通过已运行共享服务的 `thread/queue/add` 入队，发送前核对原生 ID、目录和 Telegram 暂停/删除状态。连接设置固定 `start_daemon=False`，没有恢复、抢占、中断或向终端写入输入。Antigravity 目前仅支持登记，发送明确返回 `skipped / unsupported_transport`。
+
+`agent_broadcast_status(refresh=true)` 只查询原生队列与历史。原生队列回执记为 `enqueued`；仅当历史里匹配 `clientUserMessageId` 对应的 `clientId` 时记为 `received`，并保存原生轮次 ID。消息从队列消失但没有匹配记录时不算收到。发送中断、进程重启或回执丢失记为 `uncertain`，不自动重发；只有明确发生在发送前的故障才重试。
+
+新增 16 项测试，涵盖原生与 bridge 成员兼容、原生 ID 保留、组外隔离、重复成员与并发重复请求、成员变化后的旧请求、发送事务失败、预算拒绝、回执丢失、服务重启恢复、Telegram 暂停/删除、队列分页和收到证明。独立 Python helper 测试替换 codex-async 客户端，断言只能连接现有 daemon、核对原会话并入队，不启动模型。MCP stdio 测试覆盖原生成员参数与发送结果查询。
+
+```text
+uv run --locked --with pytest python -m pytest -q
+242 passed, 50 subtests passed in 15.06s
+uv run --locked ruff check src tests scripts
+All checks passed!
+skill-creator/scripts/quick_validate.py skills/cli-agent-bridge
+Skill is valid!
+```
+
+更新前确认 bridge 没有活动 worker、未完成的管理请求或发送中的父通知，并备份数据库。仅重启 bridge 服务；新表创建后，原有所有表的内容哈希不变。测试全部使用临时状态与模拟客户端，没有向无关真实会话发送消息。
+
+经用户授权创建 `example-agents` 组，登记原来的四个会话。三个 Codex 各发送一次正式通知，均取得原生队列回执；是否进入原生历史按每个目标单独查询。AGY 的同一会话有两个现存进程，未找到验证过的安全接入接口，未向其发送。部分 Codex 入队不代表全组已经收到。具体会话、回执和查询时间只保存在本机私有报告中，不提交聊天内容或运行数据库。
+
+本次备份、测试日志和逐目标结果位于 `<private-validation-state>/report`。原有未提交修改与其他 agent 的工作保留，未提交或推送代码。尚不支持原生 AGY 队列、原生预算统计及通过 `agent_cancel` 撤回原生消息；原生关闭会话也不会被这项功能自动唤醒。
+
+## 2026-11-02 AGY 配置与主动读取组消息
+
+核对重启后的 AGY 进程，启动目录为 `/home/user`，原来登记的项目目录对应同一会话的旧进程。通过现有分组接口修正目录，保留原生 ID 和其余三个成员。没有重启、关闭或向这两个 AGY 进程写入终端输入。
+
+用户级 AGY MCP 配置原为空文件。用 `agy mcp add` 添加 `cli-agent-bridge` 的 stdio 命令，两个目录中的 `agy mcp list` 都能列出它。独立 MCP 客户端握手和工具调用成功，但没有从正在运行的 AGY 实例验证工具调用；配置存在和独立客户端成功均不等于原生实例已经接入。官方 `/mcp` 管理面板支持在原窗口重载，尚无证据要求重启整个 AGY。
+
+新增只读 `agent_group_inbox`，按明确的组、runtime 和原生 ID 查询保留的广播。当前成员才能读取，原推送被跳过的消息也能主动查询；游标避免重复处理，限制每页最多 10 条。它不启动会话、不发送消息、不修改回执，因此协调者代查不会把 AGY 的 `skipped` 改成已收到。已有自动队列和父通知不变。
+
+新增两项测试和实际 MCP 工具检查，验证按组及接收方筛选、组外拒绝、原始消息保留、分页无重复、无效参数及移出/删除成员后拒绝读取。完整结果为 `244 passed, 50 subtests passed in 15.11s`，Ruff 和 skill 格式检查通过。
+
+更新时确认 bridge 无活动 worker 或发送中的记录，备份数据库后仅重启 bridge。使用独立 MCP 客户端读取该 AGY 的一条既有通知，所有数据库表哈希保持不变；没有再次向真实组广播。原生 AGY 的实际读取仍未确认，自动推送仍无验证过的安全接口。查到的本地监听端口属于 language server，未将它们当作安全消息队列使用。
+
+检查记录位于 `<private-validation-state>/report`。下一步是在当前目标 AGY 窗口本轮结束后通过 `/mcp` 重载，确认 bridge 已连接，再由原会话调用 `agent_groups` 与 `agent_group_inbox`。原有审批设置保持不变，代码未提交或推送。
+
+## 2026-11-03 AGY 关闭后按组消息自动恢复
+
+原生 AGY 的新组广播现在保存为 `pending`。确认原实例完全关闭后，bridge 用原 native ID 启动一轮 stream-json 会话并发送消息。活动实例、同 ID 多实例、无法识别所属的 `-c/--continue` 进程或无法读取的 AGY 状态都会等待；不向已有终端写入输入。旧 `skipped` 广播不变，不补发过时通知。
+
+`agy_presence.py` 检查 native presence flock、两种 conversation 参数及进程所属。`agy_wake.py` 与现有 Telegram 客户端共用恢复锁，启动前、init 后、写入前都检查活动实例；原生主会话数据库或 summary 缺失时拒绝启动。恢复命令只指定原 ID 和流格式，不覆盖模型、推理强度、认证、MCP、sandbox 或 mode，不传跳过权限参数。恢复的原生主会话仍可调用 bridge。
+
+收件必须由原 ID 返回新的 `user_input/DONE`，步骤编号大于恢复前原生记录的最大编号。收到后马上保存 `received`；其后的推理通过 `processing_status` 单独记录，长推理不会占住其他目标的发送。回执丢失、写入后退出或服务重启均不盲目重发；已经收到而执行失败，也不能当作未送达重跑。首次确认的原生步骤编号不能被后续回执替换。
+
+每一轮只清理本次创建的进程组，包括退出后遗留的 MCP 子进程；不操作原有实例或原有训练。Telegram 检查使用 `antigravity:<native_id>`，继续尊重暂停和删除状态。
+
+新增 35 项测试，包括 fake CLI 的真正独立进程、临时原生数据库和锁：原生 ID 保留、历史重放、缺失记录、活动及不明进程、服务间共享锁、启动中出现新实例、重复请求、两组并发、失回执、长推理先保存收件、服务重启、迟到权限拒绝、错误或冲突回执、后代进程清理。进程识别也覆盖真机 systemd 的 exe 受保护但 comm/cmdline 可读的情况，避免将无关系统进程误当作 AGY。
+
+```text
+uv run --locked --with pytest python -m pytest -q
+279 passed, 66 subtests passed in 15.64s
+uv run --locked ruff check src tests scripts
+All checks passed!
+skill-creator/scripts/quick_validate.py skills/cli-agent-bridge
+Skill is valid!
+```
+
+更新前确认 bridge 没有活动 worker、待完成 API 或发送中记录，保存数据库备份后仅重启 bridge 服务。新列只增加执行状态，原有所有列的值和行数保持一致；原来四个组员和 revision=2 不变，AGY transport 为 `antigravity_resume`。Telegram、codex-async 服务未重启，其他 agent 的未提交文件未改。
+
+09:44 实查原 AGY 仍持有 native presence 锁；排除当前实例检查其他进程时没有误报。该实例未被关闭或重启，本次没有对它做真实的关闭后恢复测试，也没有向组内或其他真实会话发送测试广播。代码和 fake CLI 测试验证了关闭恢复的行为；原会话的真实恢复要在其自然关闭且有新组消息时发生，不能把这次活动锁检查说成已经恢复。
+
+完整检查、部署记录和备份位于 `<private-validation-state>/report`。代码尚未提交或推送。

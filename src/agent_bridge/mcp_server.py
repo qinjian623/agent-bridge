@@ -13,6 +13,39 @@ def server(state):
     )
     read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 
+    @mcp.tool(annotations=read_only)
+    async def agent_groups(group_id: str | None = None) -> dict:
+        """List active groups, or inspect one group's revision and member session states. Does not send messages."""
+        return await request(state, "agent_groups", locals())
+
+    @mcp.tool()
+    async def agent_group(
+        group_id: str, action: str, expected_revision: int, request_id: str, session_ids: list[str] | None = None,
+        native_members: list[dict] | None = None,
+    ) -> dict:
+        """Create/add/remove/delete a group. session_ids are existing bridge IDs. native_members register existing native sessions as {runtime, native_id, cwd, label}; remove only needs runtime/native_id. Registration never starts a session. Codex uses its native queue; Antigravity restores the original session when completely closed and waits while any original or unidentified instance is active. Create requires revision 0; other changes use the inspected revision. Delete retires the ID but never cancels queued tasks/messages."""
+        params = locals()
+        if native_members is None:
+            params.pop("native_members")
+        return await request(state, "agent_group", params)
+
+    @mcp.tool()
+    async def agent_broadcast(
+        group_id: str, message: str, expected_revision: int, request_id: str, reservation: int = 0,
+    ) -> dict:
+        """Queue one message per member of the explicit group at its inspected revision. May incur inference costs. Bridge members get tasks; native Codex uses its existing queue without takeover. A closed original Antigravity session is restored for the message; active/uncertain owners wait, with no terminal input or duplicate instance. Old skipped broadcasts are never replayed. Retry the same request_id and parameters to avoid duplicates. Read task_id with agent_result or broadcast_id with agent_broadcast_status. Pending is local; received requires native user_input confirmation and is separate from processing_status. Native delivery requires the bridge token budget disabled; parent notifications are unchanged."""
+        return await request(state, "agent_broadcast", locals())
+
+    @mcp.tool(annotations=read_only)
+    async def agent_broadcast_status(broadcast_id: str, refresh: bool = False) -> dict:
+        """Read each recipient's current state. refresh reads native queues/history only; never sends or wakes a session. Queue disappearance alone is unconfirmed, not received. Uncertain deliveries are never automatically resent."""
+        return await request(state, "agent_broadcast_status", locals())
+
+    @mcp.tool(annotations=read_only)
+    async def agent_group_inbox(group_id: str, runtime: str, native_id: str, after: int = 0, limit: int = 10) -> dict:
+        """Read saved broadcasts addressed to one current native member of an explicit group. Antigravity can pull messages here even when push delivery was skipped. Does not start/resume/interrupt any session or mark messages received. A coordinator reading on behalf of a target is not native receipt. Remember cursor and pass it as after to avoid reading old messages again; has_more indicates another page. Requires normal bridge management access."""
+        return await request(state, "agent_group_inbox", locals())
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True))
     async def agent_catalog(refresh: bool = False, profile: str | None = None) -> dict:
         """Discover models from configured providers without inference. Cache 5 minutes; refresh forces a query. Returns per-profile errors/stale data. Select an exact discovered ID with profile + model in open/dispatch; listed does not mean inference-verified."""

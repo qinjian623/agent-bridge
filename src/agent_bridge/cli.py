@@ -17,7 +17,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Write a private example config; never overwrite existing config")
     commands.add_parser("serve", help="Run the persistent Unix socket broker")
-    commands.add_parser("mcp", help="Run the nine MCP tools over stdio")
+    commands.add_parser("mcp", help="Run the MCP tools over stdio")
     commands.add_parser("doctor", help="Check local configuration and installed CLI paths")
     worker = commands.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("session_id")

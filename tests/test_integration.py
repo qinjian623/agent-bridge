@@ -57,14 +57,16 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(store.get_parent("parent")["deliveries"]))
         self.assertIsNone(store.claim(self.broker.config))
 
-    async def test_actual_mcp_client_lists_and_calls_nine_tools(self):
+    async def test_actual_mcp_client_preserves_original_tools_and_adds_group_tools(self):
         params = StdioServerParameters(
             command=sys.executable, args=["-m", "agent_bridge.cli", "--state", str(self.state), "mcp"]
         )
         async with stdio_client(params) as (reader, writer), ClientSession(reader, writer) as session:
             await session.initialize()
             tools = await session.list_tools()
-            self.assertEqual(9, len(tools.tools))
+            self.assertEqual({"agent_catalog", "agent_open", "agent_dispatch", "agent_control", "agent_cancel",
+                              "agent_inspect", "agent_wait", "agent_result", "agent_review",
+                              "agent_groups", "agent_group", "agent_broadcast", "agent_broadcast_status", "agent_group_inbox"}, {t.name for t in tools.tools})
             for name in ("agent_open", "agent_dispatch"):
                 self.assertIn("model", next(t for t in tools.tools if t.name == name).inputSchema["properties"])
             schema = next(t for t in tools.tools if t.name == "agent_dispatch").inputSchema["properties"]

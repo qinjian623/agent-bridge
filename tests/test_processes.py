@@ -135,3 +135,50 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.4)
         self.assertEqual(1, len(result["attempts"]))
         self.assertEqual(1, len((self.state / "invocations.txt").read_text().splitlines()))
+
+    async def test_group_broadcast_executes_only_members_and_one_crash_does_not_replay_others(self):
+        sessions, directories = [], {}
+        for index in range(3):
+            directory = self.state / str(index)
+            directory.mkdir()
+            opened = await request(self.state, "agent_open", {
+                "profile": "fixture", "cwd": str(directory), "request_id": "group-open-" + str(index),
+            })
+            sid = opened["session_id"]
+            sessions.append(sid)
+            directories[sid] = directory
+            for _ in range(100):
+                worker = await request(self.state, "agent_inspect", {"session_id": sid})
+                if worker["worker_pid"]:
+                    self.workers.append((worker["worker_pid"], worker["worker_start"]))
+                    break
+                await asyncio.sleep(.05)
+            else:
+                self.fail("fixture worker did not start")
+        await request(self.state, "agent_group", {"group_id": "test-only", "action": "create", "expected_revision": 0,
+                                                "request_id": "group-create", "session_ids": sessions[:2]})
+        args = {"group_id": "test-only", "message": "fixture", "expected_revision": 0, "request_id": "broadcast"}
+        sent = await request(self.state, "agent_broadcast", args)
+        self.assertEqual(set(sessions[:2]), {row["session_id"] for row in sent["recipients"]})
+        for _ in range(100):
+            if all((directories[sid] / "invocations.txt").exists() for sid in sessions[:2]):
+                break
+            await asyncio.sleep(.02)
+        else:
+            self.fail("both member prompts were not received")
+        failed_sid = sessions[0]
+        worker = await request(self.state, "agent_inspect", {"session_id": failed_sid})
+        os.kill(worker["worker_pid"], signal.SIGKILL)
+        for recipient in sent["recipients"]:
+            expected = "recovery_needed" if recipient["session_id"] == failed_sid else "completed"
+            task = await self.wait_state(recipient["task_id"], {expected})
+            self.assertEqual(1, len(task["attempts"]))
+        self.assertEqual(sent, await request(self.state, "agent_broadcast", args))
+        await asyncio.sleep(.2)
+        self.assertFalse((directories[sessions[2]] / "invocations.txt").exists())
+        for sid in sessions[:2]:
+            self.assertEqual(1, len((directories[sid] / "invocations.txt").read_text().splitlines()))
+        for sid in sessions:
+            session = await request(self.state, "agent_inspect", {"session_id": sid})
+            await request(self.state, "agent_control", {"session_id": sid, "action": "close",
+                "expected_revision": session["revision"], "request_id": "group-close-" + sid})

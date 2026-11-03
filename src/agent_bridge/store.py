@@ -98,6 +98,26 @@ CREATE TABLE IF NOT EXISTS deliveries (
  event_seq INTEGER PRIMARY KEY REFERENCES events(seq), parent_id TEXT NOT NULL REFERENCES parents(id),
  status TEXT NOT NULL DEFAULT 'pending', receipt TEXT, error TEXT
 );
+CREATE TABLE IF NOT EXISTS session_groups (
+ id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,
+ deleted INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_group_members (
+ group_id TEXT NOT NULL REFERENCES session_groups(id), session_id TEXT NOT NULL REFERENCES sessions(id),
+ PRIMARY KEY(group_id,session_id)
+);
+CREATE TABLE IF NOT EXISTS native_group_members (
+ group_id TEXT NOT NULL REFERENCES session_groups(id), runtime TEXT NOT NULL, native_id TEXT NOT NULL,
+ cwd TEXT NOT NULL, label TEXT NOT NULL,
+ PRIMARY KEY(group_id,runtime,native_id)
+);
+CREATE TABLE IF NOT EXISTS native_broadcast_deliveries (
+ id TEXT PRIMARY KEY, broadcast_id TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES session_groups(id),
+ runtime TEXT NOT NULL, native_id TEXT NOT NULL, cwd TEXT NOT NULL, message TEXT NOT NULL,
+ status TEXT NOT NULL, receipt TEXT, native_turn_id TEXT, processing_status TEXT, error TEXT, created REAL NOT NULL, last_attempt REAL NOT NULL DEFAULT 0,
+ UNIQUE(broadcast_id,runtime,native_id)
+);
+CREATE INDEX IF NOT EXISTS native_broadcast_pending ON native_broadcast_deliveries(status,last_attempt);
 CREATE INDEX IF NOT EXISTS task_queue ON tasks(status,created);
 CREATE INDEX IF NOT EXISTS event_session ON events(session_id,seq);
 """
@@ -112,6 +132,8 @@ class Store:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
             db.execute("BEGIN IMMEDIATE")
+            if "processing_status" not in {row[1] for row in db.execute("PRAGMA table_info(native_broadcast_deliveries)")}:
+                db.execute("ALTER TABLE native_broadcast_deliveries ADD COLUMN processing_status TEXT")
             if "notify" not in {row[1] for row in db.execute("PRAGMA table_info(parents)")}:
                 db.execute("ALTER TABLE parents ADD COLUMN notify INTEGER NOT NULL DEFAULT 1")
             if "workspace" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
@@ -149,7 +171,7 @@ class Store:
 
     @staticmethod
     def required(db, table, key):
-        if table not in {"sessions", "tasks", "attempts", "questions"}:
+        if table not in {"sessions", "tasks", "attempts", "questions", "session_groups"}:
             raise ValueError("Invalid table")
         row = db.execute(f"SELECT * FROM {table} WHERE id=?", (key,)).fetchone()
         if row is None:
@@ -238,15 +260,17 @@ class Store:
                 raise BridgeError("session_closed", "Reopen this session explicitly before submitting work")
             for dependency in dependencies:
                 self.required(db, "tasks", dependency)
-            task = identifier()
-            db.execute(
-                "INSERT INTO tasks(id,session_id,instruction,dependencies,reservation,created,details) VALUES(?,?,?,?,?,?,?)",
-                (task, session_id, instruction, encode(dependencies), reservation, time.time(), encode(details)),
-            )
-            self.event(db, "task_queued", {}, session_id, task)
-            return self.remember(
-                db, request_id, fingerprint, {"task_id": task, "session_id": session_id, "status": "queued"}
-            )
+            result = self.enqueue_task(db, session_id, instruction, dependencies, reservation, details)
+            return self.remember(db, request_id, fingerprint, result)
+
+    def enqueue_task(self, db, session_id, instruction, dependencies, reservation, details):
+        task = identifier()
+        db.execute(
+            "INSERT INTO tasks(id,session_id,instruction,dependencies,reservation,created,details) VALUES(?,?,?,?,?,?,?)",
+            (task, session_id, instruction, encode(dependencies), reservation, time.time(), encode(details)),
+        )
+        self.event(db, "task_queued", {}, session_id, task)
+        return {"task_id": task, "session_id": session_id, "status": "queued"}
 
     def validate_dispatch(self, instruction, reservation, dependencies=None, retry_task_id=None):
         with self.connection() as db:
