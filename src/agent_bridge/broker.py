@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import secrets
 import signal
@@ -12,6 +13,7 @@ import socket
 import struct
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,8 +22,10 @@ from .config import Config, Profile, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
+from .peer_protocol import PROTOCOL_VERSION, NodeRef, PeerErrorCode
+from .peer_transport import DefaultPeerClientFactory
 from .routing import choose
-from .store import Store, encode
+from .store import Store, encode, task_input
 from .worker import alive, owned_processes
 from .workspace import directory_copy, worktree
 
@@ -31,11 +35,14 @@ def unit_name(state, session_id):
 
 
 class Broker:
-    def __init__(self, state: Path):
+    def __init__(self, state: Path, peer_factory=None):
         self.state = state
         self.config = Config.load(state / "config.json")
         self.store = Store(state)
         self.host_registry = ConfigHostRegistry(self.config.hosts, state)
+        # Phase B routing: one identity-checking client factory over the registered hosts. Injecting one keeps
+        # tests (and future transports) independent of SSH while production uses the default SSH transport.
+        self.peer_factory = peer_factory if peer_factory is not None else DefaultPeerClientFactory(self.host_registry)
         self.models = ModelDirectory(state)
         token_path = state / "admin.token"
         if not token_path.exists():
@@ -156,7 +163,329 @@ class Broker:
         finally:
             await asyncio.gather(*pending, return_exceptions=True)
 
+    # ---------------------------------------------------------------- phase B remote routing
+
+    @staticmethod
+    def _remote_host(args):
+        host_id = args.get("host_id")
+        if host_id is None or host_id == "local":
+            return None
+        if not isinstance(host_id, str) or not host_id:
+            raise BridgeError("invalid_request", "host_id must be a non-empty string")
+        return host_id
+
+    async def _peer_node(self, host_id, client=None):
+        """Resolve the pinned execution-node identity, handshaking once when no pin exists yet."""
+        config = self.host_registry.get(host_id)
+        if config.pinned is not None:
+            return config.pinned
+        client = client or self.peer_factory.client(host_id)
+        hello = await client.hello(
+            {
+                "protocol_versions": [PROTOCOL_VERSION],
+                "coordinator_id": socket.gethostname(),
+                "coordinator_generation": "local",
+            }
+        )
+        node = hello.get("node") if isinstance(hello, dict) else None
+        if not isinstance(node, dict):
+            raise BridgeError("invalid_request", "peer.hello returned no node identity")
+        node_id = node.get("node_id")
+        generation = node.get("state_generation")
+        if not isinstance(node_id, str) or not node_id or not isinstance(generation, str) or not generation:
+            raise BridgeError("invalid_request", "peer.hello returned an invalid node identity")
+        return NodeRef(host_id, node_id, generation)
+
+    @staticmethod
+    def _stable_operation_id(host_id, method, request_id, params):
+        material = encode(
+            {"host_id": host_id, "method": method, "request_id": request_id, "params": params}
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _remote_open_spec(args):
+        spec = {}
+        for key in ("profile", "cwd", "access", "project_id", "model", "workspace_mode", "base", "snapshot_files"):
+            value = args.get(key)
+            if value is not None:
+                spec[key] = value
+        return spec
+
+    @staticmethod
+    def _target_seq(operation_id):
+        # Deterministic from the stable operation id: retries reuse the same target_seq (ADR-05/ADR-09).
+        return int(operation_id[:16], 16) % (1 << 62)
+
+    def _operation_response(self, operation):
+        result = operation.get("result")
+        params = operation.get("params") if isinstance(operation.get("params"), dict) else {}
+        payload = dict(result) if isinstance(result, dict) else {}
+        payload.setdefault("operation_id", operation["operation_id"])
+        payload.setdefault("host_id", params.get("host_id") or "local")
+        if isinstance(result, dict):
+            return payload
+        if operation.get("error"):
+            error = operation["error"]
+            raise BridgeError(
+                "operation_failed", error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+            )
+        raise BridgeError(PeerErrorCode.OPERATION_PENDING, "The cross-host operation has no result yet")
+
+    async def _remote_deliver(self, host_id, method, args, *, instruction=None, open_only=False):
+        client = self.peer_factory.client(host_id)
+        node = await self._peer_node(host_id, client)
+        operation_id = self._stable_operation_id(
+            host_id, method, str(args.get("request_id") or ""), args
+        )
+        target_seq = self._target_seq(operation_id)
+        target_id = args.get("session_id") or ""
+        parameters = {
+            "operation": {
+                "node_id": node.node_id,
+                "state_generation": node.state_generation,
+                "operation_id": operation_id,
+            },
+            "delivery_id": "delivery-" + operation_id[:40],
+            "group_id": str(args.get("group_id") or ""),
+            "broadcast_id": str(args.get("broadcast_id") or ""),
+            "target": {"kind": "bridge", "id": target_id},
+            "target_seq": target_seq,
+            "seq_kind": "message",
+            "expected_group_revision": int(args.get("expected_group_revision") or 0),
+            "reservation": int(args.get("reservation") or 0),
+            "host_id": host_id,
+        }
+        if open_only or not target_id:
+            parameters["open"] = self._remote_open_spec(args)
+        if not open_only:
+            parameters["message"] = instruction or ""
+        fingerprint = hashlib.sha256(encode(parameters).encode("utf-8")).hexdigest()
+        existing = self.store.get_operation(operation_id)
+        if existing is not None:
+            if existing["fingerprint"] != fingerprint:
+                raise BridgeError(
+                    PeerErrorCode.OPERATION_CONFLICT,
+                    "operation_id was already used with different remote parameters",
+                )
+            return self._operation_response(existing)
+        self.store.record_operation(
+            operation_id,
+            node.node_id,
+            node.state_generation,
+            fingerprint,
+            method,
+            parameters,
+            status="pending",
+        )
+        try:
+            result = await client.deliver(parameters)  # type: ignore[arg-type]
+        except BridgeError as error:
+            self.store.update_operation(operation_id, status="uncertain", error=error.as_dict())
+            raise
+        self.store.update_operation(operation_id, status="completed", result=result)
+        return {"operation_id": operation_id, "host_id": host_id, **result}
+
+    async def _remote_open(self, host_id, args):
+        if not args.get("profile"):
+            raise BridgeError("invalid_request", "profile is required for a remote open")
+        return await self._remote_deliver(host_id, "agent_open", args, open_only=True)
+
+    async def _remote_dispatch(self, host_id, args):
+        requirements = args.get("requirements")
+        if requirements is None:
+            requirements = {}
+        if not isinstance(requirements, dict):
+            raise BridgeError("invalid_request", "requirements must be an object")
+        if requirements.get("hard_budget"):
+            raise BridgeError("hard_budget_unsupported", "No verified hard cap is available")
+        instruction = args.get("instruction")
+        reservation = args.get("reservation")
+        if reservation is None:
+            reservation = 0
+        task_input(instruction, reservation, args.get("dependencies"))
+        if not args.get("session_id") and not args.get("profile"):
+            raise BridgeError("invalid_request", "profile is required when a remote dispatch opens a session")
+        return await self._remote_deliver(host_id, "agent_dispatch", args, instruction=instruction)
+
+    async def _cancel(self, args):
+        supplied = [
+            key
+            for key in ("task_id", "operation_id", "delivery_id")
+            if isinstance(args.get(key), str) and args.get(key)
+        ]
+        if len(supplied) != 1:
+            raise BridgeError(
+                "invalid_request", "Exactly one of task_id, operation_id or delivery_id is required"
+            )
+        target = supplied[0]
+        value = args[target]
+        request_id = args.get("request_id")
+        if request_id is not None and (not isinstance(request_id, str) or len(request_id) > 200):
+            raise BridgeError("invalid_request_id", "request_id must be at most 200 characters")
+        host_id = self._remote_host(args)
+
+        if host_id is not None:
+            client = self.peer_factory.client(host_id)
+            node = await self._peer_node(host_id, client)
+            operation_id = self._stable_operation_id(host_id, "agent_cancel", str(request_id or ""), args)
+            parameters = {
+                "operation": {
+                    "node_id": node.node_id,
+                    "state_generation": node.state_generation,
+                    "operation_id": operation_id,
+                },
+                target: value,
+                "host_id": host_id,
+            }
+            fingerprint = hashlib.sha256(encode(parameters).encode("utf-8")).hexdigest()
+            existing = self.store.get_operation(operation_id)
+            if existing is not None:
+                if existing["fingerprint"] != fingerprint:
+                    raise BridgeError(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "operation_id was already used with different cancel parameters",
+                    )
+                return self._operation_response(existing)
+            self.store.record_operation(
+                operation_id,
+                node.node_id,
+                node.state_generation,
+                fingerprint,
+                "agent_cancel",
+                parameters,
+                status="pending",
+            )
+            try:
+                result = await client.cancel(parameters)  # type: ignore[arg-type]
+            except BridgeError as error:
+                self.store.update_operation(operation_id, status="uncertain", error=error.as_dict())
+                raise
+            self.store.update_operation(operation_id, status="completed", result=result)
+            return {"operation_id": operation_id, "host_id": host_id, **result}
+
+        if target == "task_id":
+            return self.store.cancel(value, request_id or ("cancel:" + value))
+
+        if target == "operation_id":
+            operation = self.store.get_operation(value)
+        else:
+            operation = None
+            with self.store.connection() as db:
+                rows = db.execute(
+                    "SELECT * FROM peer_operations WHERE params LIKE ? ORDER BY created DESC LIMIT 20",
+                    (f"%{value}%",),
+                ).fetchall()
+            for row in rows:
+                params = Store._decode_json(row["params"])
+                if not isinstance(params, dict):
+                    continue
+                parameters = params.get("delivery") if isinstance(params.get("delivery"), dict) else params
+                if parameters.get("delivery_id") == value:
+                    operation = Store._peer_operation(row)
+                    break
+        if operation is None:
+            raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown operation: {value}")
+        parameters = operation.get("params") if isinstance(operation.get("params"), dict) else {}
+        operation_host = parameters.get("host_id")
+        if operation_host and operation_host != "local" and target != "task_id":
+            return await self._cancel({**args, "host_id": operation_host})
+        result = operation.get("result") if isinstance(operation.get("result"), dict) else {}
+        task_id = result.get("task_id")
+        if task_id:
+            self.store.cancel(task_id, request_id or ("cancel:" + task_id))
+        self.store.update_operation(value, status="cancelled")
+        return {"target": value, "status": "cancelled"}
+
+    def _operation_view(self, operation):
+        params = operation.get("params") if isinstance(operation.get("params"), dict) else {}
+        host_id = params.get("host_id")
+        if not isinstance(host_id, str) or not host_id:
+            host_id = "local"
+        view = {"operation_id": operation["operation_id"], "host_id": host_id, "status": operation["status"]}
+        result = operation.get("result")
+        if isinstance(result, dict):
+            view["result"] = result
+            artifacts = result.get("artifacts")
+            if isinstance(artifacts, list):
+                view["artifacts"] = artifacts
+        error = operation.get("error")
+        if error is not None:
+            view["error"] = (
+                error if isinstance(error, dict) else {"code": "operation_failed", "message": str(error)}
+            )
+        return view
+
+    async def _refresh_operation(self, operation, host_id):
+        lookup = await self.peer_factory.client(host_id).lookup_delivery(
+            {
+                "operation": {
+                    "node_id": operation["node_id"],
+                    "state_generation": operation["state_generation"],
+                    "operation_id": operation["operation_id"],
+                }
+            }
+        )
+        if not isinstance(lookup, dict) or not lookup.get("found"):
+            return
+        status = lookup.get("operation_status")
+        delivery = lookup.get("delivery")
+        if not isinstance(status, str) and isinstance(delivery, dict):
+            status = delivery.get("status")
+        mapping = {
+            "accepted_remote": "completed",
+            "received": "running",
+            "queued": "running",
+            "pending": "pending",
+            "running": "running",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "uncertain": "uncertain",
+        }
+        refreshed = mapping.get(status) if isinstance(status, str) else None
+        updates = {}
+        if refreshed is not None and refreshed != operation["status"]:
+            updates["status"] = refreshed
+        if isinstance(delivery, dict) and delivery.get("task_id"):
+            base = operation.get("result") if isinstance(operation.get("result"), dict) else {}
+            updates["result"] = {**base, **delivery}
+        if updates:
+            self.store.update_operation(operation["operation_id"], **updates)
+
+    async def _operation(self, args):
+        operation_id = args.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise BridgeError("invalid_request", "operation_id must be a non-empty string")
+        wait = args.get("wait")
+        if wait is None:
+            wait = 0
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not math.isfinite(wait) or wait < 0:
+            raise BridgeError("invalid_request", "wait must be a non-negative finite number")
+        deadline = asyncio.get_running_loop().time() + min(float(wait), 50)
+        while True:
+            operation = self.store.get_operation(operation_id)
+            if operation is None:
+                raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown operation: {operation_id}")
+            params = operation.get("params") if isinstance(operation.get("params"), dict) else {}
+            host_id = params.get("host_id")
+            if operation["status"] in {"pending", "running", "uncertain"} and isinstance(host_id, str) and host_id != "local":
+                await self._refresh_operation(operation, host_id)
+                operation = self.store.get_operation(operation_id)
+            if operation["status"] not in {"pending", "running"}:
+                return self._operation_view(operation)
+            if asyncio.get_running_loop().time() >= deadline:
+                return self._operation_view(operation)
+            await asyncio.sleep(0.15)
+
     async def call(self, method, args):
+        if method == "agent_monitor":
+            from .monitor import MonitorCollector
+
+            collector = MonitorCollector(self.state)
+            limit = args.get("limit", 15)
+            include_events = args.get("include_events", True)
+            return collector.collect(limit=limit, include_events=include_events)
         if method == "agent_hosts":
             host_id = args.get("host_id")
             if host_id is not None and not isinstance(host_id, str):
@@ -199,13 +528,27 @@ class Broker:
         if method == "agent_catalog":
             if not isinstance(args.get("refresh", False), bool):
                 raise BridgeError("invalid_request", "refresh must be a boolean")
+            host_id = self._remote_host(args)
+            if host_id is not None:
+                catalog_params = {"refresh": args.get("refresh", False)}
+                if args.get("profile") is not None:
+                    catalog_params["profile"] = args["profile"]
+                result = await self.peer_factory.client(host_id).catalog(catalog_params)
+                return {**result, "host_id": host_id}
             name = args.get("profile")
             if name is not None and name not in self.config.profiles:
                 raise BridgeError("unknown_profile", str(name))
             profiles = [p for p in self.config.profiles.values() if name is None or p.name == name]
             discoveries = await asyncio.gather(*(self.models.get(p, args.get("refresh", False)) for p in profiles))
+            fetched_at = time.time()
+            entries = [
+                {**p.public(), "host_id": "local", "stale": False, "fetched_at": fetched_at} for p in profiles
+            ]
             return {
-                "profiles": [p.public() for p in profiles],
+                "profiles": entries,
+                "host_id": "local",
+                "stale": False,
+                "fetched_at": fetched_at,
                 "discovery": discoveries,
                 "objective": self.config.default_strategy,
                 "strategies": ["balanced", "cost", "speed"],
@@ -215,7 +558,12 @@ class Broker:
                 "price_notice": "Catalog estimates are not confirmed bills",
                 "model_directory": "Discovered IDs can be selected with profile + model; directory visibility is not inference verification. Cached for 300 seconds; refresh=true queries again. Automatic scoring still uses verified configured profiles.",
             }
+        if method == "agent_operation":
+            return await self._operation(args)
         if method == "agent_open":
+            host_id = self._remote_host(args)
+            if host_id is not None:
+                return await self._remote_open(host_id, args)
             name = args["profile"]
             if name not in self.config.profiles:
                 raise BridgeError("unknown_profile", name)
@@ -261,6 +609,9 @@ class Broker:
                 raise BridgeError("invalid_request", "requirements must be an object")
             if requirements.get("hard_budget"):
                 raise BridgeError("hard_budget_unsupported", "No verified hard cap is available")
+            host_id = self._remote_host(args)
+            if host_id is not None:
+                return await self._remote_dispatch(host_id, args)
             reservation = self.store.validate_dispatch(
                 args["instruction"], args.get("reservation"), args.get("dependencies"), args.get("retry_task_id")
             )
@@ -382,7 +733,7 @@ class Broker:
                 args.get("continue_task_id"),
             )
         if method == "agent_cancel":
-            return self.store.cancel(args["task_id"], args["request_id"])
+            return await self._cancel(args)
         if method in {"agent_inspect", "agent_result"}:
             if not args.get("task_id") and not args.get("session_id"):
                 await asyncio.to_thread(self.store.refresh_parent_usage)

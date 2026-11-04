@@ -14,6 +14,7 @@ from .codex_parent import read_resume_config
 from .config import Config, Profile
 from .errors import BridgeError
 from .parent_usage import meter_usage, refresh_meter, start_meter
+from .peer_protocol import PeerErrorCode
 
 
 def encode(value):
@@ -120,6 +121,27 @@ CREATE TABLE IF NOT EXISTS native_broadcast_deliveries (
 CREATE INDEX IF NOT EXISTS native_broadcast_pending ON native_broadcast_deliveries(status,last_attempt);
 CREATE INDEX IF NOT EXISTS task_queue ON tasks(status,created);
 CREATE INDEX IF NOT EXISTS event_session ON events(session_id,seq);
+CREATE TABLE IF NOT EXISTS peer_operations (
+ operation_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,
+ fingerprint TEXT NOT NULL, method TEXT NOT NULL, params TEXT NOT NULL, status TEXT NOT NULL,
+ result TEXT, error TEXT, created REAL NOT NULL, updated REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS peer_operation_identity ON peer_operations(node_id,state_generation,operation_id);
+CREATE TABLE IF NOT EXISTS peer_inbox (
+ delivery_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, node_id TEXT NOT NULL,
+ state_generation TEXT NOT NULL, target_seq INTEGER NOT NULL,
+ seq_kind TEXT NOT NULL DEFAULT 'delivery', operation_id TEXT NOT NULL,
+ payload TEXT NOT NULL, status TEXT NOT NULL, receipt TEXT, created REAL NOT NULL,
+ UNIQUE(host_id,node_id,state_generation,target_seq)
+);
+CREATE INDEX IF NOT EXISTS peer_inbox_operation ON peer_inbox(operation_id);
+CREATE TABLE IF NOT EXISTS node_outbox (
+ seq INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT UNIQUE NOT NULL,
+ group_id TEXT, native_id TEXT, method TEXT NOT NULL, payload TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending', created REAL NOT NULL,
+ pulled_at REAL, acked_at REAL
+);
+CREATE INDEX IF NOT EXISTS node_outbox_pending ON node_outbox(status,seq);
 """
 
 
@@ -237,6 +259,35 @@ class Store:
             )
             self.event(db, "session_opened", {}, session)
             return self.remember(db, request_id, fingerprint, {"session_id": session, "revision": 0})
+
+    def create_session(self, db, profile: Profile, cwd: str, access: str, parent: str | None = None, workspace=None):
+        """Insert one session inside an existing transaction (peer.deliver composite open, ADR-13).
+
+        Unlike `open`, this does not allocate a `requests` row: the caller's peer operation record is the
+        idempotency key, so session creation and task enqueueing can share one SQLite transaction.
+        """
+        directory = Path(cwd).expanduser().resolve()
+        if not directory.is_dir():
+            raise BridgeError("invalid_directory", "Working directory must exist")
+        if access not in {"read-only", "workspace-write"}:
+            raise BridgeError("invalid_access", "access must be read-only or workspace-write")
+        session = identifier()
+        native = identifier() if profile.runtime == "claude" else None
+        db.execute(
+            "INSERT INTO sessions(id,profile,cwd,access,parent,native_id,created,workspace) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                session,
+                encode(asdict(profile)),
+                str(directory),
+                access,
+                parent,
+                native,
+                time.time(),
+                encode(workspace or {}),
+            ),
+        )
+        self.event(db, "session_opened", {}, session)
+        return session, str(directory)
 
     def dispatch(
         self, session_id: str, instruction: str, request_id: str, dependencies=None, reservation=0, details=None
@@ -1156,3 +1207,271 @@ class Store:
                 (*values, min(limit, 200)),
             ).fetchall()
         return [{**dict(row), "data": json.loads(row["data"])} for row in rows]
+
+    # ---------------------------------------------------------------- multi-machine phase B storage
+
+    @staticmethod
+    def _decode_json(value):
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+
+    @classmethod
+    def _peer_operation(cls, row):
+        value = dict(row)
+        value["params"] = cls._decode_json(value.get("params"))
+        value["result"] = cls._decode_json(value.get("result"))
+        value["error"] = cls._decode_json(value.get("error"))
+        return value
+
+    @classmethod
+    def _peer_inbox(cls, row):
+        value = dict(row)
+        value["payload"] = cls._decode_json(value.get("payload"))
+        value["receipt"] = cls._decode_json(value.get("receipt"))
+        return value
+
+    @classmethod
+    def _node_outbox(cls, row):
+        value = dict(row)
+        value["payload"] = cls._decode_json(value.get("payload"))
+        return value
+
+    def record_operation(
+        self,
+        operation_id,
+        node_id=None,
+        state_generation=None,
+        fingerprint=None,
+        method=None,
+        params=None,
+        status="pending",
+        result=None,
+        error=None,
+    ):
+        """Persist one idempotency record for `(node_id, state_generation, operation_id)` (ADR-04).
+
+        Re-recording the same operation with an identical fingerprint returns the existing row, which lets a
+        crash/retry path inspect the stored outcome instead of running the work twice.
+        """
+        if not isinstance(operation_id, str) or not operation_id:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "operation_id must be a non-empty string")
+        now = time.time()
+        encoded_params = encode(params if params is not None else {})
+        encoded_result = encode(result) if result is not None else None
+        encoded_error = None if error is None else (error if isinstance(error, str) else encode(error))
+        with self.connection(write=True) as db:
+            existing = db.execute(
+                "SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if existing is not None:
+                if fingerprint is not None and existing["fingerprint"] != fingerprint:
+                    raise BridgeError(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "operation_id was already used for different parameters",
+                    )
+                return self._peer_operation(existing)
+            db.execute(
+                "INSERT INTO peer_operations(operation_id,node_id,state_generation,fingerprint,method,params,status,result,error,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    operation_id,
+                    node_id or "",
+                    state_generation or "",
+                    fingerprint or "",
+                    method or "",
+                    encoded_params,
+                    status,
+                    encoded_result,
+                    encoded_error,
+                    now,
+                    now,
+                ),
+            )
+            row = db.execute("SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            return self._peer_operation(row)
+
+    def get_operation(self, operation_id, node_id=None, state_generation=None, fingerprint=None):
+        """Return one operation record, optionally constrained to the ADR-04 identity namespace.
+
+        A supplied fingerprint only matches when it equals the stored one, so callers can distinguish a replay
+        from a conflicting reuse of the same operation_id.
+        """
+        if not isinstance(operation_id, str) or not operation_id:
+            return None
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        if row is None:
+            return None
+        if node_id is not None and row["node_id"] != node_id:
+            return None
+        if state_generation is not None and row["state_generation"] != state_generation:
+            return None
+        if fingerprint is not None and row["fingerprint"] != fingerprint:
+            return None
+        return self._peer_operation(row)
+
+    def update_operation(self, operation_id, status=None, result=None, error=None, params=None):
+        """Update an existing operation record and touch `updated`; returns the refreshed row."""
+        assignments = ["updated=?"]
+        values = [time.time()]
+        for column, value in (("status", status), ("params", params)):
+            if value is not None:
+                assignments.append(f"{column}=?")
+                values.append(encode(value) if column == "params" else value)
+        if result is not None:
+            assignments.append("result=?")
+            values.append(encode(result))
+        if error is not None:
+            assignments.append("error=?")
+            values.append(error if isinstance(error, str) else encode(error))
+        values.append(operation_id)
+        with self.connection(write=True) as db:
+            changed = db.execute(
+                "UPDATE peer_operations SET " + ",".join(assignments) + " WHERE operation_id=?", values
+            ).rowcount
+            if not changed:
+                raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown operation: {operation_id}")
+            row = db.execute("SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            return self._peer_operation(row)
+
+    def record_inbox_delivery(
+        self,
+        delivery_id,
+        host_id,
+        node_id,
+        state_generation,
+        target_seq,
+        operation_id,
+        payload,
+        status="received",
+        receipt=None,
+        seq_kind="delivery",
+    ):
+        """Persist one received delivery intent (ADR-07/ADR-08).
+
+        The `(host_id, node_id, state_generation, target_seq)` unique constraint prevents two different
+        deliveries from silently occupying the same sequence slot. Re-recording the same delivery_id is
+        idempotent so a resent frame cannot create a duplicate.
+        """
+        for name, value in (
+            ("delivery_id", delivery_id),
+            ("host_id", host_id),
+            ("node_id", node_id),
+            ("state_generation", state_generation),
+            ("operation_id", operation_id),
+        ):
+            if not isinstance(value, str) or not value:
+                raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{name} must be a non-empty string")
+        if isinstance(target_seq, bool) or not isinstance(target_seq, int) or target_seq < 0:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "target_seq must be a non-negative integer")
+        if not isinstance(seq_kind, str) or not seq_kind:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "seq_kind must be a non-empty string")
+        encoded_payload = encode(payload)
+        encoded_receipt = None if receipt is None else encode(receipt)
+        with self.connection(write=True) as db:
+            existing = db.execute("SELECT * FROM peer_inbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            if existing is not None:
+                if existing["operation_id"] != operation_id:
+                    raise BridgeError(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "delivery_id was already used for a different operation",
+                    )
+                return self._peer_inbox(existing)
+            try:
+                db.execute(
+                    "INSERT INTO peer_inbox(delivery_id,host_id,node_id,state_generation,target_seq,seq_kind,operation_id,payload,status,receipt,created) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        delivery_id,
+                        host_id,
+                        node_id,
+                        state_generation,
+                        target_seq,
+                        seq_kind,
+                        operation_id,
+                        encoded_payload,
+                        status,
+                        encoded_receipt,
+                        time.time(),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise BridgeError(
+                    PeerErrorCode.SEQUENCE_GAP,
+                    f"target_seq {target_seq} is already recorded for this node",
+                ) from error
+            row = db.execute("SELECT * FROM peer_inbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            return self._peer_inbox(row)
+
+    def get_inbox_delivery(self, delivery_id):
+        if not isinstance(delivery_id, str) or not delivery_id:
+            return None
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM peer_inbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+        return None if row is None else self._peer_inbox(row)
+
+    def add_outbox(self, operation_id, method, payload, group_id=None, native_id=None, status="pending"):
+        """Enqueue one outbound request; duplicate operation_ids are idempotent (ADR-04)."""
+        if not isinstance(operation_id, str) or not operation_id:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "operation_id must be a non-empty string")
+        if not isinstance(method, str) or not method:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "method must be a non-empty string")
+        encoded_payload = encode(payload)
+        with self.connection(write=True) as db:
+            existing = db.execute("SELECT * FROM node_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            if existing is not None:
+                if existing["payload"] != encoded_payload or existing["method"] != method:
+                    raise BridgeError(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "operation_id was already used for a different outbox request",
+                    )
+                return existing["seq"]
+            cursor = db.execute(
+                "INSERT INTO node_outbox(operation_id,group_id,native_id,method,payload,status,created) VALUES(?,?,?,?,?,?,?)",
+                (operation_id, group_id, native_id, method, encoded_payload, status, time.time()),
+            )
+            return cursor.lastrowid
+
+    def pull_outbox(self, after=0, limit=100):
+        """Return pending/pulled outbox rows after `after`, marking them pulled for retry safety."""
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "after must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "limit must be a positive integer")
+        limit = min(limit, 100)
+        now = time.time()
+        with self.connection(write=True) as db:
+            rows = db.execute(
+                "SELECT * FROM node_outbox WHERE seq>? AND status IN ('pending','pulled') ORDER BY seq LIMIT ?",
+                (after, limit),
+            ).fetchall()
+            if rows:
+                db.executemany(
+                    "UPDATE node_outbox SET status='pulled',pulled_at=? WHERE seq=?",
+                    [(now, row["seq"]) for row in rows],
+                )
+                marks = ",".join("?" * len(rows))
+                rows = db.execute(
+                    f"SELECT * FROM node_outbox WHERE seq IN ({marks}) ORDER BY seq",
+                    [row["seq"] for row in rows],
+                ).fetchall()
+        return [self._node_outbox(row) for row in rows]
+
+    def ack_outbox(self, operation_id, result=None, status="acked"):
+        """Mark one outbox request acknowledged; `result` is accepted for API symmetry (no column is needed)."""
+        if not isinstance(operation_id, str) or not operation_id:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "operation_id must be a non-empty string")
+        with self.connection(write=True) as db:
+            changed = db.execute(
+                "UPDATE node_outbox SET status=?,acked_at=? WHERE operation_id=?",
+                (status, time.time(), operation_id),
+            ).rowcount
+            if not changed:
+                raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown outbox operation: {operation_id}")
+            row = db.execute("SELECT * FROM node_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            return self._node_outbox(row)
+

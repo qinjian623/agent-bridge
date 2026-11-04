@@ -72,7 +72,19 @@ class DirectPeerServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["node_state"], "ready")
         self.assertEqual(result["max_confirmed_seq"], 0)
-        self.assertEqual(result["capabilities"], ["peer.hello", "peer.inspect"])
+        self.assertEqual(
+            result["capabilities"],
+            [
+                "peer.hello",
+                "peer.inspect",
+                "peer.catalog",
+                "peer.deliver",
+                "peer.lookup_delivery",
+                "peer.cancel",
+                "peer.result",
+                "peer.events",
+            ],
+        )
         self.assertTrue(result["broker_version"])
 
     async def test_hello_rejects_unsupported_versions(self):
@@ -133,7 +145,7 @@ class DirectPeerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["error"]["code"], PeerErrorCode.INVALID_PARAMS)
 
     async def test_unimplemented_whitelisted_methods_are_reported_as_not_implemented(self):
-        response = await self.service.handle(request("peer.catalog", {}))
+        response = await self.service.handle(request("peer.pull_requests", {"after": 0}))
 
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], PeerErrorCode.NOT_IMPLEMENTED)

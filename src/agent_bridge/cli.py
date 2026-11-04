@@ -33,6 +33,16 @@ def build_parser():
     relay.add_argument("--state", default=argparse.SUPPRESS)
     worker = commands.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("session_id")
+    monitor = commands.add_parser("monitor", help="Monitor active agents, tasks, and communications")
+    monitor.add_argument("--web", action="store_true", help="Launch local web-based monitor dashboard")
+    monitor.add_argument("--port", type=int, default=8080, help="Web monitor port (default: 8080)")
+    monitor.add_argument("--host", default="127.0.0.1", help="Web monitor host (default: 127.0.0.1)")
+    monitor.add_argument("--interval", type=float, default=2.0, help="Terminal refresh interval in seconds (default: 2.0)")
+    monitor.add_argument("--once", action="store_true", help="Print a single terminal dashboard snapshot and exit")
+    monitor.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --once (default: text)")
+    name_cmd = commands.add_parser("name", help="Set human-friendly alias name for a session")
+    name_cmd.add_argument("session_id", help="Session ID (prefix or full UUID)")
+    name_cmd.add_argument("name", help="Human-readable alias name")
     call = commands.add_parser("call", help="Call a tool using JSON from --json or stdin")
     call.add_argument("method")
     call.add_argument("--json", default=None)
@@ -88,8 +98,16 @@ def main():
             from .node_identity import FileNodeIdentityStore
             from .peer_api import DirectPeerService
             from .peer_transport import DirectRelayServer
+            from .store import Store
 
-            service = DirectPeerService(FileNodeIdentityStore(state), host_id=socket.gethostname())
+            config_path = state / "config.json"
+            config = Config.load(config_path) if config_path.exists() else None
+            service = DirectPeerService(
+                FileNodeIdentityStore(state),
+                host_id=socket.gethostname(),
+                store=Store(state),
+                config=config,
+            )
             asyncio.run(DirectRelayServer(service).serve(_AsyncStdinReader(sys.stdin.buffer), sys.stdout.buffer))
         elif args.command == "mcp":
             from .mcp_server import server
@@ -116,6 +134,20 @@ def main():
                     indent=2,
                 )
             )
+        elif args.command == "monitor":
+            if args.web:
+                from .web_monitor import run_web_monitor
+
+                run_web_monitor(state, host=args.host, port=args.port)
+            else:
+                from .monitor import run_tui_monitor
+
+                run_tui_monitor(state, interval=args.interval, once=args.once, output_format=args.format)
+        elif args.command == "name":
+            from .monitor import set_session_name
+
+            set_session_name(state, args.session_id, args.name)
+            print(f"Session {args.session_id} named: {args.name}")
         else:
             from .broker import request
 

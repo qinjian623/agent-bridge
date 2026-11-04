@@ -19,6 +19,11 @@ def server(state):
         return await request(state, "agent_hosts", {})
 
     @mcp.tool(annotations=read_only)
+    async def agent_monitor(limit: int = 15, include_events: bool = True) -> dict:
+        """Overall multi-agent monitor snapshot: cluster hosts, active sessions, running tasks, pending questions/approvals, broadcasts, and recent communications."""
+        return await request(state, "agent_monitor", locals())
+
+    @mcp.tool(annotations=read_only)
     async def agent_groups(group_id: str | None = None) -> dict:
         """List active groups, or inspect one group's revision and member session states. Does not send messages."""
         return await request(state, "agent_groups", locals())
@@ -52,9 +57,14 @@ def server(state):
         return await request(state, "agent_group_inbox", locals())
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True))
-    async def agent_catalog(refresh: bool = False, profile: str | None = None) -> dict:
-        """Discover models from configured providers without inference. Cache 5 minutes; refresh forces a query. Returns per-profile errors/stale data. Select an exact discovered ID with profile + model in open/dispatch; listed does not mean inference-verified."""
+    async def agent_catalog(refresh: bool = False, profile: str | None = None, host_id: str | None = None) -> dict:
+        """Discover models from configured providers without inference, locally or on a registered remote host. Cache 5 minutes; refresh forces a query. Returns per-profile errors/stale data. Select an exact discovered ID with profile + model in open/dispatch; listed does not mean inference-verified."""
         return await request(state, "agent_catalog", locals())
+
+    @mcp.tool(annotations=read_only)
+    async def agent_operation(operation_id: str, wait: float | None = None) -> dict:
+        """Read the state and stored result of a cross-host operation by its stable operation_id. Optional wait (seconds, capped) polls until the operation settles or the timeout expires; a timeout is not failure."""
+        return await request(state, "agent_operation", locals())
 
     @mcp.tool()
     async def agent_open(
@@ -67,8 +77,10 @@ def server(state):
         snapshot_files: list[str] | None = None,
         workspace_mode: str = "git",
         model: str | None = None,
+        host_id: str | None = None,
+        project_id: str | None = None,
     ) -> dict:
-        """Create a persistent native session. Optional model selects an exact discovered ID under this profile's provider/auth/quota. Writes use a Git worktree; snapshot_files selects current file contents. Non-Git workspace_mode=copy requires snapshot_files."""
+        """Create a persistent native session locally or on a registered remote host. Optional model selects an exact discovered ID under this profile's provider/auth/quota. Writes use a Git worktree; snapshot_files selects current file contents. Non-Git workspace_mode=copy requires snapshot_files. For remote hosts, cwd stays the local source directory and project_id names the managed remote project; open+dispatch is one atomic operation there (ADR-13)."""
         return await request(state, "agent_open", locals())
 
     @mcp.tool()
@@ -88,8 +100,10 @@ def server(state):
         snapshot_files: list[str] | None = None,
         workspace_mode: str = "git",
         model: str | None = None,
+        host_id: str | None = None,
+        project_id: str | None = None,
     ) -> dict:
-        """Queue one task. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Optional profile + model selects an exact discovered model; existing sessions cannot change models. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result. No verified hard_budget support."""
+        """Queue one task locally or on a registered remote host. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Optional profile + model selects an exact discovered model; existing sessions cannot change models. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result. No verified hard_budget support. Remote dispatch without session_id uses one atomic open+dispatch operation; cwd is the local source dir and project_id names the remote project."""
         return await request(state, "agent_dispatch", locals())
 
     @mcp.tool()
@@ -117,8 +131,14 @@ def server(state):
         return await request(state, "agent_control", locals())
 
     @mcp.tool()
-    async def agent_cancel(task_id: str, request_id: str) -> dict:
-        """Cancel this task, keeping other tasks and the session intact."""
+    async def agent_cancel(
+        task_id: str | None = None,
+        request_id: str = "",
+        operation_id: str | None = None,
+        delivery_id: str | None = None,
+        host_id: str | None = None,
+    ) -> dict:
+        """Cancel by exactly one of task_id, operation_id or delivery_id, keeping other tasks and the session intact. host_id routes the cancel to a registered remote node; operation_id/delivery_id also work before a remote task_id exists (ADR-11)."""
         return await request(state, "agent_cancel", locals())
 
     @mcp.tool(annotations=read_only)
