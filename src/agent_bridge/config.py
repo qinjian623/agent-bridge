@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .errors import BridgeError
+from .hosts import HostConfig, parse_hosts
 from .usage import validate_price
 
 
@@ -102,6 +103,7 @@ class Config:
     codex_async_python: str | None = None
     telegram_database: str | None = None
     default_strategy: str = "balanced"
+    hosts: dict[str, HostConfig] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path):
@@ -110,7 +112,8 @@ class Config:
         if "telegram_database" not in data and telegram_db.is_file():
             data["telegram_database"] = str(telegram_db)
         profiles = {name: Profile(name=name, **value).validate() for name, value in data.pop("profiles").items()}
-        config = cls(profiles=profiles, **data)
+        hosts = parse_hosts(data.pop("hosts", {}))
+        config = cls(profiles=profiles, hosts=hosts, **data)
         if config.default_strategy not in {"balanced", "cost", "speed"}:
             raise BridgeError("invalid_config", "default_strategy must be balanced, cost or speed")
         if config.parallel_limit < 1 or config.quota_limit < 1:

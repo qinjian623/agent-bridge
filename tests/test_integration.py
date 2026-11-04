@@ -29,6 +29,13 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(
                 {
                     "profiles": {"fixed": {"runtime": "codex", "model": "fixed-model", "executable": sys.executable}},
+                    "hosts": {
+                        "gpu-a": {
+                            "ssh_target": "gpu-a.internal",
+                            "remote_executable": "/usr/local/bin/agent-bridge",
+                            "pinned": {"node_id": "node-a", "state_generation": "generation-a"},
+                        }
+                    },
                     "worker_launcher": "detached",
                     "telegram_database": None,
                 }
@@ -65,7 +72,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             await session.initialize()
             tools = await session.list_tools()
             self.assertEqual({"agent_catalog", "agent_open", "agent_dispatch", "agent_control", "agent_cancel",
-                              "agent_inspect", "agent_wait", "agent_result", "agent_review",
+                              "agent_inspect", "agent_wait", "agent_result", "agent_review", "agent_hosts",
                               "agent_groups", "agent_group", "agent_broadcast", "agent_broadcast_status", "agent_group_inbox"}, {t.name for t in tools.tools})
             for name in ("agent_open", "agent_dispatch"):
                 self.assertIn("model", next(t for t in tools.tools if t.name == name).inputSchema["properties"])
@@ -89,6 +96,45 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(inspected.isError, inspected)
             self.assertEqual("fixed-model", json.loads(inspected.content[0].text)["profile"]["model"])
         self.assertEqual(1, len(self.broker.store.sessions()))
+
+    async def test_agent_hosts_tool_lists_registered_hosts_without_network(self):
+        params = StdioServerParameters(
+            command=sys.executable, args=["-m", "agent_bridge.cli", "--state", str(self.state), "mcp"]
+        )
+        async with stdio_client(params) as (reader, writer), ClientSession(reader, writer) as session:
+            await session.initialize()
+            tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+            self.assertTrue(tools["agent_hosts"].annotations.readOnlyHint)
+            self.assertEqual(tools["agent_hosts"].inputSchema.get("properties", {}), {})
+
+            listed = await session.call_tool("agent_hosts", {})
+            self.assertFalse(listed.isError, listed)
+            hosts = json.loads(listed.content[0].text)["hosts"]
+            self.assertEqual(["gpu-a"], [host["host_id"] for host in hosts])
+            self.assertEqual(
+                {
+                    "host_id",
+                    "state",
+                    "node_id",
+                    "state_generation",
+                    "last_contact",
+                    "protocol_version",
+                    "detail",
+                },
+                set(hosts[0]),
+            )
+            self.assertEqual("offline", hosts[0]["state"])
+            self.assertEqual("node-a", hosts[0]["node_id"])
+            self.assertEqual("generation-a", hosts[0]["state_generation"])
+            self.assertIsNone(hosts[0]["last_contact"])
+            self.assertIsNone(hosts[0]["protocol_version"])
+
+            filtered = await self.broker.call("agent_hosts", {"host_id": "gpu-a"})
+            self.assertEqual(hosts, filtered["hosts"])
+
+            with self.assertRaises(BridgeError) as caught:
+                await self.broker.call("agent_hosts", {"host_id": "missing"})
+            self.assertEqual(caught.exception.code, "peer_host_unknown")
 
     async def test_child_client_cannot_control_owner(self):
         with (

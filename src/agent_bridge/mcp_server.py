@@ -14,6 +14,11 @@ def server(state):
     read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 
     @mcp.tool(annotations=read_only)
+    async def agent_hosts() -> dict:
+        """List administrator-registered execution hosts with their cached state, pinned identity and last contact. Never opens a network connection; refresh happens through peer traffic."""
+        return await request(state, "agent_hosts", {})
+
+    @mcp.tool(annotations=read_only)
     async def agent_groups(group_id: str | None = None) -> dict:
         """List active groups, or inspect one group's revision and member session states. Does not send messages."""
         return await request(state, "agent_groups", locals())

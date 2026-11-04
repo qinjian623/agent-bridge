@@ -4,14 +4,24 @@ import argparse
 import asyncio
 import json
 import os
+import socket
 import sys
 
 from .config import Config, state_directory
 from .errors import BridgeError
 
 
-def main():
-    os.umask(0o077)
+class _AsyncStdinReader:
+    """Async line reader over a blocking binary stream such as sys.stdin.buffer."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    async def readline(self):
+        return await asyncio.to_thread(self._stream.readline)
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description="Persistent local Codex / Claude Code / Pi / Antigravity sessions")
     parser.add_argument("--state")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -19,12 +29,19 @@ def main():
     commands.add_parser("serve", help="Run the persistent Unix socket broker")
     commands.add_parser("mcp", help="Run the MCP tools over stdio")
     commands.add_parser("doctor", help="Check local configuration and installed CLI paths")
+    relay = commands.add_parser("relay", help="Bridge stdin/stdout peer JSONL to the local node service")
+    relay.add_argument("--state", default=argparse.SUPPRESS)
     worker = commands.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("session_id")
     call = commands.add_parser("call", help="Call a tool using JSON from --json or stdin")
     call.add_argument("method")
     call.add_argument("--json", default=None)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    os.umask(0o077)
+    args = build_parser().parse_args()
     try:
         state = state_directory(args.state)
         if args.command == "init":
@@ -67,6 +84,13 @@ def main():
             from .worker import Worker
 
             asyncio.run(Worker(state, Config.load(state / "config.json"), args.session_id).run())
+        elif args.command == "relay":
+            from .node_identity import FileNodeIdentityStore
+            from .peer_api import DirectPeerService
+            from .peer_transport import DirectRelayServer
+
+            service = DirectPeerService(FileNodeIdentityStore(state), host_id=socket.gethostname())
+            asyncio.run(DirectRelayServer(service).serve(_AsyncStdinReader(sys.stdin.buffer), sys.stdout.buffer))
         elif args.command == "mcp":
             from .mcp_server import server
 

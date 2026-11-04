@@ -4,6 +4,8 @@
 
 当前为可运行的开发版本。三个程序的真实执行、中断、重开，以及 Astra 父进程退出后继续处理 Sol、Pi、Claude 结果均已通过检查。包含主会话开销的小型比较见 [报告](docs/benchmark.md)。真实 Telegram 消息测试仍待授权，详见 [检查记录](docs/verification.md)。
 
+多机器接入方案见 [多机器架构规范](docs/multi-machine-design.md)（已整合 [AGY / DeepSeek 审查结论](docs/multi-machine-review.md)）。阶段 A3 已提供 `agent-bridge relay`、SSH JSONL 传输、`peer.hello` / `peer.inspect` 握手与只读 `agent_hosts` 查询；协调端路由与派单接线仍未完成，日常使用仍按单机运行。
+
 Antigravity 是新增运行时：离线 CLI 协议与 broker/worker 测试覆盖连续追问、取消、恢复、权限拒绝和 token 统计；真实 `agy 1.4.3` 已验证模型目录与零推理启动握手。真实模型推理、工具执行及取消尚未联调。
 
 ## Antigravity

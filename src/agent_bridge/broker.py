@@ -19,6 +19,7 @@ from . import groups, native_broadcast
 from .config import Config, Profile, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
+from .hosts import ConfigHostRegistry
 from .routing import choose
 from .store import Store, encode
 from .worker import alive, owned_processes
@@ -34,6 +35,7 @@ class Broker:
         self.state = state
         self.config = Config.load(state / "config.json")
         self.store = Store(state)
+        self.host_registry = ConfigHostRegistry(self.config.hosts, state)
         self.models = ModelDirectory(state)
         token_path = state / "admin.token"
         if not token_path.exists():
@@ -155,6 +157,24 @@ class Broker:
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def call(self, method, args):
+        if method == "agent_hosts":
+            host_id = args.get("host_id")
+            if host_id is not None and not isinstance(host_id, str):
+                raise BridgeError("invalid_request", "host_id must be a string")
+            return {
+                "hosts": [
+                    {
+                        "host_id": status.host_id,
+                        "state": status.state.value,
+                        "node_id": status.node.node_id if status.node else None,
+                        "state_generation": status.node.state_generation if status.node else None,
+                        "last_contact": status.last_contact,
+                        "protocol_version": status.protocol_version,
+                        "detail": status.detail,
+                    }
+                    for status in self.host_registry.status(host_id)
+                ]
+            }
         if method == "agent_groups":
             return groups.inspect_groups(self.store, args.get("group_id"))
         if method == "agent_group":
