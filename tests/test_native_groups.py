@@ -58,7 +58,9 @@ class NativeGroupTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual((1, 3), (removed["revision"], len(removed["members"])))
         deleted = groups.control_group(self.store, "nu", "delete", 1, "delete")
-        self.assertEqual([], deleted["members"])
+        self.assertEqual(
+            {m["native_id"] for m in self.members[1:]}, {m["native_id"] for m in deleted["members"]},
+        )
         self.assertEqual([], groups.inspect_groups(self.store)["groups"])
 
     def test_duplicate_requests_keep_snapshot_and_outside_never_gets_a_delivery(self):
@@ -75,9 +77,23 @@ class NativeGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, self.broadcast())
         with self.assertRaisesRegex(BridgeError, "different content"):
             groups.broadcast(self.store, "nu", "changed", 0, "send")
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE native_broadcast_deliveries SET status='skipped'")
         groups.control_group(self.store, "nu", "delete", 1, "delete")
         self.assertEqual(result, self.broadcast())
         self.assertEqual(4, len(self.rows()))
+
+    def test_delete_is_blocked_while_native_deliveries_are_unsettled(self):
+        self.create()
+        self.broadcast()
+        with self.assertRaisesRegex(BridgeError, "unsettled work") as caught:
+            groups.control_group(self.store, "nu", "delete", 0, "delete")
+        self.assertEqual("group_prune_blocked", caught.exception.code)
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE native_broadcast_deliveries SET status='skipped'")
+        deleted = groups.control_group(self.store, "nu", "delete", 0, "delete")
+        self.assertTrue(deleted["deleted"])
+        self.assertEqual(4, len(deleted["members"]))
 
     def test_invalid_native_members_and_conflicting_metadata_are_atomic(self):
         self.create()
@@ -156,6 +172,8 @@ class NativeGroupTests(unittest.IsolatedAsyncioTestCase):
         groups.control_group(self.store, "nu", "remove", 0, "remove", native_members=[member])
         with self.assertRaisesRegex(BridgeError, "not a member"):
             native_broadcast.inbox(self.store, "nu", member["runtime"], member["native_id"])
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE native_broadcast_deliveries SET status='skipped'")
         groups.control_group(self.store, "nu", "delete", 1, "delete")
         with self.assertRaisesRegex(BridgeError, "group was deleted"):
             native_broadcast.inbox(self.store, "nu", member["runtime"], member["native_id"])

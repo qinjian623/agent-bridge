@@ -1860,7 +1860,13 @@ class Broker:
                 ]
             }
         if method == "agent_groups":
-            return groups.inspect_groups(self.store, args.get("group_id"))
+            return groups.inspect_groups(
+                self.store, args.get("group_id"), args.get("active_only", False),
+            )
+        if method == "agent_group_prune":
+            return await groups.prune_groups(
+                self.store, self, args["older_than"], args.get("dry_run", True), args["request_id"],
+            )
         if method == "agent_group":
             remote_members = args.get("remote_members")
             if remote_members is not None and args.get("action") in {"create", "add"}:

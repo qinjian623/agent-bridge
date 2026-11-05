@@ -54,15 +54,17 @@ class GroupTests(unittest.TestCase):
             groups.control_group(self.store, "team", "remove", 0, "stale-remove", [first])
         with self.assertRaisesRegex(BridgeError, "sessions: missing"):
             groups.control_group(self.store, "team", "add", 1, "bad-member", [outside, "missing"])
-        self.assertEqual(added, groups.inspect_groups(self.store, "team"))
+        inspected = groups.inspect_groups(self.store, "team")
+        self.assertEqual(added, {key: inspected[key] for key in added})
         removed = groups.control_group(self.store, "team", "remove", 1, "remove", [first])
         self.assertEqual([second], [m["session_id"] for m in removed["members"]])
         self.assertEqual(2, removed["revision"])
         deleted = groups.control_group(self.store, "team", "delete", 2, "delete")
         self.assertTrue(deleted["deleted"])
-        self.assertEqual([], deleted["members"])
+        self.assertEqual([second], [m["session_id"] for m in deleted["members"]])
         self.assertEqual([], groups.inspect_groups(self.store)["groups"])
-        self.assertEqual(deleted, groups.inspect_groups(self.store, "team"))
+        inspected = groups.inspect_groups(self.store, "team")
+        self.assertEqual(deleted, {key: inspected[key] for key in deleted})
         with self.assertRaisesRegex(BridgeError, "already exists or was deleted"):
             groups.control_group(self.store, "team", "create", 0, "recreate")
         with self.assertRaisesRegex(BridgeError, "group was deleted"):

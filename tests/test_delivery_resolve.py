@@ -264,7 +264,12 @@ class ResolutionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 "UPDATE peer_outbox SET status='uncertain',revision=1 WHERE delivery_id=?",
                 (doomed_id,),
             )
-        groups.control_group(self.store, "doomed", "delete", 0, "delete-doomed")
+        with self.assertRaises(BridgeError) as caught:
+            groups.control_group(self.store, "doomed", "delete", 0, "delete-doomed")
+        self.assertEqual(PeerErrorCode.GROUP_PRUNE_BLOCKED, caught.exception.code)
+        # Deletion is impossible until the uncertain delivery settles; apply the soft-delete CAS
+        # directly to verify that delivery resolution still rejects an already-deleted group.
+        self.store.prune_group_cas("doomed", 0)
 
         with self.assertRaisesRegex(BridgeError, "group was deleted"):
             await peer_api.resolve_delivery(

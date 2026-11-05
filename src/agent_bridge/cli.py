@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import sys
+import uuid
 
 from .config import Config, state_directory
 from .errors import BridgeError
@@ -65,6 +66,18 @@ def build_parser():
     monitor.add_argument("--interval", type=float, default=2.0, help="Terminal refresh interval in seconds (default: 2.0)")
     monitor.add_argument("--once", action="store_true", help="Print a single terminal dashboard snapshot and exit")
     monitor.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --once (default: text)")
+    group = commands.add_parser("group", help="Inspect and prune explicit groups")
+    group_commands = group.add_subparsers(dest="group_command", required=True)
+    group_prune = group_commands.add_parser(
+        "prune", help="Soft-delete groups with no activity older than the threshold",
+    )
+    group_prune.add_argument(
+        "--older-than", required=True, metavar="DURATION",
+        help="Positive duration such as 7d, 12h, 2w or 3600s; activity at or after the cutoff is kept",
+    )
+    group_prune.add_argument(
+        "--dry-run", action="store_true", help="Only report eligible and blocked groups; do not delete",
+    )
     name_cmd = commands.add_parser("name", help="Set human-friendly alias name for a session")
     name_cmd.add_argument("session_id", help="Session ID (prefix or full UUID)")
     name_cmd.add_argument("name", help="Human-readable alias name")
@@ -179,6 +192,15 @@ def main():
 
             set_session_name(state, args.session_id, args.name)
             print(f"Session {args.session_id} named: {args.name}")
+        elif args.command == "group":
+            from .broker import request
+
+            result = asyncio.run(request(state, "agent_group_prune", {
+                "older_than": args.older_than,
+                "dry_run": bool(args.dry_run),
+                "request_id": uuid.uuid4().hex,
+            }))
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             from .broker import request
 

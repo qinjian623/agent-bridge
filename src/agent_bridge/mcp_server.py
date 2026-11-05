@@ -24,9 +24,16 @@ def server(state):
         return await request(state, "agent_monitor", locals())
 
     @mcp.tool(annotations=read_only)
-    async def agent_groups(group_id: str | None = None) -> dict:
-        """List active groups, or inspect one group's revision and member session states. Does not send messages."""
+    async def agent_groups(group_id: str | None = None, active_only: bool = False) -> dict:
+        """List groups with derived activity state, or inspect one group including deleted details and member states. active_only keeps active and unknown groups; unknown is deliberately included because unverified members must not disappear. Does not send messages."""
         return await request(state, "agent_groups", locals())
+
+    @mcp.tool()
+    async def agent_group_prune(
+        older_than: str | int | float, dry_run: bool = True, request_id: str | None = None,
+    ) -> dict:
+        """Administrator-only historical group cleanup. Soft-deletes groups whose last activity is strictly older than older_than (for example 7d, 12h, 2w, 3600s) only after read-only verification that every member is stopped and all work is settled; unreachable, running, or unknown members skip the group. dry_run defaults to true and only reports eligible/blocked groups. Reuse request_id to return the same run; a new request_id is required after reviewing a dry run to actually prune."""
+        return await request(state, "agent_group_prune", locals())
 
     @mcp.tool()
     async def agent_group(

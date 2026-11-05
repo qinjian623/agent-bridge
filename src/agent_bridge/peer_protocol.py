@@ -1198,7 +1198,7 @@ def fail(request_id: str, error: BridgeError) -> PeerResponse:
 
 # ---------------------------------------------------------------- group lifecycle (C5)
 
-GroupActivityState = Literal["active", "idle", "unknown", "deleted"]
+GroupActivityState = Literal["active", "inactive", "completed", "unknown", "deleted"]
 
 _DURATION_UNITS = {"s": 1, "h": 3600, "d": 86400, "w": 604800}
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?|\.\d+)([shdw]?)")

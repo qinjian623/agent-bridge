@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -7,20 +8,42 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from .agy_presence import inactive_reason as native_inactive_reason
+from .config import safe_error
 from .errors import BridgeError
 from .peer_protocol import (
     DeliverySource,
     PeerDeliveryStatus,
+    PeerErrorCode,
     canonical_operation_id,
     compute_stream_id,
+    normalize_group_prune_params,
     normalize_remote_member,
 )
 from .store import Store, encode, identifier, task_input
+from .worker import alive, owned_processes
 
 TERMINAL_RECIPIENT_STATUSES = (
     PeerDeliveryStatus.RELEASED,
     PeerDeliveryStatus.CANCELLED,
     PeerDeliveryStatus.FAILED,
+)
+TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# "pending_review" is not written by the current worker, but older or hand-edited state can contain it.
+UNSETTLED_TASK_STATUSES = frozenset({
+    "queued", "assigned", "running", "waiting_input", "interrupted", "recovery_needed", "pending_review",
+})
+# A native delivery settles only on an explicit terminal status or a terminal processing outcome.
+TERMINAL_NATIVE_STATUSES = frozenset({"skipped", "failed", "cancelled"})
+TERMINAL_PROCESSING_STATUSES = frozenset({"completed", "failed"})
+NATIVE_QUEUE_BLOCKING_STATUSES = ("pending", "sending", "uncertain")
+ACTIVE_OBSERVED_STATES = frozenset({"running", "waiting_input", "interrupted", "recovery_needed"})
+ACTIVE_STATES = frozenset({"active", "unknown"})
+_GROUP_TASK_WHERE = (
+    "(CASE WHEN json_valid(t.details) THEN json_extract(t.details,'$.group_id') END=? "
+    "OR t.id IN (SELECT r.task_id FROM broadcast_recipients r "
+    "JOIN group_broadcasts b ON b.id=r.broadcast_id "
+    "WHERE b.group_id=? AND r.task_id IS NOT NULL))"
 )
 
 
@@ -41,8 +64,13 @@ def _remote_member_view(row):
 
 def group_view(db, group_id):
     row = Store.required(db, "session_groups", group_id)
+    created = row["created"]
     return {
         "group_id": row["id"], "revision": row["revision"], "deleted": bool(row["deleted"]),
+        "deleted_at": row["deleted_at"], "delete_reason": row["delete_reason"],
+        "created": created,
+        "updated_at": created if row["updated_at"] is None else row["updated_at"],
+        "last_activity_at": created if row["last_activity_at"] is None else row["last_activity_at"],
         "members": [dict(member) for member in db.execute(
             "SELECT m.session_id,s.desired,s.observed FROM session_group_members m JOIN sessions s ON s.id=m.session_id WHERE m.group_id=? ORDER BY m.session_id",
             (group_id,),
@@ -60,20 +88,195 @@ def group_view(db, group_id):
     }
 
 
-def inspect_groups(store, group_id=None):
+def _recipient_is_settled(db, recipient):
+    """Resolve a frozen broadcast recipient to its live work item; stored status alone goes stale."""
+    if recipient["task_id"]:
+        task = db.execute("SELECT status FROM tasks WHERE id=?", (recipient["task_id"],)).fetchone()
+        return task is not None and task["status"] in TERMINAL_TASK_STATUSES
+    if recipient["delivery_id"]:
+        outbox = db.execute(
+            "SELECT status FROM peer_outbox WHERE delivery_id=?", (recipient["delivery_id"],),
+        ).fetchone()
+        if outbox is not None:
+            return outbox["status"] in TERMINAL_RECIPIENT_STATUSES
+        native = db.execute(
+            "SELECT status,processing_status FROM native_broadcast_deliveries WHERE id=?",
+            (recipient["delivery_id"],),
+        ).fetchone()
+        if native is not None:
+            return (
+                native["status"] in TERMINAL_NATIVE_STATUSES
+                or native["processing_status"] in TERMINAL_PROCESSING_STATUSES
+            )
+        queue = db.execute(
+            "SELECT status,processing_status FROM native_send_queue WHERE delivery_source=? AND delivery_id=?",
+            (str(DeliverySource.LOCAL_BROADCAST), recipient["delivery_id"]),
+        ).fetchone()
+        if queue is not None:
+            return (
+                queue["status"] in TERMINAL_NATIVE_STATUSES
+                or queue["processing_status"] in TERMINAL_PROCESSING_STATUSES
+            )
+        # A delivery row disappeared without a provable terminal outcome.
+        return False
+    return recipient["status"] in {"skipped", *TERMINAL_RECIPIENT_STATUSES}
+
+
+def _unsettled_work(db, group_id):
+    """Return every durable work item that makes this group unsafe to delete or prune."""
+    items = [{"type": "task", "id": row["id"], "status": row["status"]}
+             for row in db.execute(
+                 "SELECT t.id,t.status FROM tasks t WHERE " + _GROUP_TASK_WHERE + " ORDER BY t.id",
+                 (group_id, group_id),
+             ) if row["status"] in UNSETTLED_TASK_STATUSES]
+    items.extend(
+        {"type": "question", "id": row["id"]}
+        for row in db.execute(
+            "SELECT q.id FROM questions q JOIN tasks t ON t.id=q.task_id "
+            "WHERE q.status='pending' AND " + _GROUP_TASK_WHERE + " ORDER BY q.id",
+            (group_id, group_id),
+        )
+    )
+    recipients = db.execute(
+        "SELECT r.broadcast_id,r.recipient_key,r.task_id,r.delivery_id,r.status "
+        "FROM broadcast_recipients r JOIN group_broadcasts b ON b.id=r.broadcast_id "
+        "WHERE b.group_id=? ORDER BY r.broadcast_id,r.recipient_key",
+        (group_id,),
+    ).fetchall()
+    items.extend(
+        {"type": "broadcast_recipient", "id": row["recipient_key"], "broadcast_id": row["broadcast_id"]}
+        for row in recipients if not _recipient_is_settled(db, row)
+    )
+    items.extend(
+        {"type": "outbox", "id": row["delivery_id"], "status": row["status"]}
+        for row in db.execute(
+            "SELECT delivery_id,status FROM peer_outbox WHERE group_id=? "
+            f"AND status NOT IN ({','.join('?' for _ in TERMINAL_RECIPIENT_STATUSES)}) ORDER BY delivery_id",
+            (group_id, *TERMINAL_RECIPIENT_STATUSES),
+        )
+    )
+    items.extend(
+        {"type": "node_outbox", "id": row["seq"], "status": row["status"]}
+        for row in db.execute(
+            "SELECT seq,status FROM node_outbox WHERE group_id=? AND status!='acked' ORDER BY seq",
+            (group_id,),
+        )
+    )
+    return items
+
+
+def _native_queue_blocking(db, runtime, native_id):
+    return db.execute(
+        "SELECT status FROM native_send_queue WHERE runtime=? AND native_id=? "
+        f"AND status IN ({','.join('?' for _ in NATIVE_QUEUE_BLOCKING_STATUSES)}) LIMIT 1",
+        (runtime, native_id, *NATIVE_QUEUE_BLOCKING_STATUSES),
+    ).fetchone()
+
+
+def _activity_state(db, group, now):
+    """Derive the conservative activity classification from current members and durable work."""
+    group_id = group["id"]
+    unsettled = _unsettled_work(db, group_id)
+    bridge = [dict(row) for row in db.execute(
+        "SELECT m.session_id,s.desired,s.observed,s.worker_pid,s.worker_start,s.process_scope "
+        "FROM session_group_members m JOIN sessions s ON s.id=m.session_id "
+        "WHERE m.group_id=? ORDER BY m.session_id",
+        (group_id,),
+    )]
+    natives = [dict(row) for row in db.execute(
+        "SELECT runtime,native_id FROM native_group_members WHERE group_id=? ORDER BY runtime,native_id",
+        (group_id,),
+    )]
+    remotes = [dict(row) for row in db.execute(
+        "SELECT host_id,node_id,state_generation,target_kind,runtime,target_id "
+        "FROM remote_group_members WHERE group_id=? "
+        "ORDER BY host_id,node_id,state_generation,target_kind,runtime,target_id",
+        (group_id,),
+    )]
+    active_reasons = []
+    unknown_reasons = []
+    if unsettled:
+        active_reasons.append(f"{len(unsettled)} unsettled work item(s) must settle first")
+    for member in bridge:
+        sid = member["session_id"]
+        observed = member["observed"]
+        if member["desired"] == "open":
+            active_reasons.append(f"bridge session {sid} is open")
+        if observed in ACTIVE_OBSERVED_STATES:
+            active_reasons.append(f"bridge session {sid} is observed {observed}")
+        elif observed != "stopped":
+            # starting/idle mean the worker process exists; paused does not imply exited.
+            active_reasons.append(f"bridge session {sid} is not stopped (observed {observed})")
+        elif member["worker_pid"] and alive(member):
+            active_reasons.append(f"bridge session {sid} still owns a live worker process")
+        elif member["process_scope"]:
+            processes = owned_processes(member["process_scope"])
+            if processes["status"] == "running":
+                active_reasons.append(f"bridge session {sid} still owns worker processes")
+            elif processes["status"] != "stopped":
+                unknown_reasons.append(f"bridge session {sid} process state cannot be verified")
+    for member in natives:
+        runtime, native_id = member["runtime"], member["native_id"]
+        blocked = _native_queue_blocking(db, runtime, native_id)
+        if blocked is not None:
+            active_reasons.append(f"native session {runtime}:{native_id} has a {blocked['status']} delivery")
+        else:
+            # There is no durable process proof for an idle native session; never claim it is stopped.
+            unknown_reasons.append(f"native session {runtime}:{native_id} process state cannot be reliably verified")
+    for member in remotes:
+        unknown_reasons.append(
+            f"remote member {member['host_id']}:{member['target_kind']}:{member['target_id']} "
+            "cannot be verified from this node"
+        )
+    has_members = bool(bridge or natives or remotes)
+    if active_reasons:
+        state, reasons = "active", active_reasons + unknown_reasons
+    elif unknown_reasons:
+        state, reasons = "unknown", unknown_reasons
+    elif not has_members:
+        state, reasons = "inactive", ["group has no members and no unsettled work"]
+    elif not natives and not remotes and all(
+        member["desired"] == "closed" and member["observed"] == "stopped" for member in bridge
+    ):
+        state, reasons = "completed", ["all members are closed and stopped; all work is settled"]
+    else:
+        state, reasons = "inactive", ["all members are stopped; no unsettled work"]
+    if group["deleted"]:
+        state, reasons = "deleted", ["group is soft-deleted"]
+    return {
+        "activity_state": state,
+        "active": state in ACTIVE_STATES,
+        "activity_reasons": reasons,
+        "last_activity_at": group["created"] if group["last_activity_at"] is None else group["last_activity_at"],
+        "checked_at": now,
+        "stale": state == "unknown" or (state != "deleted" and bool(unknown_reasons)),
+        "unsettled_count": len(unsettled),
+        "member_count": len(bridge) + len(natives) + len(remotes),
+        "remote_member_count": len(remotes),
+    }
+
+
+def inspect_groups(store, group_id=None, active_only=False):
+    if not isinstance(active_only, bool):
+        raise BridgeError("invalid_request", "active_only must be a boolean")
     if group_id is not None:
         validate_group_id(group_id)
     with store.connection() as db:
         db.execute("BEGIN")
+        now = time.time()
         if group_id is not None:
-            return group_view(db, group_id)
-        return {"groups": [dict(row) for row in db.execute(
-            "SELECT g.id AS group_id,g.revision,"
-            "(SELECT COUNT(*) FROM session_group_members WHERE group_id=g.id)+"
-            "(SELECT COUNT(*) FROM native_group_members WHERE group_id=g.id)+"
-            "(SELECT COUNT(*) FROM remote_group_members WHERE group_id=g.id) AS member_count "
-            "FROM session_groups g WHERE g.deleted=0 ORDER BY g.created,g.id"
-        )]}
+            row = Store.required(db, "session_groups", group_id)
+            view = group_view(db, group_id)
+            view.update(_activity_state(db, row, now))
+            return view
+        result = []
+        for row in db.execute("SELECT * FROM session_groups WHERE deleted=0 ORDER BY created,id").fetchall():
+            view = group_view(db, row["id"])
+            view.update(_activity_state(db, row, now))
+            if active_only and view["activity_state"] not in ACTIVE_STATES:
+                continue
+            result.append(view)
+        return {"groups": result}
 
 
 def native_members_input(members, action):
@@ -162,12 +365,16 @@ def control_group(
         fingerprint, old = store.previous(db, request_id, payload)
         if old is not None:
             return old
+        now = time.time()
         if action == "create":
             if revision != 0:
                 raise BridgeError("stale_revision", "A new group requires expected_revision=0")
             if db.execute("SELECT 1 FROM session_groups WHERE id=?", (group_id,)).fetchone():
                 raise BridgeError("group_exists", "This group_id already exists or was deleted; use a new ID")
-            db.execute("INSERT INTO session_groups(id,created) VALUES(?,?)", (group_id, time.time()))
+            db.execute(
+                "INSERT INTO session_groups(id,created,updated_at,last_activity_at) VALUES(?,?,?,?)",
+                (group_id, now, now, now),
+            )
         else:
             row = store.required(db, "session_groups", group_id)
             if row["deleted"]:
@@ -208,7 +415,6 @@ def control_group(
                     "INSERT OR IGNORE INTO native_group_members(group_id,runtime,native_id,cwd,label) VALUES(?,?,?,?,?)",
                     (group_id, member["runtime"], member["native_id"], member["cwd"], member["label"]),
                 ).rowcount)
-            now = time.time()
             joined_revision = revision if action == "create" else revision + 1
             for member in remotes:
                 receipt = encode({"member": member, "verified_at": now, "source": "agent_group"})
@@ -238,13 +444,20 @@ def control_group(
                      member["target_kind"], member["runtime"], member["target_id"]),
                 ).rowcount)
         else:
-            db.execute("DELETE FROM session_group_members WHERE group_id=?", (group_id,))
-            db.execute("DELETE FROM native_group_members WHERE group_id=?", (group_id,))
-            # Remote members stay archived with the soft-deleted group so the frozen history remains inspectable.
-            db.execute("UPDATE session_groups SET deleted=1 WHERE id=?", (group_id,))
+            if _unsettled_work(db, group_id):
+                raise BridgeError(PeerErrorCode.GROUP_PRUNE_BLOCKED, "Cannot delete group with unsettled work")
+            # Soft delete keeps the complete member snapshot (local, native and remote) for history and prune.
+            db.execute(
+                "UPDATE session_groups SET deleted=1,deleted_at=?,delete_reason='deleted',"
+                "revision=revision+1,updated_at=? WHERE id=?",
+                (now, now, group_id),
+            )
         if changed:
-            if action != "create":
-                db.execute("UPDATE session_groups SET revision=revision+1 WHERE id=?", (group_id,))
+            if action in {"add", "remove"}:
+                db.execute(
+                    "UPDATE session_groups SET revision=revision+1,updated_at=?,last_activity_at=? WHERE id=?",
+                    (now, now, group_id),
+                )
             store.event(db, "group_changed", {"group_id": group_id, "action": action, "session_ids": members,
                                                "native_members": natives, "remote_members": remotes})
         return store.remember(db, request_id, fingerprint, group_view(db, group_id))
@@ -614,3 +827,218 @@ def broadcast_status(store, broadcast_id):
             "counts": counts,
             "recipients": recipients,
         }
+
+
+def _member_snapshot(db, group_id):
+    view = group_view(db, group_id)
+    return {"members": view["members"], "remote_members": view["remote_members"]}
+
+
+def _bridge_stop_reason(db, group_id):
+    for session in db.execute(
+        "SELECT s.id,s.desired,s.observed,s.worker_pid,s.worker_start,s.process_scope "
+        "FROM session_group_members m JOIN sessions s ON s.id=m.session_id "
+        "WHERE m.group_id=? ORDER BY s.id",
+        (group_id,),
+    ):
+        sid = session["id"]
+        if session["desired"] != "closed":
+            return f"bridge session {sid} is not closed (desired={session['desired']})"
+        if session["observed"] != "stopped":
+            return f"bridge session {sid} is not stopped (observed={session['observed']})"
+        if session["worker_pid"] and alive(session):
+            return f"bridge session {sid} still owns a live worker process"
+        if session["process_scope"]:
+            processes = owned_processes(session["process_scope"])
+            if processes["status"] == "running":
+                return f"bridge session {sid} still owns worker processes"
+            if processes["status"] != "stopped":
+                return f"bridge session {sid} process state cannot be verified"
+    return None
+
+
+def _native_stop_reason(db, group_id):
+    for member in db.execute(
+        "SELECT runtime,native_id FROM native_group_members WHERE group_id=? ORDER BY runtime,native_id",
+        (group_id,),
+    ):
+        runtime, native_id = member["runtime"], member["native_id"]
+        blocked = _native_queue_blocking(db, runtime, native_id)
+        if blocked is not None:
+            return f"native session {runtime}:{native_id} has a {blocked['status']} delivery or send lock"
+        if db.execute("SELECT 1 FROM sessions WHERE native_id=?", (native_id,)).fetchone():
+            return f"native session {runtime}:{native_id} is now owned by a bridge session"
+        if runtime == "antigravity":
+            try:
+                reason = native_inactive_reason(native_id, "agy")
+            except (OSError, ValueError) as error:
+                return f"native AGY session {native_id} state cannot be verified: {safe_error(error)}"
+            if reason:
+                return f"native AGY session {native_id}: {reason}"
+    return None
+
+
+def _peer_client(broker, host_id):
+    factory = getattr(broker, "peer_factory", None)
+    if factory is None:
+        return None
+    if hasattr(factory, "client"):
+        return factory.client(host_id)
+    if callable(factory):
+        return factory(host_id)
+    return factory
+
+
+async def _remote_member_reason(broker, member):
+    host_id, target_id = member["host_id"], member["target_id"]
+    try:
+        client = _peer_client(broker, host_id)
+    except Exception as error:
+        return f"remote host {host_id} is unavailable: {safe_error(error)}"
+    if client is None:
+        return f"remote member {host_id}:{target_id} cannot be verified without a peer client"
+    try:
+        result = client.inspect({"kind": "session", "id": target_id})
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception as error:
+        return f"remote host {host_id} is unreachable: {safe_error(error)}"
+    items = result.get("items") if isinstance(result, dict) else None
+    if not isinstance(items, list):
+        return f"remote host {host_id} returned no verifiable session state"
+    matches = [
+        item for item in items
+        if isinstance(item, dict) and (item.get("id") == target_id or item.get("native_id") == target_id)
+    ]
+    if not matches:
+        return f"remote {member['target_kind']} {target_id} on {host_id} is not confirmed stopped"
+    item = matches[0]
+    if item.get("desired") not in {None, "closed"}:
+        return f"remote {member['target_kind']} {target_id} on {host_id} is not closed"
+    if item.get("observed") != "stopped":
+        return (
+            f"remote {member['target_kind']} {target_id} on {host_id} is not stopped "
+            f"(observed={item.get('observed')})"
+        )
+    return None
+
+
+async def _prune_block_reason(store, broker, group_id):
+    """ACV read-only gate: durable work, local member stop proof, then remote probes outside the DB lock."""
+    with store.connection() as db:
+        db.execute("BEGIN")
+        unsettled = _unsettled_work(db, group_id)
+        if unsettled:
+            kinds = {}
+            for item in unsettled:
+                kinds[item["type"]] = kinds.get(item["type"], 0) + 1
+            detail = ", ".join(f"{count} {kind}" for kind, count in sorted(kinds.items()))
+            return f"{len(unsettled)} unsettled work item(s) must settle first: {detail}"
+        reason = _bridge_stop_reason(db, group_id)
+        if reason:
+            return reason
+        reason = _native_stop_reason(db, group_id)
+        if reason:
+            return reason
+        remotes = [dict(row) for row in db.execute(
+            "SELECT host_id,node_id,state_generation,target_kind,runtime,target_id "
+            "FROM remote_group_members WHERE group_id=? "
+            "ORDER BY host_id,node_id,state_generation,target_kind,runtime,target_id",
+            (group_id,),
+        )]
+    if not remotes:
+        return None
+    if broker is None:
+        return "remote members require coordinator peer access"
+    reasons = []
+    for member in remotes:
+        reason = await _remote_member_reason(broker, member)
+        if reason:
+            reasons.append(reason)
+    return "; ".join(reasons) if reasons else None
+
+
+def _prune_result(run, dry_run, items):
+    summary = {"total": len(items)}
+    for item in items:
+        summary[item["status"]] = summary.get(item["status"], 0) + 1
+    return {
+        "run_id": run["id"], "cutoff": run["cutoff"], "dry_run": dry_run,
+        "items": items, "summary": summary,
+    }
+
+
+async def prune_groups(store, broker, older_than, dry_run=True, request_id=None):
+    """Authoritative Coordinator Verification (ADR-25): read-only probes, then a local CAS soft delete."""
+    params = normalize_group_prune_params({
+        "older_than": older_than, "dry_run": dry_run, "request_id": request_id,
+    })
+    seconds, dry, request_id = params["older_than"], params["dry_run"], params["request_id"]
+    cutoff = time.time() - seconds
+    fingerprint = hashlib.sha256(
+        encode({"older_than": seconds, "dry_run": dry}).encode("utf-8")
+    ).hexdigest()
+    proposed_run_id = identifier()
+    run = store.create_group_prune_run(proposed_run_id, request_id, fingerprint, cutoff)
+    if run["id"] != proposed_run_id:
+        # A retried request returns the original fixed run and never widens its candidate set.
+        return _prune_result(run, dry, store.get_group_prune_items(run["id"]))
+    run_id = run["id"]
+    cutoff = run["cutoff"]
+    try:
+        with store.connection() as db:
+            db.execute("BEGIN")
+            candidates = [dict(row) for row in db.execute(
+                "SELECT * FROM session_groups WHERE deleted=0 AND last_activity_at<? "
+                "ORDER BY last_activity_at,id",
+                (cutoff,),
+            )]
+        for group in candidates:
+            group_id, revision = group["id"], group["revision"]
+            with store.connection() as db:
+                db.execute("BEGIN")
+                snapshot = _member_snapshot(db, group_id)
+            try:
+                reason = await _prune_block_reason(store, broker, group_id)
+            except Exception as error:
+                reason = f"prune verification failed: {safe_error(error)}"
+            if reason is None and not dry:
+                # Re-read the facts that can change without a revision bump before the local CAS.
+                with store.connection() as db:
+                    db.execute("BEGIN")
+                    current = db.execute(
+                        "SELECT revision,deleted,last_activity_at,created FROM session_groups WHERE id=?",
+                        (group_id,),
+                    ).fetchone()
+                    still_unsettled = current is not None and _unsettled_work(db, group_id)
+                if (
+                    current is None or current["deleted"] or current["revision"] != revision
+                    or (current["last_activity_at"] if current["last_activity_at"] is not None else current["created"])
+                    != (group["last_activity_at"] if group["last_activity_at"] is not None else group["created"])
+                    or still_unsettled
+                ):
+                    reason = "group activity or membership changed after verification"
+            if reason is not None:
+                store.record_group_prune_item(run_id, group_id, revision, snapshot, "blocked", "skipped", reason)
+                continue
+            if dry:
+                store.record_group_prune_item(run_id, group_id, revision, snapshot, "eligible", "dry_run")
+                continue
+            try:
+                store.prune_group_cas(group_id, revision, delete_reason="pruned")
+            except BridgeError as error:
+                store.record_group_prune_item(
+                    run_id, group_id, revision, snapshot, "blocked", "skipped", safe_error(error),
+                )
+                continue
+            with store.connection(write=True) as db:
+                store.event(db, "group_pruned", {
+                    "group_id": group_id, "run_id": run_id, "delete_reason": "pruned", "cutoff": cutoff,
+                })
+            store.record_group_prune_item(run_id, group_id, revision, snapshot, "pruned", "pruned")
+    except BaseException:
+        store.finish_group_prune_run(run_id, status="failed")
+        raise
+    else:
+        store.finish_group_prune_run(run_id)
+    return _prune_result(run, dry, store.get_group_prune_items(run_id))
