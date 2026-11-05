@@ -7,16 +7,21 @@ from agent_bridge.peer_protocol import (
     CAPABILITIES,
     PEER_METHODS,
     PROTOCOL_VERSION,
+    DeliverySource,
     GroupRef,
+    NativeSendQueueItem,
     NodeRef,
     ObjectRef,
     OperationStatus,
     PeerDeliveryStatus,
     PeerErrorCode,
+    SendQueueStatus,
     TargetRef,
+    can_advance_native_queue,
     canonical_operation_id,
     compute_stream_id,
     fail,
+    is_head_blocking,
     negotiate_version,
     ok,
     require_method,
@@ -144,6 +149,38 @@ class PhaseCRefs(unittest.TestCase):
             canonical_operation_id(self.A, "g2", "peer.deliver", "r2"),
         ):
             self.assertNotEqual(base, other)
+
+
+class NativeSendQueueContract(unittest.TestCase):
+    def test_send_queue_status_values(self):
+        self.assertEqual(
+            {s.value for s in SendQueueStatus},
+            {"pending", "sending", "enqueued", "received", "uncertain", "failed", "cancelled"},
+        )
+
+    def test_delivery_source_values(self):
+        self.assertEqual(
+            {s.value for s in DeliverySource},
+            {"local_broadcast", "peer_deliver", "parent_notification", "migration"},
+        )
+
+    def test_native_send_queue_item_fields(self):
+        self.assertEqual(
+            set(NativeSendQueueItem.__annotations__),
+            {
+                "id", "runtime", "native_id", "local_seq", "delivery_source", "delivery_id", "message",
+                "status", "receipt", "native_turn_id", "processing_status", "error", "revision",
+                "created", "last_attempt",
+            },
+        )
+
+    def test_head_blocking_and_advance_are_complementary(self):
+        blocking = {"pending", "sending", "uncertain"}
+        for status in SendQueueStatus:
+            self.assertEqual(is_head_blocking(status), status.value in blocking)
+            self.assertEqual(can_advance_native_queue(status), status.value not in blocking)
+        self.assertFalse(is_head_blocking("bogus"))
+        self.assertFalse(can_advance_native_queue("bogus"))
 
 
 if __name__ == "__main__":

@@ -179,9 +179,49 @@ class PeerDeliveryStatus(StrEnum):  # coordinator peer_outbox.status
 class SendQueueStatus(StrEnum):  # node native_send_queue.status
     PENDING = "pending"
     SENDING = "sending"
+    ENQUEUED = "enqueued"
     RECEIVED = "received"
     UNCERTAIN = "uncertain"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class DeliverySource(StrEnum):  # native_send_queue.delivery_source
+    LOCAL_BROADCAST = "local_broadcast"
+    PEER_DELIVER = "peer_deliver"
+    PARENT_NOTIFICATION = "parent_notification"
+    MIGRATION = "migration"
+
+
+class NativeSendQueueItem(TypedDict):
+    id: str
+    runtime: str
+    native_id: str
+    local_seq: int
+    delivery_source: str
+    delivery_id: str
+    message: str
+    status: str
+    receipt: str | None
+    native_turn_id: str | None
+    processing_status: str | None
+    error: str | None
+    revision: int
+    created: float
+    last_attempt: float
+
+
+def is_head_blocking(status: str) -> bool:
+    return status in (SendQueueStatus.PENDING, SendQueueStatus.SENDING, SendQueueStatus.UNCERTAIN)
+
+
+def can_advance_native_queue(status: str) -> bool:
+    return status in (
+        SendQueueStatus.RECEIVED,
+        SendQueueStatus.ENQUEUED,
+        SendQueueStatus.CANCELLED,
+        SendQueueStatus.FAILED,
+    )
 
 
 class ProcessingStatus(StrEnum):  # native processing, independent of receipt
