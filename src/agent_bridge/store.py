@@ -144,7 +144,26 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE TABLE IF NOT EXISTS session_groups (
  id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,
  deleted INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL,
- last_activity_at REAL
+ updated_at REAL, last_activity_at REAL, deleted_at REAL, delete_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS group_prune_runs (
+ id TEXT PRIMARY KEY,
+ request_id TEXT NOT NULL UNIQUE,
+ fingerprint TEXT NOT NULL,
+ cutoff REAL NOT NULL,
+ status TEXT NOT NULL,
+ created REAL NOT NULL,
+ finished REAL
+);
+CREATE TABLE IF NOT EXISTS group_prune_items (
+ run_id TEXT NOT NULL REFERENCES group_prune_runs(id),
+ group_id TEXT NOT NULL REFERENCES session_groups(id),
+ expected_revision INTEGER NOT NULL,
+ member_snapshot TEXT NOT NULL,
+ check_result TEXT NOT NULL,
+ status TEXT NOT NULL,
+ reason TEXT,
+ PRIMARY KEY(run_id, group_id)
 );
 CREATE TABLE IF NOT EXISTS session_group_members (
  group_id TEXT NOT NULL REFERENCES session_groups(id), session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -348,9 +367,29 @@ class Store:
                 db.execute("UPDATE attempts SET reservation=(SELECT reservation FROM tasks WHERE id=attempts.task_id)")
             if "last_attempt" not in {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}:
                 db.execute("ALTER TABLE deliveries ADD COLUMN last_attempt REAL NOT NULL DEFAULT 0")
-            if "last_activity_at" not in {row[1] for row in db.execute("PRAGMA table_info(session_groups)")}:
-                db.execute("ALTER TABLE session_groups ADD COLUMN last_activity_at REAL")
-                db.execute("UPDATE session_groups SET last_activity_at=created")
+            group_columns = {row[1] for row in db.execute("PRAGMA table_info(session_groups)")}
+            for column, ddl in (
+                ("updated_at", "REAL"),
+                ("last_activity_at", "REAL"),
+                ("deleted_at", "REAL"),
+                ("delete_reason", "TEXT"),
+            ):
+                if column not in group_columns:
+                    db.execute(f"ALTER TABLE session_groups ADD COLUMN {column} {ddl}")
+            if "last_activity_at" not in group_columns:
+                db.execute(
+                    """UPDATE session_groups SET last_activity_at=max(created, COALESCE((SELECT max(t) FROM (
+                        SELECT e.created AS t FROM events e
+                        WHERE e.kind IN ('group_changed','group_broadcast') AND json_valid(e.data)
+                          AND json_extract(e.data,'$.group_id')=session_groups.id
+                        UNION ALL SELECT b.created FROM group_broadcasts b WHERE b.group_id=session_groups.id
+                        UNION ALL SELECT r.updated FROM broadcast_recipients r
+                          JOIN group_broadcasts b ON b.id=r.broadcast_id WHERE b.group_id=session_groups.id
+                    )), created))"""
+                )
+            db.execute("UPDATE session_groups SET last_activity_at=created WHERE last_activity_at IS NULL")
+            db.execute("UPDATE session_groups SET updated_at=created WHERE updated_at IS NULL")
+            db.execute("CREATE INDEX IF NOT EXISTS session_groups_prune ON session_groups(deleted, last_activity_at)")
             self._migrate_node_outbox(db)
             self._migrate_peer_inbox(db)
             self._migrate_native_send_queue(db)
@@ -496,6 +535,91 @@ class Store:
             return 0
         value = data.get("max_confirmed_seq") if isinstance(data, dict) else None
         return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    def create_group_prune_run(
+        self, run_id: str, request_id: str, fingerprint: str, cutoff: float, now: float | None = None
+    ) -> dict:
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT * FROM group_prune_runs WHERE request_id=?", (request_id,)).fetchone()
+            if row is not None:
+                if row["fingerprint"] != fingerprint:
+                    raise BridgeError("request_conflict", "request_id was already used with different parameters")
+                return dict(row)
+            db.execute(
+                "INSERT INTO group_prune_runs(id,request_id,fingerprint,cutoff,status,created) VALUES(?,?,?,?,?,?)",
+                (run_id, request_id, fingerprint, cutoff, "running", time.time() if now is None else now),
+            )
+            return dict(db.execute("SELECT * FROM group_prune_runs WHERE id=?", (run_id,)).fetchone())
+
+    def get_group_prune_run(self, run_id: str) -> dict | None:
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM group_prune_runs WHERE id=?", (run_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_group_prune_run_by_request_id(self, request_id: str) -> dict | None:
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM group_prune_runs WHERE request_id=?", (request_id,)).fetchone()
+            return dict(row) if row else None
+
+    def record_group_prune_item(
+        self,
+        run_id: str,
+        group_id: str,
+        expected_revision: int,
+        member_snapshot: str | dict,
+        check_result: str,
+        status: str,
+        reason: str | None = None,
+    ) -> None:
+        if not isinstance(member_snapshot, str):
+            member_snapshot = json.dumps(member_snapshot, sort_keys=True, separators=(",", ":"))
+        with self.connection(write=True) as db:
+            db.execute(
+                "INSERT OR REPLACE INTO group_prune_items(run_id,group_id,expected_revision,member_snapshot,"
+                "check_result,status,reason) VALUES(?,?,?,?,?,?,?)",
+                (run_id, group_id, expected_revision, member_snapshot, check_result, status, reason),
+            )
+
+    def get_group_prune_items(self, run_id: str) -> list[dict]:
+        with self.connection() as db:
+            rows = db.execute("SELECT * FROM group_prune_items WHERE run_id=? ORDER BY group_id", (run_id,))
+            return [dict(row) for row in rows]
+
+    def finish_group_prune_run(self, run_id: str, status: str = "completed", now: float | None = None) -> None:
+        with self.connection(write=True) as db:
+            db.execute(
+                "UPDATE group_prune_runs SET status=?, finished=? WHERE id=?",
+                (status, time.time() if now is None else now, run_id),
+            )
+
+    def prune_group_cas(
+        self, group_id: str, expected_revision: int, delete_reason: str = "pruned", now: float | None = None
+    ) -> dict:
+        ts = time.time() if now is None else now
+        with self.connection(write=True) as db:
+            cursor = db.execute(
+                "UPDATE session_groups SET deleted=1, deleted_at=:now, delete_reason=:reason, revision=revision+1 "
+                "WHERE id=:group_id AND revision=:expected_revision AND deleted=0",
+                {"now": ts, "reason": delete_reason, "group_id": group_id, "expected_revision": expected_revision},
+            )
+            row = db.execute("SELECT * FROM session_groups WHERE id=?", (group_id,)).fetchone()
+            if cursor.rowcount == 0:
+                if row is None:
+                    raise BridgeError("not_found", f"session_groups: {group_id}")
+                if row["deleted"]:
+                    raise BridgeError("group_deleted", "This group was deleted")
+                raise BridgeError(PeerErrorCode.REVISION_CONFLICT, f"stale revision, expected {expected_revision}")
+            return dict(row)
+
+    def touch_group_activity(self, group_id: str, timestamp: float | None = None, updated: bool = False, db=None) -> None:
+        ts = time.time() if timestamp is None else timestamp
+        sql = "UPDATE session_groups SET last_activity_at=?" + (", updated_at=?" if updated else "") + " WHERE id=?"
+        args = (ts, ts, group_id) if updated else (ts, group_id)
+        if db is not None:
+            db.execute(sql, args)
+            return
+        with self.connection(write=True) as own:
+            own.execute(sql, args)
 
     @contextmanager
     def connection(self, *, write=False):

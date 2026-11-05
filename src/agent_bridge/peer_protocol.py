@@ -1193,3 +1193,79 @@ def ok(request_id: str, result: dict[str, Any]) -> PeerResponse:
 
 def fail(request_id: str, error: BridgeError) -> PeerResponse:
     return {"v": PROTOCOL_VERSION, "id": request_id, "ok": False, "error": error.as_dict()}  # type: ignore[typeddict-item]
+
+
+
+# ---------------------------------------------------------------- group lifecycle (C5)
+
+GroupActivityState = Literal["active", "idle", "unknown", "deleted"]
+
+_DURATION_UNITS = {"s": 1, "h": 3600, "d": 86400, "w": 604800}
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?|\.\d+)([shdw]?)")
+
+
+class GroupPruneRun(TypedDict):
+    id: str
+    request_id: str
+    fingerprint: str
+    cutoff: float
+    status: str
+    created: float
+    finished: float | None
+
+
+class GroupPruneItem(TypedDict):
+    run_id: str
+    group_id: str
+    expected_revision: int
+    member_snapshot: str
+    check_result: str
+    status: str
+    reason: str | None
+
+
+class GroupPruneParams(TypedDict):
+    older_than: str | int | float
+    dry_run: NotRequired[bool]
+    request_id: str
+
+
+class GroupPruneResult(TypedDict):
+    run_id: str
+    cutoff: float
+    dry_run: bool
+    items: list[dict[str, Any]]
+    summary: dict[str, int]
+
+
+def parse_older_than(older_than: str | int | float) -> float:
+    """Return a positive duration in seconds from a number or a string like '7d', '12h', '2w', '3600s'."""
+    if isinstance(older_than, bool):
+        raise BridgeError("invalid_request", "older_than must be a positive number or duration string")
+    if isinstance(older_than, (int, float)):
+        value = float(older_than)
+    elif isinstance(older_than, str):
+        match = _DURATION_RE.fullmatch(older_than.strip().lower())
+        if match is None:
+            raise BridgeError("invalid_request", f"invalid older_than duration: {older_than!r}")
+        value = float(match.group(1)) * _DURATION_UNITS[match.group(2) or "s"]
+    else:
+        raise BridgeError("invalid_request", "older_than must be a positive number or duration string")
+    if not value > 0 or value == float("inf"):
+        raise BridgeError("invalid_request", "older_than must be a positive finite duration")
+    return value
+
+
+def normalize_group_prune_params(params: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise BridgeError("invalid_request", "params must be an object")
+    if "older_than" not in params:
+        raise BridgeError("invalid_request", "older_than is required")
+    older_than = parse_older_than(params["older_than"])
+    dry_run = params.get("dry_run", True)
+    if not isinstance(dry_run, bool):
+        raise BridgeError("invalid_request", "dry_run must be a boolean")
+    request_id = params.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise BridgeError("invalid_request", "request_id must be a non-empty string")
+    return {"older_than": older_than, "dry_run": dry_run, "request_id": request_id}
