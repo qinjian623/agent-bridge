@@ -861,14 +861,18 @@ class Store:
     def sessions(self):
         with self.connection() as db:
             rows = db.execute(
-                "SELECT id,desired,observed,revision,worker_pid,worker_start,generation,error,profile FROM sessions ORDER BY created"
+                "SELECT s.id,s.desired,s.observed,s.revision,s.worker_pid,s.worker_start,s.generation,s.error,s.profile,sn.name "
+                "FROM sessions s LEFT JOIN session_names sn ON sn.session_id=s.id ORDER BY s.created"
             ).fetchall()
         result = []
         for row in rows:
             value = dict(row)
             profile = json.loads(value.pop("profile"))
+            name = value.pop("name")
             value.update({key: profile.get(key) for key in ("runtime", "provider", "model", "effort", "service_tier")})
             value["profile"] = profile["name"]
+            if name is not None:
+                value["name"] = name
             result.append(value)
         return result
 

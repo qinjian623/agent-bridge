@@ -407,6 +407,19 @@ class DeliverTarget(TypedDict):
     runtime: NotRequired[str]
 
 
+class DeliverOpenSpec(TypedDict):
+    profile: str
+    project_id: NotRequired[str]
+    access: NotRequired[str]
+    cwd: NotRequired[str]
+    model: NotRequired[str]
+    workspace_mode: NotRequired[str]
+    base: NotRequired[str]
+    snapshot_files: NotRequired[list[str]]
+    name: NotRequired[str]
+    workspace_ref: NotRequired[dict[str, Any]]
+
+
 class DeliverParams(TypedDict):
     operation: OperationKey
     delivery_id: str
@@ -418,7 +431,7 @@ class DeliverParams(TypedDict):
     message: NotRequired[str]  # omitted for tombstones
     expected_group_revision: int
     # Composite open+dispatch (ADR-13): present when target.kind == "bridge" and no session exists yet.
-    open: NotRequired[dict[str, Any]]  # {profile, project_id, access, ...}; never a local cwd
+    open: NotRequired[DeliverOpenSpec]  # never a local cwd
     ordering_mode: NotRequired[str]
     stream_id: NotRequired[str]
     authority_ref: NotRequired[dict[str, str]]
@@ -429,6 +442,7 @@ class DeliverResult(TypedDict):
     delivery_id: str
     status: str  # PeerDeliveryStatus (accepted_remote | uncertain | cancelled)
     session_id: NotRequired[str]
+    name: NotRequired[str]
     task_id: NotRequired[str]
     send_status: NotRequired[str]  # SendQueueStatus
     processing_status: NotRequired[str]
