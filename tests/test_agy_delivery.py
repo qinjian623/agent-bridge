@@ -152,9 +152,14 @@ class AgyDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(native_broadcast.asyncio, "create_subprocess_exec", self.spawn_fake), \
              patch.object(native_broadcast, "send", self.codex_sender):
             sender = native_broadcast.send
-            for mode in ("wrong_receipt", "wrong_turn", "integer_turn"):
+            for index, mode in enumerate(("wrong_receipt", "wrong_turn", "integer_turn")):
+                # Each uncertain head blocks later writes to the same physical target, so use a distinct target
+                # per mode; otherwise later modes would correctly stay pending behind the first uncertainty.
+                group_id = "team-" + str(index)
+                member = dict(runtime="antigravity", native_id=str(uuid.uuid4()), cwd=str(self.root))
+                groups.control_group(self.store, group_id, "create", 0, "create-" + group_id, native_members=[member])
                 with self.subTest(mode=mode), patch.dict(os.environ, {"FAKE_AGY_DRIVER_MODE": mode}):
-                    sent = self.broadcast(mode)
+                    sent = groups.broadcast(self.store, group_id, "fixture only", 0, "send-" + mode)
                     await native_broadcast.deliver(self.store, self.config, sender)
                     row = self.agy_row(sent["broadcast_id"])
                     self.assertEqual("uncertain", row["status"])

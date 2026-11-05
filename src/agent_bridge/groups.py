@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from .errors import BridgeError
+from .peer_protocol import DeliverySource
 from .store import Store, encode, identifier, task_input
 
 
@@ -196,6 +197,12 @@ def broadcast(store, group_id, message, revision, request_id, reservation=0, *, 
                     "INSERT INTO native_broadcast_deliveries(id,broadcast_id,group_id,runtime,native_id,cwd,message,status,error,created) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (delivery_id, broadcast_id, group_id, member["runtime"], member["native_id"], member["cwd"],
                      message, status, encode(reason) if reason else None, time.time()),
+                )
+                # Same transaction and same (runtime,native_id) order as the legacy row: no sender may start
+                # between these two writes, and no later message can overtake this one.
+                store.enqueue_native_send(
+                    member["runtime"], member["native_id"], DeliverySource.LOCAL_BROADCAST,
+                    delivery_id, message, status=status, item_id=delivery_id, db=db,
                 )
                 recipients.append({"delivery_id": delivery_id, "runtime": member["runtime"],
                                    "native_id": member["native_id"], "status": status,

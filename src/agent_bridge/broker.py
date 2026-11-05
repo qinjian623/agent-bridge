@@ -63,6 +63,20 @@ class Broker:
             db.execute(
                 "UPDATE native_broadcast_deliveries SET processing_status='uncertain',error='Broker stopped after native receipt; execution outcome is unknown' WHERE status='received' AND processing_status='running'"
             )
+            # ADR-05: an in-flight native write is never retried automatically. Its outcome is unknown until a
+            # native receipt is found by inspect/lookup, so the ordered queue head stays blocked as uncertain.
+            db.execute(
+                "UPDATE native_send_queue SET status='uncertain',error='Broker restarted before queue acknowledgement' WHERE status='sending'"
+            )
+            db.execute(
+                "UPDATE native_send_queue SET processing_status='uncertain',error='Broker stopped after native receipt; execution outcome is unknown' WHERE status='received' AND processing_status='running'"
+            )
+            db.execute(
+                "UPDATE native_broadcast_deliveries SET status='uncertain',error='Broker restarted before queue acknowledgement' "
+                "WHERE status IN ('pending','sending') AND id IN ("
+                "SELECT delivery_id FROM native_send_queue WHERE delivery_source IN ('local_broadcast','native_broadcast') "
+                "AND status='uncertain' AND last_attempt>0)"
+            )
 
     async def notifications(self):
         from .notifications import deliver

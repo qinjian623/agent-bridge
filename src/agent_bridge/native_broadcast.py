@@ -5,13 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
 from pathlib import Path
 
 from .config import safe_error
 from .errors import BridgeError
 from .groups import native_members_input, validate_group_id
+from .peer_protocol import DeliverySource
 from .store import encode
+
+LEGACY_SOURCES = (str(DeliverySource.LOCAL_BROADCAST), "native_broadcast")
+QUEUE_SOURCES = (*LEGACY_SOURCES, str(DeliverySource.PEER_DELIVER), str(DeliverySource.MIGRATION))
+# Legacy rows written by an older build may still be the only evidence of an in-flight write; map them onto the
+# queue states that refuse to overtake an unconfirmed native write.
+LEGACY_STATUS = {"sending": "uncertain", "unconfirmed": "uncertain"}
 
 
 def inbox(store, group_id, runtime, native_id, after=0, limit=10):
@@ -65,7 +71,8 @@ async def send(config, delivery, *, inspect=False):
             await process.wait()
 
 
-async def send_agy(store, config, row):
+async def send_agy(store, config, row, *, queue_id=None):
+    item_id = queue_id or row["id"]
     payload = {**row, "telegram_database": config.telegram_database,
                "async_state": str(Path(config.telegram_database).parent if config.telegram_database else Path.home() / ".local/state/codex-async"),
                "timeout": config.task_timeout}
@@ -91,11 +98,11 @@ async def send_agy(store, config, row):
                     if received and received["turn_id"] != reply["turn_id"]:
                         raise ValueError("AGY changed an already confirmed native user_input step")
                     received = reply
-                    with store.connection(write=True) as db:
-                        db.execute(
-                            "UPDATE native_broadcast_deliveries SET status='received',receipt=?,native_turn_id=?,processing_status=?,error=? WHERE id=? AND status IN ('sending','received','uncertain')",
-                            (reply["receipt"], reply["turn_id"], reply.get("processing_status"), reply.get("error"), row["id"]),
-                        )
+                    store.update_native_send(
+                        item_id, status="received", receipt=reply["receipt"],
+                        native_turn_id=reply["turn_id"], processing_status=reply.get("processing_status"),
+                        error=reply.get("error"),
+                    )
                 last = reply
             await process.wait()
             if last is None or process.returncode:
@@ -106,9 +113,11 @@ async def send_agy(store, config, row):
     except Exception as error:
         if received:
             result = {**received, "processing_status": "failed", "error": "AGY stopped after receipt: " + safe_error(error)}
-            with store.connection(write=True) as db:
-                db.execute("UPDATE native_broadcast_deliveries SET processing_status='failed',error=? WHERE id=? AND status='received'",
-                           (result["error"], row["id"]))
+            store.update_native_send(
+                item_id, status="received", receipt=received["receipt"],
+                native_turn_id=received["turn_id"], processing_status="failed",
+                error=result["error"], expected_status="received",
+            )
             return result
         raise
     finally:
@@ -121,16 +130,28 @@ async def send_agy(store, config, row):
                 await process.wait()
 
 
+def _legacy_delivery(store, row):
+    if row["delivery_source"] not in LEGACY_SOURCES:
+        return None
+    with store.connection() as db:
+        found = db.execute(
+            "SELECT * FROM native_broadcast_deliveries WHERE id=?", (row["delivery_id"],)
+        ).fetchone()
+    return None if found is None else dict(found)
+
+
+def _native_owned_by_bridge(store, native_id):
+    with store.connection() as db:
+        return db.execute("SELECT 1 FROM sessions WHERE native_id=?", (native_id,)).fetchone() is not None
+
+
 async def deliver(store, config, sender=send, *, tasks=None):
     capacity = max(0, config.parallel_limit - len(tasks)) if tasks is not None else 10
-    with store.connection() as db:
-        rows = [dict(row) for row in db.execute(
-            "SELECT * FROM native_broadcast_deliveries WHERE status='pending' ORDER BY last_attempt,created LIMIT ?", (capacity,),
-        )]
+    rows = store.claim_eligible_native_sends(capacity, delivery_sources=QUEUE_SOURCES)
 
-    async def process_row(row):
+    async def process_row(row, item_id):
         try:
-            result = await send_agy(store, config, row) if row["runtime"] == "antigravity" and sender is send else await sender(config, row)
+            result = await send_agy(store, config, row, queue_id=item_id) if row["runtime"] == "antigravity" and sender is send else await sender(config, row)
             status, receipt, error = result["status"], result.get("receipt"), result.get("error")
             if status == "enqueued" and isinstance(receipt, str) and receipt:
                 pass
@@ -143,27 +164,33 @@ async def deliver(store, config, sender=send, *, tasks=None):
         except Exception as exc:
             status, receipt, error = "uncertain", None, safe_error(exc)
             result = {}
-        with store.connection(write=True) as db:
-            db.execute(
-                "UPDATE native_broadcast_deliveries SET status=?,receipt=?,native_turn_id=?,processing_status=?,error=? WHERE id=? AND status='sending'",
-                (status, receipt, result.get("turn_id"), result.get("processing_status"), error, row["id"]),
-            )
+        store.update_native_send(
+            item_id, status=status, receipt=receipt, native_turn_id=result.get("turn_id"),
+            processing_status=result.get("processing_status"), error=error, expected_status="sending",
+        )
 
     pending = []
-    for row in rows:
-        with store.connection(write=True) as db:
-            if not db.execute(
-                "UPDATE native_broadcast_deliveries SET status='sending',last_attempt=? WHERE id=? AND status='pending'",
-                (time.time(), row["id"]),
-            ).rowcount:
-                continue
-            if db.execute("SELECT 1 FROM sessions WHERE native_id=?", (row["native_id"],)).fetchone():
-                db.execute(
-                    "UPDATE native_broadcast_deliveries SET status='failed',error='Native session is now owned by bridge; inspect before sending' WHERE id=?",
-                    (row["id"],),
-                )
-                continue
-        task = asyncio.create_task(process_row(row))
+    for claimed in rows:
+        legacy = _legacy_delivery(store, claimed)
+        if legacy is not None and legacy["status"] != "pending":
+            # A legacy-only writer (older build, recovery, or an explicit tool) moved this delivery on.
+            # Adopt its fact rather than sending again; `sending` and `unconfirmed` become uncertain.
+            store.update_native_send(
+                claimed["id"], status=LEGACY_STATUS.get(legacy["status"], legacy["status"]),
+                receipt=legacy["receipt"], native_turn_id=legacy["native_turn_id"],
+                processing_status=legacy["processing_status"], error=legacy["error"],
+                expected_status="sending",
+            )
+            continue
+        if _native_owned_by_bridge(store, claimed["native_id"]):
+            store.update_native_send(
+                claimed["id"], status="failed",
+                error="Native session is now owned by bridge; inspect before sending",
+                expected_status="sending",
+            )
+            continue
+        row = claimed if legacy is None else {**legacy, **claimed}
+        task = asyncio.create_task(process_row(row, claimed["id"]))
         if tasks is not None:
             tasks.add(task)
             task.add_done_callback(tasks.discard)
@@ -234,10 +261,22 @@ async def inspect(store, config, broadcast_id, *, refresh=False, sender=send):
         except Exception as exc:
             status, receipt, error = row["status"], row["receipt"], safe_error(exc)
             turn_id = row["native_turn_id"]
-        with store.connection(write=True) as db:
-            db.execute(
-                "UPDATE native_broadcast_deliveries SET status=?,receipt=?,native_turn_id=?,error=? WHERE id=? AND status=?",
-                (status, receipt, turn_id, error, row["id"], row["status"]),
+        queued = store.get_native_send_by_delivery(DeliverySource.LOCAL_BROADCAST, row["id"])
+        if queued is None:
+            queued = store.get_native_send_by_delivery("native_broadcast", row["id"])
+        if queued is None:
+            with store.connection(write=True) as db:
+                db.execute(
+                    "UPDATE native_broadcast_deliveries SET status=?,receipt=?,native_turn_id=?,error=? WHERE id=? AND status=?",
+                    (status, receipt, turn_id, error, row["id"], row["status"]),
+                )
+        else:
+            # Absence from the native queue is never proof of non-delivery.
+            queue_status = "uncertain" if status == "unconfirmed" else status
+            store.update_native_send(
+                queued["id"], status=queue_status, receipt=receipt, native_turn_id=turn_id,
+                processing_status=row["processing_status"], error=error,
+                expected_status=queued["status"],
             )
 
     await asyncio.gather(*(check(row) for row in rows))

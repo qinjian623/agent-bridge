@@ -15,7 +15,7 @@ from .codex_parent import read_resume_config
 from .config import Config, Profile
 from .errors import BridgeError
 from .parent_usage import meter_usage, refresh_meter, start_meter
-from .peer_protocol import PeerErrorCode, compute_stream_id
+from .peer_protocol import DeliverySource, PeerErrorCode, compute_stream_id
 
 
 def encode(value):
@@ -304,6 +304,7 @@ class Store:
                 db.execute("ALTER TABLE deliveries ADD COLUMN last_attempt REAL NOT NULL DEFAULT 0")
             self._migrate_node_outbox(db)
             self._migrate_peer_inbox(db)
+            self._migrate_native_send_queue(db)
             self._initialize_commit_log(db)
         self.path.chmod(0o600)
 
@@ -370,6 +371,51 @@ class Store:
             "ON peer_inbox(stream_id,target_seq) WHERE ordering_mode='ordered'"
         )
         db.execute("CREATE INDEX IF NOT EXISTS peer_inbox_operation ON peer_inbox(operation_id)")
+
+    @staticmethod
+    def _migrate_native_send_queue(db):
+        """Import legacy native broadcast rows into the ordered send queue, exactly once.
+
+        Rows are imported per physical target in insertion order, so the historical write order is preserved
+        without guessing from UUIDs. `sending` becomes `uncertain`: after a restart the native write may or may
+        not have happened. Re-running the migration is a no-op because `(delivery_source, delivery_id)` is unique.
+        """
+        legacy = db.execute(
+            "SELECT d.* FROM native_broadcast_deliveries d "
+            "LEFT JOIN native_send_queue q "
+            "ON q.delivery_source IN (?,?) AND q.delivery_id=d.id "
+            "WHERE q.id IS NULL ORDER BY d.runtime,d.native_id,d.rowid",
+            Store.NATIVE_SEND_LEGACY_SOURCES,
+        ).fetchall()
+        counters = {}
+        for row in legacy:
+            key = (row["runtime"], row["native_id"])
+            if key not in counters:
+                saved = db.execute(
+                    "SELECT next_seq FROM native_target_counters WHERE runtime=? AND native_id=?", key
+                ).fetchone()
+                counters[key] = saved["next_seq"] if saved else 1
+            local_seq = counters[key]
+            status = "uncertain" if row["status"] == "sending" else row["status"]
+            db.execute(
+                "INSERT OR IGNORE INTO native_send_queue("
+                "id,runtime,native_id,local_seq,delivery_source,delivery_id,message,status,receipt,"
+                "native_turn_id,processing_status,error,revision,created,last_attempt) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                (
+                    row["id"], row["runtime"], row["native_id"], local_seq,
+                    "native_broadcast", row["id"], row["message"], status, row["receipt"],
+                    row["native_turn_id"], row["processing_status"], row["error"], row["created"],
+                    row["last_attempt"],
+                ),
+            )
+            counters[key] = local_seq + 1
+        for (runtime, native_id), next_seq in counters.items():
+            db.execute(
+                "INSERT INTO native_target_counters(runtime,native_id,next_seq) VALUES(?,?,?) "
+                "ON CONFLICT(runtime,native_id) DO UPDATE SET next_seq=MAX(next_seq,excluded.next_seq)",
+                (runtime, native_id, next_seq),
+            )
 
     def _initialize_commit_log(self, db):
         """Seed the commit log above the pre-migration confirmed sequence, once."""
@@ -1372,6 +1418,12 @@ class Store:
                     raise BridgeError(
                         "invalid_delivery", "Only a delivery sent to this parent can be acknowledged"
                     )
+                # The acknowledgement also proves the native write happened, releasing the ordered queue.
+                db.execute(
+                    "UPDATE native_send_queue SET status='received',error=NULL,revision=revision+1 "
+                    "WHERE delivery_source=? AND delivery_id=? AND status IN ('pending','sending','uncertain')",
+                    (DeliverySource.PARENT_NOTIFICATION, str(event_seq)),
+                )
                 desired = row["desired"]
             else:
                 desired = {
@@ -1869,4 +1921,253 @@ class Store:
                 raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown outbox operation: {operation_id}")
             row = db.execute("SELECT * FROM node_outbox WHERE operation_id=?", (operation_id,)).fetchone()
             return self._node_outbox(row)
+
+    # ---------------------------------------------------------------- multi-machine phase C native send queue
+
+    NATIVE_SEND_BLOCKING_STATUSES = ("pending", "sending", "uncertain")
+    NATIVE_SEND_LEGACY_SOURCES = (str(DeliverySource.LOCAL_BROADCAST), "native_broadcast")
+
+    @staticmethod
+    def _native_send_text(value, name):
+        if not isinstance(value, str) or not value:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{name} must be a non-empty string")
+        return value
+
+    @classmethod
+    def _allocate_native_local_seq(cls, db, runtime, native_id):
+        row = db.execute(
+            "SELECT next_seq FROM native_target_counters WHERE runtime=? AND native_id=?",
+            (runtime, native_id),
+        ).fetchone()
+        if row is None:
+            db.execute(
+                "INSERT INTO native_target_counters(runtime,native_id,next_seq) VALUES(?,?,2)",
+                (runtime, native_id),
+            )
+            return 1
+        seq = row["next_seq"]
+        db.execute(
+            "UPDATE native_target_counters SET next_seq=? WHERE runtime=? AND native_id=?",
+            (seq + 1, runtime, native_id),
+        )
+        return seq
+
+    def allocate_native_local_seq(self, runtime: str, native_id: str) -> int:
+        """Allocate the next gap-free local write sequence for one physical native target, starting at 1."""
+        runtime = self._native_send_text(runtime, "runtime")
+        native_id = self._native_send_text(native_id, "native_id")
+        with self.connection(write=True) as db:
+            return self._allocate_native_local_seq(db, runtime, native_id)
+
+    def enqueue_native_send(
+        self,
+        runtime: str,
+        native_id: str,
+        delivery_source: str,
+        delivery_id: str,
+        message: str,
+        status: str = "pending",
+        *,
+        item_id: str | None = None,
+        db=None,
+    ) -> dict:
+        """Persist one write to a native target, ordered by `(runtime, native_id, local_seq)`.
+
+        `(delivery_source, delivery_id)` is the idempotency key: replaying the same logical delivery returns the
+        existing row instead of allocating another sequence. Pass `db` to join a caller's transaction; groups use
+        that to commit the legacy row and the queue row atomically.
+        """
+        runtime = self._native_send_text(runtime, "runtime")
+        native_id = self._native_send_text(native_id, "native_id")
+        delivery_source = self._native_send_text(delivery_source, "delivery_source")
+        delivery_id = self._native_send_text(delivery_id, "delivery_id")
+        if not isinstance(message, str):
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "message must be a string")
+        status = self._native_send_text(status, "status")
+
+        def enqueue(connection):
+            existing = connection.execute(
+                "SELECT * FROM native_send_queue WHERE delivery_source=? AND delivery_id=?",
+                (delivery_source, delivery_id),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            local_seq = self._allocate_native_local_seq(connection, runtime, native_id)
+            queue_id = item_id or identifier()
+            connection.execute(
+                "INSERT INTO native_send_queue("
+                "id,runtime,native_id,local_seq,delivery_source,delivery_id,message,status,created) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (queue_id, runtime, native_id, local_seq, delivery_source, delivery_id, message, status, time.time()),
+            )
+            row = connection.execute("SELECT * FROM native_send_queue WHERE id=?", (queue_id,)).fetchone()
+            return dict(row)
+
+        if db is not None:
+            return enqueue(db)
+        with self.connection(write=True) as connection:
+            return enqueue(connection)
+
+    def get_native_send_queue_item(self, item_id: str) -> dict | None:
+        if not isinstance(item_id, str) or not item_id:
+            return None
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM native_send_queue WHERE id=?", (item_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def get_native_send_by_delivery(self, delivery_source: str, delivery_id: str) -> dict | None:
+        if not isinstance(delivery_source, str) or not delivery_source:
+            return None
+        if not isinstance(delivery_id, str) or not delivery_id:
+            return None
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM native_send_queue WHERE delivery_source=? AND delivery_id=?",
+                (delivery_source, delivery_id),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    @classmethod
+    def _claim_native_send_head(cls, db, allowed, now, limit=None):
+        heads = db.execute(
+            "SELECT runtime,native_id,MIN(local_seq) AS local_seq FROM native_send_queue "
+            "WHERE status IN (?,?,?) GROUP BY runtime,native_id "
+            "ORDER BY MIN(last_attempt),MIN(created),runtime,native_id",
+            cls.NATIVE_SEND_BLOCKING_STATUSES,
+        ).fetchall()
+        claimed = []
+        for head in heads:
+            if limit is not None and len(claimed) >= limit:
+                break
+            row = db.execute(
+                "SELECT * FROM native_send_queue WHERE runtime=? AND native_id=? AND local_seq=?",
+                (head["runtime"], head["native_id"], head["local_seq"]),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                continue
+            if allowed is not None and row["delivery_source"] not in allowed:
+                continue
+            if not db.execute(
+                "UPDATE native_send_queue SET status='sending',last_attempt=?,revision=revision+1 "
+                "WHERE id=? AND status='pending'",
+                (now, row["id"]),
+            ).rowcount:
+                continue
+            claimed.append(dict(db.execute("SELECT * FROM native_send_queue WHERE id=?", (row["id"],)).fetchone()))
+        return claimed
+
+    def claim_eligible_native_sends(self, limit: int = 10, *, delivery_sources=None) -> list[dict]:
+        """Claim at most one pending head per target, up to `limit` targets, in fair order.
+
+        A target whose oldest unfinished item is `sending` or `uncertain` is blocked: later items for that target
+        must never overtake an in-flight or unconfirmed native write. Other targets are unaffected.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "limit must be a non-negative integer")
+        if limit == 0:
+            return []
+        allowed = None if delivery_sources is None else {str(source) for source in delivery_sources}
+        with self.connection(write=True) as db:
+            return self._claim_native_send_head(db, allowed, time.time(), limit)
+
+    def claim_native_send_head(self, delivery_source: str, delivery_id: str) -> dict | None:
+        """Claim one delivery only when it is the pending head of its target's queue.
+
+        Used by the parent-notification path, which must share the same per-target ordering as broadcasts
+        without claiming work that belongs to another target.
+        """
+        delivery_source = self._native_send_text(delivery_source, "delivery_source")
+        delivery_id = self._native_send_text(delivery_id, "delivery_id")
+        with self.connection(write=True) as db:
+            item = db.execute(
+                "SELECT * FROM native_send_queue WHERE delivery_source=? AND delivery_id=?",
+                (delivery_source, delivery_id),
+            ).fetchone()
+            if item is None or item["status"] != "pending":
+                return None
+            head = db.execute(
+                "SELECT id FROM native_send_queue WHERE runtime=? AND native_id=? AND status IN (?,?,?) "
+                "ORDER BY local_seq LIMIT 1",
+                (item["runtime"], item["native_id"], *self.NATIVE_SEND_BLOCKING_STATUSES),
+            ).fetchone()
+            if head is None or head["id"] != item["id"]:
+                return None
+            if not db.execute(
+                "UPDATE native_send_queue SET status='sending',last_attempt=?,revision=revision+1 "
+                "WHERE id=? AND status='pending'",
+                (time.time(), item["id"]),
+            ).rowcount:
+                return None
+            return dict(db.execute("SELECT * FROM native_send_queue WHERE id=?", (item["id"],)).fetchone())
+
+    @classmethod
+    def _sync_native_send_legacy(cls, db, row):
+        if row["delivery_source"] in cls.NATIVE_SEND_LEGACY_SOURCES:
+            db.execute(
+                "UPDATE native_broadcast_deliveries SET status=?,receipt=?,native_turn_id=?,"
+                "processing_status=?,error=? WHERE id=?",
+                (
+                    row["status"], row["receipt"], row["native_turn_id"],
+                    row["processing_status"], row["error"], row["delivery_id"],
+                ),
+            )
+        elif row["delivery_source"] == str(DeliverySource.PARENT_NOTIFICATION):
+            try:
+                event_seq = int(row["delivery_id"])
+            except (TypeError, ValueError):
+                return
+            # `deliveries` has its own accepted/wake_pending/processed state machine; notifications.py owns
+            # those transitions. Only mirror the unambiguous transient states, and never undo a parent_ack.
+            if row["status"] in ("pending", "sending", "uncertain"):
+                db.execute(
+                    "UPDATE deliveries SET status=?,receipt=COALESCE(?,receipt),error=? "
+                    "WHERE event_seq=? AND status!='processed'",
+                    (row["status"], row["receipt"], row["error"], event_seq),
+                )
+            else:
+                db.execute(
+                    "UPDATE deliveries SET receipt=COALESCE(?,receipt),error=? "
+                    "WHERE event_seq=? AND status!='processed'",
+                    (row["receipt"], row["error"], event_seq),
+                )
+
+    def update_native_send(
+        self,
+        item_id: str,
+        status: str,
+        receipt: str = None,
+        native_turn_id: str = None,
+        processing_status: str = None,
+        error: str = None,
+        *,
+        expected_status: str | None = None,
+        db=None,
+    ) -> dict:
+        """Update one queue row and mirror it to the legacy table for existing queries.
+
+        `expected_status` gives callers compare-and-swap semantics: when the row moved on (for example a parent
+        acknowledged an uncertain notification), the update is skipped and the current row is returned.
+        """
+        item_id = self._native_send_text(item_id, "item_id")
+        status = self._native_send_text(status, "status")
+
+        def update(connection):
+            existing = connection.execute("SELECT * FROM native_send_queue WHERE id=?", (item_id,)).fetchone()
+            if existing is None:
+                raise BridgeError("not_found", f"native_send_queue: {item_id}")
+            if expected_status is not None and existing["status"] != expected_status:
+                return dict(existing)
+            connection.execute(
+                "UPDATE native_send_queue SET status=?,receipt=?,native_turn_id=?,processing_status=?,"
+                "error=?,revision=revision+1 WHERE id=?",
+                (status, receipt, native_turn_id, processing_status, error, item_id),
+            )
+            row = dict(connection.execute("SELECT * FROM native_send_queue WHERE id=?", (item_id,)).fetchone())
+            self._sync_native_send_legacy(connection, row)
+            return row
+
+        if db is not None:
+            return update(db)
+        with self.connection(write=True) as connection:
+            return update(connection)
 
