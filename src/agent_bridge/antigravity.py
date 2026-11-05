@@ -77,7 +77,7 @@ class AntigravityRuntime:
                                          lambda e: e.get("event") in {"init", "step_update", "result"}, self.reject_question)
         try:
             await self.client.start()
-            event = await asyncio.wait_for(self.client.event(), 30)
+            event = await asyncio.wait_for(self.client.event(), 60)
             native = event.get("conversation_id")
             if event.get("event") != "init" or not isinstance(native, str) or not native:
                 raise BridgeError("invalid_protocol", "Antigravity did not return an initial conversation ID")
@@ -110,7 +110,7 @@ class AntigravityRuntime:
             # EOF ends the process after this turn, establishing a stdout/stderr completion barrier.
             self.client.process.stdin.close()
             while True:
-                event = await self.client.event() if accepted else await asyncio.wait_for(self.client.event(), 30)
+                event = await self.client.event() if accepted else await asyncio.wait_for(self.client.event(), 60)
                 kind = event.get("event")
                 if kind == "step_update":
                     step = event.get("step_update", {})

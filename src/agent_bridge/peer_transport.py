@@ -44,10 +44,14 @@ from .peer_protocol import (
     PeerResponse,
     PullRequestsParams,
     PullRequestsResult,
+    ResolveDeliveryParams,
+    ResolveDeliveryResult,
     ResultParams,
     ResultResult,
     ReviewParams,
     ReviewResult,
+    WorkspaceParams,
+    WorkspaceResult,
     fail,
     peer_error,
     require_method,
@@ -95,6 +99,8 @@ class PeerClient(Protocol):
     async def result(self, params: ResultParams) -> ResultResult: ...
     async def inbox(self, params: InboxParams) -> InboxResult: ...
     async def notify_parent(self, params: NotifyParentParams) -> NotifyParentResult: ...
+    async def workspace(self, params: WorkspaceParams) -> WorkspaceResult: ...
+    async def resolve_delivery(self, params: ResolveDeliveryParams) -> ResolveDeliveryResult: ...
 
 
 class PeerClientFactory(Protocol):
@@ -390,6 +396,12 @@ class DirectPeerClient:
 
     async def notify_parent(self, params: NotifyParentParams) -> NotifyParentResult:
         return cast(NotifyParentResult, await self._call("notify_parent", params))
+
+    async def workspace(self, params: WorkspaceParams) -> WorkspaceResult:
+        return cast(WorkspaceResult, await self._call("workspace", params))
+
+    async def resolve_delivery(self, params: ResolveDeliveryParams) -> ResolveDeliveryResult:
+        return cast(ResolveDeliveryResult, await self._call("resolve_delivery", params))
 
     # ---------------------------------------------------------------- internals
 

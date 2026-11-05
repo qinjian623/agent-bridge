@@ -6,7 +6,7 @@ import json
 import socket
 import sqlite3
 import time
-from typing import Any, NotRequired, Protocol, TypedDict
+from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 from . import __version__
 from .config import Profile
@@ -39,11 +39,12 @@ class RemoteMember(TypedDict):
     """agent_group.remote_members item. kind=native registers an existing native session (never starts it)."""
 
     host_id: str
-    kind: str  # native (bridge members on a remote host are added via session refs in a later phase)
-    runtime: str  # codex | antigravity
-    native_id: str
-    cwd: str  # path on the remote host, informational
-    label: str
+    target_kind: Literal["bridge", "native"]
+    session_id: NotRequired[str]  # target_kind == "bridge"
+    runtime: NotRequired[str]  # target_kind == "native": codex | antigravity
+    native_id: NotRequired[str]  # target_kind == "native"
+    cwd: NotRequired[str]  # path on the remote host, informational
+    label: NotRequired[str]
 
 
 class AgentHostsResult(TypedDict):
@@ -68,9 +69,11 @@ class AgentDeliveryResolveParams(TypedDict):
     """Admin only. Clears an `uncertain` queue head; never resends."""
 
     delivery_id: str
-    resolution: str  # received | not_received  (what the evidence shows)
+    resolution: Literal["received", "not_received"]  # what the evidence shows
     evidence: str  # non-empty
     expected_revision: int  # group revision inspected by the admin
+    expected_delivery_revision: int
+    expected_remote_revision: int
     request_id: str
 
 
@@ -111,7 +114,8 @@ class DeliveryScheduler(Protocol):
     def cancel(self, delivery_id: str) -> PeerDeliveryStatus:
         """Unsent -> turn into a tombstone that keeps target_seq; later seqs wait for tombstone ACK."""
 
-    def resolve(self, params: AgentDeliveryResolveParams) -> dict[str, Any]: ...
+    def resolve(self, params: AgentDeliveryResolveParams) -> dict[str, Any]:
+        """Calls peer.resolve_delivery with expected_delivery_revision; moves resolving -> released/failed."""
 
 
 class OutboxPuller(Protocol):
@@ -119,7 +123,8 @@ class OutboxPuller(Protocol):
 
     async def run_once(self, host_id: str) -> int:
         """peer.pull_requests -> verify Binding/group membership/revision -> execute locally ->
-        peer.ack_request. Returns processed item count. Must be idempotent per operation_id."""
+        peer.ack_request. Returns processed item count. Must be idempotent per operation_id.
+        Advances its cursor only to PullRequestsResult.scan_upper_seq, so skipped rows are not rescanned."""
 
 
 class EventMirror(Protocol):
@@ -129,6 +134,9 @@ class EventMirror(Protocol):
         """Dedupe on (node, event.seq). Returns (local_seq, duplicate). Never moves cursors backwards."""
 
     def cursor(self, node: NodeRef) -> int: ...
+
+    def route_parent(self, node: NodeRef, parent_ref: dict[str, str]) -> None:
+        """Raises parent_route_conflict when parent_ref is already bound to a different route."""
 
 
 class OperationTracker(Protocol):

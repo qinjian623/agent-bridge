@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from .errors import BridgeError
 
@@ -15,6 +15,15 @@ PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 1 << 20  # one JSONL frame; larger payloads must be Artifact references (ADR-15)
 MAX_PAGE_LIMIT = 100
 INLINE_RESULT_BYTES = 16 * 1024  # results above this are returned as ArtifactRef only
+CAPABILITIES = (
+    "groups_v1",
+    "ordered_delivery_v1",
+    "member_outbox_v1",
+    "event_mirror_v1",
+    "workspace_v1",
+    "session_name_v1",
+    "prune_guard_v1",
+)
 
 
 # ---------------------------------------------------------------- identity (design 4.1)
@@ -83,6 +92,11 @@ class PeerDeliveryStatus(StrEnum):  # coordinator peer_outbox.status
     ACCEPTED_REMOTE = "accepted_remote"
     CANCELLED = "cancelled"
     UNCERTAIN = "uncertain"
+    SENDING = "sending"
+    TOMBSTONE_PENDING = "tombstone_pending"
+    RELEASED = "released"
+    RESOLVING = "resolving"
+    FAILED = "failed"
 
 
 class SendQueueStatus(StrEnum):  # node native_send_queue.status
@@ -128,6 +142,13 @@ class PeerErrorCode(StrEnum):
     BUDGET_SCOPE = "peer_budget_scope"  # token budget enabled but group has remote native members (ADR-14)
     FRAME_TOO_LARGE = "peer_frame_too_large"
     NOT_IMPLEMENTED = "peer_not_implemented"
+    WORKSPACE_CONFLICT = "workspace_conflict"
+    WORKSPACE_ALREADY_ATTACHED = "workspace_already_attached"
+    WORKSPACE_LIMIT_EXCEEDED = "workspace_limit_exceeded"
+    WORKSPACE_PROJECT_CHANGED = "workspace_project_changed"
+    GROUP_PRUNE_BLOCKED = "group_prune_blocked"
+    NATIVE_STOP_UNVERIFIABLE = "native_stop_unverifiable"
+    PARENT_ROUTE_CONFLICT = "parent_route_conflict"
 
 
 def peer_error(code: PeerErrorCode, message: str) -> BridgeError:
@@ -229,10 +250,16 @@ class OutboxItem(TypedDict):
     method: str  # agent_broadcast | agent_group_inbox ... (member-role MCP methods only)
     payload: dict[str, Any]
     created: float
+    seq: NotRequired[int]  # node_outbox sequence
+    sender_ref: NotRequired[dict[str, str]]  # ObjectRef.as_dict() of the sending member
+    authority_ref: NotRequired[dict[str, str]]  # ObjectRef.as_dict() of the authorising object
+    authorization_revision: NotRequired[int]
+    fingerprint: NotRequired[str]
 
 
 class PullRequestsResult(Page):
     items: list[OutboxItem]
+    scan_upper_seq: NotRequired[int]  # highest node_outbox seq scanned, including skipped rows
 
 
 class AckRequestParams(TypedDict):
@@ -264,6 +291,10 @@ class DeliverParams(TypedDict):
     expected_group_revision: int
     # Composite open+dispatch (ADR-13): present when target.kind == "bridge" and no session exists yet.
     open: NotRequired[dict[str, Any]]  # {profile, project_id, access, ...}; never a local cwd
+    ordering_mode: NotRequired[str]
+    stream_id: NotRequired[str]
+    authority_ref: NotRequired[dict[str, str]]
+    parent_ref: NotRequired[dict[str, str]]
 
 
 class DeliverResult(TypedDict):
@@ -385,6 +416,46 @@ class NotifyParentResult(TypedDict):
     duplicate: bool
 
 
+class WorkspaceParams(TypedDict):
+    operation: OperationKey
+    action: Literal["prepare", "chunk", "seal", "abort"]
+    # prepare
+    project_id: NotRequired[str]
+    workspace_id: NotRequired[str]
+    manifest: NotRequired[dict[str, Any]]
+    total_size: NotRequired[int]
+    # chunk
+    upload_id: NotRequired[str]
+    offset: NotRequired[int]
+    data: NotRequired[str]  # base64 chunk payload
+    sha256: NotRequired[str]
+    # seal / abort
+    expected_sha256: NotRequired[str]
+    reason: NotRequired[str]
+
+
+class WorkspaceResult(TypedDict):
+    action: str
+    workspace_id: NotRequired[str]
+    upload_id: NotRequired[str]
+    received: NotRequired[int]  # bytes durably stored so far
+    status: NotRequired[str]
+
+
+class ResolveDeliveryParams(TypedDict):
+    operation: OperationKey
+    delivery_id: str
+    resolution: Literal["received", "not_received"]
+    evidence: str  # non-empty
+    expected_delivery_revision: int
+
+
+class ResolveDeliveryResult(TypedDict):
+    delivery_id: str
+    status: str  # PeerDeliveryStatus
+    delivery_revision: NotRequired[int]
+
+
 # ---------------------------------------------------------------- method registry / whitelist (ADR-12)
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +485,10 @@ PEER_METHODS: dict[str, MethodSpec] = {spec.name: spec for spec in (
     MethodSpec("peer.inbox", InboxParams, InboxResult, False, "Native member inbox history"),
     MethodSpec("peer.notify_parent", NotifyParentParams, NotifyParentResult, True,
                "Deliver completion event to the coordinator-side parent mirror"),
+    MethodSpec("peer.workspace", WorkspaceParams, WorkspaceResult, True,
+               "Prepare/upload/seal/abort a project workspace", admin_only=True),
+    MethodSpec("peer.resolve_delivery", ResolveDeliveryParams, ResolveDeliveryResult, True,
+               "Resolve an uncertain delivery with evidence", admin_only=True),
 )}
 
 

@@ -6,7 +6,7 @@
 
 | 文件 | 内容 | 对应阶段 |
 |---|---|---|
-| `src/agent_bridge/peer_protocol.py` | 协议版本、身份引用、状态枚举、错误码、信封、14 个 `peer.*` 方法的参数/结果类型、白名单 `PEER_METHODS` / `require_method` | 全部 |
+| `src/agent_bridge/peer_protocol.py` | 协议版本、身份引用、状态枚举、错误码、信封、16 个 `peer.*` 方法的参数/结果类型、白名单 `PEER_METHODS` / `require_method` | 全部 |
 | `src/agent_bridge/node_identity.py` | `NodeIdentity`、`NodeIdentityStore`（`node_identity.json`） | A |
 | `src/agent_bridge/hosts.py` | `HostConfig`、`HostStatus`、`HostRegistry` | A |
 | `src/agent_bridge/peer_transport.py` | `PeerTransport`、`RelayServer`、`PeerClient`、`PeerClientFactory`、`PeerService` | A/B |
@@ -41,8 +41,10 @@
 | `peer.result` | 否 | 否 | 结果摘要与 Artifact 分页数据 |
 | `peer.inbox` | 否 | 否 | 原生成员收件箱历史 |
 | `peer.notify_parent` | 是 | 否 | 完成事件进入父会话镜像，返回本地 `mirror_seq` |
+| `peer.workspace` | 是 | 是 | 工作区上传：`action` = `prepare` / `chunk` / `seal` / `abort`，均带 `operation` |
+| `peer.resolve_delivery` | 是 | 是 | 以非空 `evidence` 和 `expected_delivery_revision` 解决 `uncertain` 投递（`received` / `not_received`），不重发 |
 
-> 设计文档的修订点：5.节方法清单原缺少第 9 节恢复矩阵使用的 `peer.lookup_delivery`，本契约已补入；“5 组白名单”按清单实为 14 个方法，以本表为准。
+> 设计文档的修订点：5.节方法清单原缺少第 9 节恢复矩阵使用的 `peer.lookup_delivery`，本契约已补入；“5 组白名单”按清单实为 14 个方法，Phase C 增加 `peer.workspace`、`peer.resolve_delivery` 后共 16 个，以本表为准。
 
 ## 4. 实现必须遵守的规则
 
@@ -69,7 +71,7 @@
 |---|---|---|
 | `agent_hosts` | 新增，只读 | 无；返回 `AgentHostsResult` |
 | `agent_operation` | 新增，只读 | `operation_id`, `wait?` |
-| `agent_delivery_resolve` | 新增，管理员 | `delivery_id`, `resolution`(`received`/`not_received`), `evidence`, `expected_revision`, `request_id` |
+| `agent_delivery_resolve` | 新增，管理员 | `delivery_id`, `resolution`(`received`/`not_received`), `evidence`, `expected_revision`, `expected_delivery_revision`, `expected_remote_revision`, `request_id` |
 | `agent_catalog` | 增强 | 增加 `host_id?`；每项增加 `host_id`, `stale`, `fetched_at` |
 | `agent_open` / `agent_dispatch` | 增强 | 增加 `host_id?`, `project_id?`；`cwd` 仍是本地源目录 |
 | `agent_group` | 增强 | 增加 `remote_members: list[RemoteMember]` |
@@ -80,6 +82,12 @@
 ## 6. 错误码
 
 见 `PeerErrorCode`：`peer_method_not_allowed`、`peer_version_mismatch`、`peer_invalid_params`、`peer_identity_mismatch`、`peer_state_corrupted`、`peer_host_offline`、`peer_host_unknown`、`operation_pending`、`operation_conflict`、`operation_not_found`、`delivery_uncertain`、`delivery_blocked`、`peer_sequence_gap`、`revision_conflict`、`peer_permission_denied`、`peer_budget_scope`、`peer_frame_too_large`、`peer_not_implemented`。
+
+Phase C 新增错误码：`workspace_conflict`、`workspace_already_attached`、`workspace_limit_exceeded`、`workspace_project_changed`、`group_prune_blocked`、`native_stop_unverifiable`、`parent_route_conflict`。`PeerDeliveryStatus` 新增 `sending`、`tombstone_pending`、`released`、`resolving`、`failed`。
+
+`peer_protocol.CAPABILITIES`：`groups_v1`、`ordered_delivery_v1`、`member_outbox_v1`、`event_mirror_v1`、`workspace_v1`、`session_name_v1`、`prune_guard_v1`。
+
+Phase C 契约调整：`RemoteMember` 使用 `target_kind`（`bridge` 带 `session_id`；`native` 带 `runtime` + `native_id`）；`peer.deliver` 增加可选 `ordering_mode`、`stream_id`、`authority_ref`、`parent_ref`；`peer.pull_requests` 结果增加 `scan_upper_seq`；`OutboxItem` 增加 `seq`、`sender_ref`、`authority_ref`、`authorization_revision`、`fingerprint`。`peer.workspace` 与 `peer.resolve_delivery` 为管理员方法，当前节点返回 `peer_not_implemented`。
 
 ## 7. 实现分工建议
 

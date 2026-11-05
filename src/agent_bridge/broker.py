@@ -92,7 +92,7 @@ class Broker:
     async def launch(self, session_id):
         args = [sys.executable, "-m", "agent_bridge.cli", "--state", str(self.state), "worker", session_id]
         if self.config.worker_launcher == "systemd":
-            proc = await asyncio.create_subprocess_exec(
+            cmd = [
                 "systemd-run",
                 "--user",
                 "--quiet",
@@ -102,7 +102,22 @@ class Broker:
                 "--property=TimeoutStopSec=45",
                 "--property=UMask=0077",
                 "--setenv=PATH=" + os.environ.get("PATH", ""),
-                *args,
+            ]
+            for var in (
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "no_proxy",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "NO_PROXY",
+            ):
+                if var in os.environ:
+                    cmd.append(f"--setenv={var}={os.environ[var]}")
+            cmd.extend(args)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
