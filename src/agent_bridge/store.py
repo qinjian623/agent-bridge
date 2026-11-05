@@ -15,7 +15,7 @@ from .codex_parent import read_resume_config
 from .config import Config, Profile
 from .errors import BridgeError
 from .parent_usage import meter_usage, refresh_meter, start_meter
-from .peer_protocol import PeerErrorCode
+from .peer_protocol import PeerErrorCode, compute_stream_id
 
 
 def encode(value):
@@ -139,6 +139,72 @@ CREATE TABLE IF NOT EXISTS native_broadcast_deliveries (
 CREATE INDEX IF NOT EXISTS native_broadcast_pending ON native_broadcast_deliveries(status,last_attempt);
 CREATE INDEX IF NOT EXISTS task_queue ON tasks(status,created);
 CREATE INDEX IF NOT EXISTS event_session ON events(session_id,seq);
+CREATE TABLE IF NOT EXISTS remote_group_members (
+ group_id TEXT NOT NULL REFERENCES session_groups(id),
+ host_id TEXT NOT NULL, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,
+ target_kind TEXT NOT NULL CHECK(target_kind IN ('bridge','native')),
+ runtime TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL,
+ cwd TEXT NOT NULL DEFAULT '', label TEXT NOT NULL DEFAULT '',
+ joined_revision INTEGER NOT NULL, verified_at REAL NOT NULL,
+ verification_receipt TEXT NOT NULL, created REAL NOT NULL,
+ CHECK((target_kind='bridge' AND runtime='') OR
+       (target_kind='native' AND runtime IN ('codex','antigravity'))),
+ PRIMARY KEY(group_id,host_id,node_id,state_generation,target_kind,runtime,target_id)
+);
+CREATE TABLE IF NOT EXISTS group_broadcasts (
+ id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES session_groups(id),
+ group_revision INTEGER NOT NULL, sender_ref TEXT, message TEXT NOT NULL,
+ recipient_snapshot TEXT NOT NULL, request_key TEXT UNIQUE NOT NULL,
+ created REAL NOT NULL, settled_at REAL
+);
+CREATE TABLE IF NOT EXISTS broadcast_recipients (
+ broadcast_id TEXT NOT NULL REFERENCES group_broadcasts(id),
+ recipient_key TEXT NOT NULL, target_ref TEXT NOT NULL,
+ delivery_id TEXT UNIQUE, task_id TEXT, status TEXT NOT NULL,
+ send_status TEXT, processing_status TEXT, error TEXT,
+ updated REAL NOT NULL,
+ PRIMARY KEY(broadcast_id,recipient_key)
+);
+CREATE TABLE IF NOT EXISTS target_streams (
+ stream_id TEXT PRIMARY KEY, authority_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
+ next_seq INTEGER NOT NULL DEFAULT 1 CHECK(next_seq>=1),
+ released_seq INTEGER NOT NULL DEFAULT 0 CHECK(released_seq>=0),
+ CHECK(next_seq>released_seq)
+);
+CREATE TABLE IF NOT EXISTS peer_outbox (
+ delivery_id TEXT PRIMARY KEY,
+ broadcast_id TEXT REFERENCES group_broadcasts(id),
+ group_id TEXT REFERENCES session_groups(id), group_revision INTEGER,
+ stream_id TEXT NOT NULL REFERENCES target_streams(stream_id),
+ target_seq INTEGER NOT NULL CHECK(target_seq>=1),
+ host_id TEXT NOT NULL, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,
+ target_kind TEXT NOT NULL, runtime TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL,
+ operation_id TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, fingerprint TEXT NOT NULL,
+ seq_kind TEXT NOT NULL CHECK(seq_kind IN ('message','tombstone')),
+ status TEXT NOT NULL DEFAULT 'pending',
+ send_status TEXT, processing_status TEXT, receipt TEXT, error TEXT,
+ revision INTEGER NOT NULL DEFAULT 0, cancel_requested INTEGER NOT NULL DEFAULT 0,
+ blocked_by TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+ last_attempt REAL NOT NULL DEFAULT 0,
+ UNIQUE(stream_id,target_seq)
+);
+CREATE INDEX IF NOT EXISTS peer_outbox_head ON peer_outbox(stream_id,target_seq,status);
+CREATE TABLE IF NOT EXISTS delivery_resolutions (
+ id TEXT PRIMARY KEY, delivery_id TEXT NOT NULL REFERENCES peer_outbox(delivery_id),
+ request_id TEXT NOT NULL UNIQUE, fingerprint TEXT NOT NULL,
+ group_revision INTEGER NOT NULL, delivery_revision INTEGER NOT NULL,
+ remote_revision INTEGER NOT NULL, request_json TEXT NOT NULL,
+ resolution TEXT NOT NULL CHECK(resolution IN ('received','not_received')),
+ evidence TEXT NOT NULL, actor TEXT NOT NULL, status TEXT NOT NULL,
+ remote_result TEXT, created REAL NOT NULL, updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pulled_request_receipts (
+ host_id TEXT NOT NULL, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,
+ operation_id TEXT NOT NULL, source_seq INTEGER NOT NULL,
+ fingerprint TEXT NOT NULL, outcome TEXT NOT NULL,
+ result TEXT NOT NULL, acked_at REAL, created REAL NOT NULL,
+ PRIMARY KEY(host_id,node_id,state_generation,operation_id)
+);
 CREATE TABLE IF NOT EXISTS peer_operations (
  operation_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,
  fingerprint TEXT NOT NULL, method TEXT NOT NULL, params TEXT NOT NULL, status TEXT NOT NULL,
@@ -146,20 +212,65 @@ CREATE TABLE IF NOT EXISTS peer_operations (
 );
 CREATE INDEX IF NOT EXISTS peer_operation_identity ON peer_operations(node_id,state_generation,operation_id);
 CREATE TABLE IF NOT EXISTS peer_inbox (
- delivery_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, node_id TEXT NOT NULL,
- state_generation TEXT NOT NULL, target_seq INTEGER NOT NULL,
- seq_kind TEXT NOT NULL DEFAULT 'delivery', operation_id TEXT NOT NULL,
+ delivery_id TEXT PRIMARY KEY,
+ host_id TEXT NOT NULL, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,
+ target_seq INTEGER NOT NULL,
+ seq_kind TEXT NOT NULL, operation_id TEXT NOT NULL,
  payload TEXT NOT NULL, status TEXT NOT NULL, receipt TEXT, created REAL NOT NULL,
- UNIQUE(host_id,node_id,state_generation,target_seq)
+ ordering_mode TEXT NOT NULL DEFAULT 'legacy' CHECK(ordering_mode IN ('legacy','bootstrap','ordered')),
+ stream_id TEXT,
+ authority_ref TEXT, target_kind TEXT, runtime TEXT, target_id TEXT,
+ revision INTEGER NOT NULL DEFAULT 0,
+ ack_seq INTEGER,
+ CHECK(ordering_mode='legacy' OR
+       (ordering_mode='bootstrap' AND stream_id IS NULL AND target_seq=0) OR
+       (ordering_mode='ordered' AND stream_id IS NOT NULL AND target_seq>=1))
 );
-CREATE INDEX IF NOT EXISTS peer_inbox_operation ON peer_inbox(operation_id);
+CREATE TABLE IF NOT EXISTS incoming_streams (
+ stream_id TEXT PRIMARY KEY, authority_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
+ admitted_seq INTEGER NOT NULL DEFAULT 0 CHECK(admitted_seq>=0)
+);
+CREATE TABLE IF NOT EXISTS ordered_targets (
+ target_kind TEXT NOT NULL, runtime TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL,
+ authority_ref TEXT NOT NULL, enabled_at REAL NOT NULL,
+ PRIMARY KEY(target_kind,runtime,target_id)
+);
+CREATE TABLE IF NOT EXISTS peer_commit_log (
+ ack_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+ mutation_key TEXT NOT NULL UNIQUE, method TEXT NOT NULL, created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS native_send_queue (
+ id TEXT PRIMARY KEY, runtime TEXT NOT NULL, native_id TEXT NOT NULL,
+ local_seq INTEGER NOT NULL,
+ delivery_source TEXT NOT NULL,
+ delivery_id TEXT NOT NULL, message TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'pending',
+ receipt TEXT, native_turn_id TEXT, processing_status TEXT,
+ error TEXT, revision INTEGER NOT NULL DEFAULT 0,
+ created REAL NOT NULL, last_attempt REAL NOT NULL DEFAULT 0,
+ UNIQUE(runtime,native_id,local_seq), UNIQUE(delivery_source,delivery_id)
+);
+CREATE INDEX IF NOT EXISTS native_send_queue_head ON native_send_queue(runtime,native_id,local_seq,status);
+CREATE TABLE IF NOT EXISTS native_target_counters (
+ runtime TEXT NOT NULL, native_id TEXT NOT NULL, next_seq INTEGER NOT NULL DEFAULT 1,
+ PRIMARY KEY(runtime,native_id)
+);
 CREATE TABLE IF NOT EXISTS node_outbox (
  seq INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT UNIQUE NOT NULL,
  group_id TEXT, native_id TEXT, method TEXT NOT NULL, payload TEXT NOT NULL,
  status TEXT NOT NULL DEFAULT 'pending', created REAL NOT NULL,
- pulled_at REAL, acked_at REAL
+ pulled_at REAL, acked_at REAL,
+ binding_id TEXT, request_id TEXT, sender_ref TEXT, authority_ref TEXT,
+ authorization_revision INTEGER, fingerprint TEXT, result TEXT, outcome TEXT
 );
 CREATE INDEX IF NOT EXISTS node_outbox_pending ON node_outbox(status,seq);
+CREATE TABLE IF NOT EXISTS member_bindings (
+ id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE,
+ sender_ref TEXT NOT NULL, authority_ref TEXT NOT NULL, group_id TEXT NOT NULL,
+ allowed_methods TEXT NOT NULL, authorization_revision INTEGER NOT NULL,
+ pid INTEGER NOT NULL, process_start TEXT NOT NULL,
+ expires_at REAL NOT NULL, revoked_at REAL, created REAL NOT NULL
+);
 """
 
 
@@ -191,7 +302,98 @@ class Store:
                 db.execute("UPDATE attempts SET reservation=(SELECT reservation FROM tasks WHERE id=attempts.task_id)")
             if "last_attempt" not in {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}:
                 db.execute("ALTER TABLE deliveries ADD COLUMN last_attempt REAL NOT NULL DEFAULT 0")
+            self._migrate_node_outbox(db)
+            self._migrate_peer_inbox(db)
+            self._initialize_commit_log(db)
         self.path.chmod(0o600)
+
+    @staticmethod
+    def _migrate_node_outbox(db):
+        columns = {row[1] for row in db.execute("PRAGMA table_info(node_outbox)")}
+        additions = (
+            ("binding_id", "TEXT"),
+            ("request_id", "TEXT"),
+            ("sender_ref", "TEXT"),
+            ("authority_ref", "TEXT"),
+            ("authorization_revision", "INTEGER"),
+            ("fingerprint", "TEXT"),
+            ("result", "TEXT"),
+            ("outcome", "TEXT"),
+        )
+        for name, sql_type in additions:
+            if name not in columns:
+                db.execute(f"ALTER TABLE node_outbox ADD COLUMN {name} {sql_type}")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS node_outbox_member_request "
+            "ON node_outbox(binding_id,request_id) WHERE binding_id IS NOT NULL"
+        )
+
+    @staticmethod
+    def _migrate_peer_inbox(db):
+        columns = {row[1] for row in db.execute("PRAGMA table_info(peer_inbox)")}
+        if "ordering_mode" not in columns:
+            db.execute("DROP TABLE IF EXISTS peer_inbox_c")
+            db.execute(
+                "CREATE TABLE peer_inbox_c ("
+                "delivery_id TEXT PRIMARY KEY,"
+                "host_id TEXT NOT NULL, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,"
+                "target_seq INTEGER NOT NULL,"
+                "seq_kind TEXT NOT NULL, operation_id TEXT NOT NULL,"
+                "payload TEXT NOT NULL, status TEXT NOT NULL, receipt TEXT, created REAL NOT NULL,"
+                "ordering_mode TEXT NOT NULL DEFAULT 'legacy' "
+                "CHECK(ordering_mode IN ('legacy','bootstrap','ordered')),"
+                "stream_id TEXT,"
+                "authority_ref TEXT, target_kind TEXT, runtime TEXT, target_id TEXT,"
+                "revision INTEGER NOT NULL DEFAULT 0,"
+                "ack_seq INTEGER,"
+                "CHECK(ordering_mode='legacy' OR "
+                "(ordering_mode='bootstrap' AND stream_id IS NULL AND target_seq=0) OR "
+                "(ordering_mode='ordered' AND stream_id IS NOT NULL AND target_seq>=1)))"
+            )
+            db.execute(
+                "INSERT INTO peer_inbox_c("
+                "delivery_id,host_id,node_id,state_generation,target_seq,seq_kind,operation_id,"
+                "payload,status,receipt,created,ordering_mode,stream_id,authority_ref,target_kind,"
+                "runtime,target_id,revision,ack_seq) "
+                "SELECT delivery_id,host_id,node_id,state_generation,target_seq,seq_kind,operation_id,"
+                "payload,status,receipt,created,'legacy',NULL,NULL,NULL,NULL,NULL,0,NULL "
+                "FROM peer_inbox"
+            )
+            db.execute("DROP TABLE peer_inbox")
+            db.execute("ALTER TABLE peer_inbox_c RENAME TO peer_inbox")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS peer_inbox_legacy_seq "
+            "ON peer_inbox(host_id,node_id,state_generation,target_seq) WHERE ordering_mode='legacy'"
+        )
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS peer_inbox_ordered_seq "
+            "ON peer_inbox(stream_id,target_seq) WHERE ordering_mode='ordered'"
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS peer_inbox_operation ON peer_inbox(operation_id)")
+
+    def _initialize_commit_log(self, db):
+        """Seed the commit log above the pre-migration confirmed sequence, once."""
+        if db.execute("SELECT 1 FROM peer_commit_log LIMIT 1").fetchone():
+            return
+        floor = self._identity_floor()
+        if "ack_seq" in {row[1] for row in db.execute("PRAGMA table_info(peer_inbox)")}:
+            value = db.execute("SELECT MAX(ack_seq) FROM peer_inbox").fetchone()[0]
+            if isinstance(value, int) and not isinstance(value, bool) and value > floor:
+                floor = value
+        if floor > 0:
+            db.execute(
+                "INSERT INTO peer_commit_log(ack_seq,mutation_key,method,created) VALUES(?,?,?,?)",
+                (floor, "migration_floor", "migration", time.time()),
+            )
+
+    def _identity_floor(self):
+        """Return the verified pre-migration max_confirmed_seq, or 0 when absent/unreadable."""
+        try:
+            data = json.loads((self.state / "node_identity.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return 0
+        value = data.get("max_confirmed_seq") if isinstance(data, dict) else None
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
     @contextmanager
     def connection(self, *, write=False):
@@ -1309,6 +1511,129 @@ class Store:
         value = dict(row)
         value["payload"] = cls._decode_json(value.get("payload"))
         return value
+
+    # ---------------------------------------------------------------- multi-machine phase C streams and commit log
+
+    @staticmethod
+    def _stream_ref(value, name):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError as error:
+                raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{name} must be a JSON object") from error
+        if not isinstance(value, dict):
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{name} must be an object")
+        return value
+
+    def _stream_identity(self, authority_ref, target_ref):
+        authority = self._stream_ref(authority_ref, "authority_ref")
+        target = self._stream_ref(target_ref, "target_ref")
+        try:
+            stream_id = compute_stream_id(authority, target)
+        except (KeyError, TypeError) as error:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"Invalid stream reference: {error}") from error
+        return stream_id, encode(authority), encode(target)
+
+    @classmethod
+    def _stream_row(cls, row):
+        value = dict(row)
+        value["authority_ref"] = cls._decode_json(value.get("authority_ref"))
+        value["target_ref"] = cls._decode_json(value.get("target_ref"))
+        return value
+
+    @staticmethod
+    def _stream_id(stream_id):
+        if not isinstance(stream_id, str) or not stream_id:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "stream_id must be a non-empty string")
+        return stream_id
+
+    def record_commit(self, mutation_key: str, method: str) -> int:
+        """Append one committed mutation and return its durable, monotonically increasing ack_seq.
+
+        `mutation_key` is the natural key for the mutation, so replaying the same key returns the original
+        sequence instead of allocating a second one.
+        """
+        if not isinstance(mutation_key, str) or not mutation_key:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "mutation_key must be a non-empty string")
+        if not isinstance(method, str) or not method:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "method must be a non-empty string")
+        with self.connection(write=True) as db:
+            existing = db.execute(
+                "SELECT ack_seq FROM peer_commit_log WHERE mutation_key=?", (mutation_key,)
+            ).fetchone()
+            if existing is not None:
+                return existing["ack_seq"]
+            cursor = db.execute(
+                "INSERT INTO peer_commit_log(mutation_key,method,created) VALUES(?,?,?)",
+                (mutation_key, method, time.time()),
+            )
+            return cursor.lastrowid
+
+    def get_or_create_target_stream(self, authority_ref: dict | str, target_ref: dict | str) -> dict:
+        """Return the coordination-side ordered stream for one authority/target pair."""
+        stream_id, encoded_authority, encoded_target = self._stream_identity(authority_ref, target_ref)
+        with self.connection(write=True) as db:
+            db.execute(
+                "INSERT INTO target_streams(stream_id,authority_ref,target_ref) VALUES(?,?,?) "
+                "ON CONFLICT(stream_id) DO NOTHING",
+                (stream_id, encoded_authority, encoded_target),
+            )
+            row = db.execute("SELECT * FROM target_streams WHERE stream_id=?", (stream_id,)).fetchone()
+        return self._stream_row(row)
+
+    def allocate_target_seq(self, stream_id: str) -> int:
+        """Allocate the next target sequence for a stream; monotonic and gap-free per stream."""
+        stream_id = self._stream_id(stream_id)
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT next_seq FROM target_streams WHERE stream_id=?", (stream_id,)).fetchone()
+            if row is None:
+                raise BridgeError("not_found", f"target_streams: {stream_id}")
+            seq = row["next_seq"]
+            db.execute("UPDATE target_streams SET next_seq=? WHERE stream_id=?", (seq + 1, stream_id))
+            return seq
+
+    def advance_released_seq(self, stream_id: str, seq: int) -> None:
+        """Advance a stream's released sequence, never moving it backwards."""
+        stream_id = self._stream_id(stream_id)
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "seq must be a non-negative integer")
+        with self.connection(write=True) as db:
+            if db.execute("SELECT 1 FROM target_streams WHERE stream_id=?", (stream_id,)).fetchone() is None:
+                raise BridgeError("not_found", f"target_streams: {stream_id}")
+            try:
+                db.execute(
+                    "UPDATE target_streams SET released_seq=MAX(released_seq,?) WHERE stream_id=?",
+                    (seq, stream_id),
+                )
+            except sqlite3.IntegrityError as error:
+                raise BridgeError(
+                    PeerErrorCode.INVALID_PARAMS, "released seq must be below the allocated next_seq"
+                ) from error
+
+    def get_or_create_incoming_stream(self, authority_ref: dict | str, target_ref: dict | str) -> dict:
+        """Return the execution-side admission stream for one authority/target pair."""
+        stream_id, encoded_authority, encoded_target = self._stream_identity(authority_ref, target_ref)
+        with self.connection(write=True) as db:
+            db.execute(
+                "INSERT INTO incoming_streams(stream_id,authority_ref,target_ref) VALUES(?,?,?) "
+                "ON CONFLICT(stream_id) DO NOTHING",
+                (stream_id, encoded_authority, encoded_target),
+            )
+            row = db.execute("SELECT * FROM incoming_streams WHERE stream_id=?", (stream_id,)).fetchone()
+        return self._stream_row(row)
+
+    def advance_admitted_seq(self, stream_id: str, seq: int) -> None:
+        """Advance an incoming stream's admitted sequence, never moving it backwards."""
+        stream_id = self._stream_id(stream_id)
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "seq must be a non-negative integer")
+        with self.connection(write=True) as db:
+            if db.execute("SELECT 1 FROM incoming_streams WHERE stream_id=?", (stream_id,)).fetchone() is None:
+                raise BridgeError("not_found", f"incoming_streams: {stream_id}")
+            db.execute(
+                "UPDATE incoming_streams SET admitted_seq=MAX(admitted_seq,?) WHERE stream_id=?",
+                (seq, stream_id),
+            )
 
     def record_operation(
         self,

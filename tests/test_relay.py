@@ -83,6 +83,13 @@ class DirectPeerServiceTests(unittest.IsolatedAsyncioTestCase):
                 "peer.cancel",
                 "peer.result",
                 "peer.events",
+                "groups_v1",
+                "ordered_delivery_v1",
+                "member_outbox_v1",
+                "event_mirror_v1",
+                "workspace_v1",
+                "session_name_v1",
+                "prune_guard_v1",
             ],
         )
         self.assertTrue(result["broker_version"])

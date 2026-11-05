@@ -13,6 +13,7 @@ from .config import Profile
 from .errors import BridgeError
 from .node_identity import NodeIdentityStore
 from .peer_protocol import (
+    CAPABILITIES,
     INLINE_RESULT_BYTES,
     MAX_PAGE_LIMIT,
     PROTOCOL_VERSION,
@@ -259,7 +260,7 @@ class DirectPeerService:
             "node": node.as_dict(),
             "node_state": identity.state.value,
             "max_confirmed_seq": identity.max_confirmed_seq,
-            "capabilities": list(IMPLEMENTED_PEER_METHODS),
+            "capabilities": list(IMPLEMENTED_PEER_METHODS) + list(CAPABILITIES),
             "broker_version": self._broker_version,
         }
 
