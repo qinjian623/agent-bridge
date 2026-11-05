@@ -21,6 +21,18 @@ class _AsyncStdinReader:
         return await asyncio.to_thread(self._stream.readline)
 
 
+class _HostListAction(argparse.Action):
+    """Collect repeated or comma-separated --allowed-hosts values into one flat list."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        entries = list(getattr(namespace, self.dest, None) or [])
+        for value in str(values).split(","):
+            value = value.strip()
+            if value:
+                entries.append(value)
+        setattr(namespace, self.dest, entries)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Persistent local Codex / Claude Code / Pi / Antigravity sessions")
     parser.add_argument("--state")
@@ -37,6 +49,19 @@ def build_parser():
     monitor.add_argument("--web", action="store_true", help="Launch local web-based monitor dashboard")
     monitor.add_argument("--port", type=int, default=8080, help="Web monitor port (default: 8080)")
     monitor.add_argument("--host", default="127.0.0.1", help="Web monitor host (default: 127.0.0.1)")
+    monitor.add_argument(
+        "--allowed-hosts",
+        action=_HostListAction,
+        default=None,
+        metavar="HOST[:PORT]",
+        help="Browser-visible Host values for the web monitor; repeat or comma-separate (default: loopback only)",
+    )
+    monitor.add_argument(
+        "--public-origin",
+        default=None,
+        metavar="ORIGIN",
+        help="Explicit public origin for an HTTPS reverse proxy, for example https://monitor.example.com",
+    )
     monitor.add_argument("--interval", type=float, default=2.0, help="Terminal refresh interval in seconds (default: 2.0)")
     monitor.add_argument("--once", action="store_true", help="Print a single terminal dashboard snapshot and exit")
     monitor.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --once (default: text)")
@@ -138,7 +163,13 @@ def main():
             if args.web:
                 from .web_monitor import run_web_monitor
 
-                run_web_monitor(state, host=args.host, port=args.port)
+                run_web_monitor(
+                    state,
+                    host=args.host,
+                    port=args.port,
+                    allowed_hosts=args.allowed_hosts,
+                    public_origin=args.public_origin,
+                )
             else:
                 from .monitor import run_tui_monitor
 
