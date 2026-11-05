@@ -571,6 +571,173 @@ class ResolveDeliveryResult(TypedDict):
     delivery_id: str
     status: str  # PeerDeliveryStatus
     delivery_revision: NotRequired[int]
+    receipt: NotRequired[str | None]
+
+
+# ---------------------------------------------------------------- remote members (design 3.1)
+
+class RemoteMember(TypedDict):
+    """agent_group.remote_members item. kind=native registers an existing native session (never starts it)."""
+
+    host_id: str
+    target_kind: Literal["bridge", "native"]
+    session_id: NotRequired[str]  # target_kind == "bridge"
+    runtime: NotRequired[str]  # target_kind == "native": codex | antigravity
+    native_id: NotRequired[str]  # target_kind == "native"
+    cwd: NotRequired[str]  # path on the remote host, informational
+    label: NotRequired[str]
+    node_id: NotRequired[str]  # required for remove
+    state_generation: NotRequired[str]  # required for remove
+
+
+def _member_text(member: dict[str, Any], key: str) -> str:
+    value = member.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"remote member {key} must be a string")
+    return value
+
+
+def normalize_remote_member(member: dict[str, Any], action: str = "add") -> dict[str, Any]:
+    """Validate a remote member and return canonical keys (target_id is session_id or native_id)."""
+    if not isinstance(member, dict):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote member must be an object")
+    kind = member.get("target_kind")
+    alias = member.get("kind")
+    if kind is None:
+        kind = alias
+    elif alias is not None and alias != kind:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote member kind conflicts with target_kind")
+    if kind not in ("bridge", "native"):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote member target_kind must be bridge or native")
+    host_id = _member_text(member, "host_id")
+    if not host_id:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote member host_id is required")
+    session_id = _member_text(member, "session_id")
+    native_id = _member_text(member, "native_id")
+    runtime = _member_text(member, "runtime")
+    cwd = _member_text(member, "cwd")
+    if kind == "bridge":
+        if not session_id:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "bridge remote member requires session_id")
+        if runtime or native_id:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "bridge remote member must not set runtime or native_id")
+        target_id = session_id
+        cwd = ""
+    else:
+        if session_id:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "native remote member must not set session_id")
+        if runtime not in ("codex", "antigravity"):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "native remote member runtime must be codex or antigravity")
+        if not native_id:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "native remote member requires native_id")
+        target_id = native_id
+    node_id = _member_text(member, "node_id")
+    state_generation = _member_text(member, "state_generation")
+    if action == "remove" and not (node_id and state_generation):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "remove requires node_id and state_generation")
+    return {
+        "host_id": host_id,
+        "node_id": node_id,
+        "state_generation": state_generation,
+        "target_kind": kind,
+        "runtime": runtime,
+        "target_id": target_id,
+        "cwd": cwd,
+        "label": _member_text(member, "label"),
+    }
+
+
+# ---------------------------------------------------------------- coordinator peer_outbox (design 3.2, 3.5, 3.6)
+
+class PeerOutboxItem(TypedDict):
+    delivery_id: str
+    broadcast_id: str | None
+    group_id: str | None
+    group_revision: int | None
+    stream_id: str
+    target_seq: int
+    host_id: str
+    node_id: str
+    state_generation: str
+    target_kind: str
+    runtime: str
+    target_id: str
+    operation_id: str
+    payload: str
+    fingerprint: str
+    seq_kind: str  # SeqKind
+    status: str  # PeerDeliveryStatus
+    send_status: str | None
+    processing_status: str | None
+    receipt: str | None
+    error: str | None
+    revision: int
+    cancel_requested: int
+    blocked_by: str | None
+    created: float
+    updated: float
+    last_attempt: float
+
+
+def is_peer_outbox_head_blocking(status: str) -> bool:
+    return status in (
+        PeerDeliveryStatus.PENDING,
+        PeerDeliveryStatus.WAITING_FOR_HOST,
+        PeerDeliveryStatus.SENDING,
+        PeerDeliveryStatus.ACCEPTED_REMOTE,
+        PeerDeliveryStatus.UNCERTAIN,
+        PeerDeliveryStatus.TOMBSTONE_PENDING,
+        PeerDeliveryStatus.RESOLVING,
+    )
+
+
+def can_advance_peer_stream(status: str) -> bool:
+    return status in (PeerDeliveryStatus.RELEASED, PeerDeliveryStatus.CANCELLED, PeerDeliveryStatus.FAILED)
+
+
+class GroupBroadcast(TypedDict):
+    id: str
+    group_id: str
+    group_revision: int
+    sender_ref: str | None
+    message: str
+    recipient_snapshot: str
+    request_key: str
+    created: float
+    settled_at: float | None
+
+
+class BroadcastRecipient(TypedDict):
+    broadcast_id: str
+    recipient_key: str
+    target_ref: str
+    delivery_id: str | None
+    task_id: str | None
+    status: str
+    send_status: str | None
+    processing_status: str | None
+    error: str | None
+    updated: float
+
+
+class DeliveryResolution(TypedDict):
+    id: str
+    delivery_id: str
+    request_id: str
+    fingerprint: str
+    group_revision: int
+    delivery_revision: int
+    remote_revision: int
+    request_json: str
+    resolution: Literal["received", "not_received"]
+    evidence: str
+    actor: str
+    status: str
+    remote_result: str | None
+    created: float
+    updated: float
 
 
 # ---------------------------------------------------------------- method registry / whitelist (ADR-12)

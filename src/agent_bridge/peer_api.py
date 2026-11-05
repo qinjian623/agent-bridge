@@ -26,6 +26,7 @@ from .peer_protocol import (
     PeerEvent,
     PeerRequest,
     PeerResponse,
+    RemoteMember,  # noqa: F401  re-exported so peer_api.RemoteMember is the peer_protocol type
     fail,
     negotiate_version,
     ok,
@@ -35,18 +36,6 @@ from .peer_protocol import (
 from .store import encode, validate_session_name
 
 # ---------------------------------------------------------------- MCP tool parameter contracts
-
-class RemoteMember(TypedDict):
-    """agent_group.remote_members item. kind=native registers an existing native session (never starts it)."""
-
-    host_id: str
-    target_kind: Literal["bridge", "native"]
-    session_id: NotRequired[str]  # target_kind == "bridge"
-    runtime: NotRequired[str]  # target_kind == "native": codex | antigravity
-    native_id: NotRequired[str]  # target_kind == "native"
-    cwd: NotRequired[str]  # path on the remote host, informational
-    label: NotRequired[str]
-
 
 class AgentHostsResult(TypedDict):
     hosts: list[dict[str, Any]]  # {host_id,state,node_id,state_generation,last_contact,protocol_version,detail}

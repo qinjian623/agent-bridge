@@ -7,7 +7,10 @@ from agent_bridge.peer_protocol import (
     CAPABILITIES,
     PEER_METHODS,
     PROTOCOL_VERSION,
+    BroadcastRecipient,
+    DeliveryResolution,
     DeliverySource,
+    GroupBroadcast,
     GroupRef,
     NativeSendQueueItem,
     NodeRef,
@@ -15,14 +18,20 @@ from agent_bridge.peer_protocol import (
     OperationStatus,
     PeerDeliveryStatus,
     PeerErrorCode,
+    PeerOutboxItem,
+    RemoteMember,
+    ResolveDeliveryResult,
     SendQueueStatus,
     TargetRef,
     can_advance_native_queue,
+    can_advance_peer_stream,
     canonical_operation_id,
     compute_stream_id,
     fail,
     is_head_blocking,
+    is_peer_outbox_head_blocking,
     negotiate_version,
+    normalize_remote_member,
     ok,
     require_method,
 )
@@ -181,6 +190,107 @@ class NativeSendQueueContract(unittest.TestCase):
             self.assertEqual(can_advance_native_queue(status), status.value not in blocking)
         self.assertFalse(is_head_blocking("bogus"))
         self.assertFalse(can_advance_native_queue("bogus"))
+
+
+class RemoteMemberContract(unittest.TestCase):
+    NATIVE = {"host_id": "h", "kind": "native", "runtime": "codex", "native_id": "n1", "cwd": "/srv", "label": "L"}
+    BRIDGE = {"host_id": "h", "target_kind": "bridge", "session_id": "s1", "label": "B"}
+
+    def assertInvalid(self, member, action="add"):
+        with self.assertRaises(BridgeError) as caught:
+            normalize_remote_member(member, action)
+        self.assertEqual(caught.exception.code, PeerErrorCode.INVALID_PARAMS)
+
+    def test_native_add_with_kind_alias(self):
+        self.assertEqual(
+            normalize_remote_member(self.NATIVE),
+            {
+                "host_id": "h", "node_id": "", "state_generation": "", "target_kind": "native",
+                "runtime": "codex", "target_id": "n1", "cwd": "/srv", "label": "L",
+            },
+        )
+
+    def test_bridge_add_normalizes_cwd(self):
+        normalized = normalize_remote_member({**self.BRIDGE, "cwd": "/ignored"}, "create")
+        self.assertEqual(normalized["target_id"], "s1")
+        self.assertEqual(normalized["runtime"], "")
+        self.assertEqual(normalized["cwd"], "")
+
+    def test_bridge_invalid(self):
+        self.assertInvalid({"host_id": "h", "target_kind": "bridge"})
+        self.assertInvalid({**self.BRIDGE, "session_id": ""})
+        self.assertInvalid({**self.BRIDGE, "runtime": "codex"})
+        self.assertInvalid({**self.BRIDGE, "native_id": "n"})
+
+    def test_native_invalid(self):
+        self.assertInvalid({**self.NATIVE, "runtime": "claude"})
+        self.assertInvalid({k: v for k, v in self.NATIVE.items() if k != "runtime"})
+        self.assertInvalid({**self.NATIVE, "native_id": ""})
+        self.assertInvalid({**self.NATIVE, "session_id": "s"})
+
+    def test_kind_invalid(self):
+        self.assertInvalid({**self.BRIDGE, "target_kind": "other"})
+        self.assertInvalid({"host_id": "h", "session_id": "s"})
+        self.assertInvalid({**self.BRIDGE, "kind": "native"})
+        self.assertInvalid({**self.BRIDGE, "host_id": ""})
+        self.assertInvalid("not a dict")  # type: ignore[arg-type]
+
+    def test_remove_requires_identity(self):
+        self.assertInvalid(self.BRIDGE, "remove")
+        self.assertInvalid({**self.BRIDGE, "node_id": "n"}, "remove")
+        self.assertInvalid({**self.NATIVE, "state_generation": "g"}, "remove")
+        normalized = normalize_remote_member({**self.NATIVE, "node_id": "n", "state_generation": "g"}, "remove")
+        self.assertEqual((normalized["node_id"], normalized["state_generation"]), ("n", "g"))
+
+    def test_add_accepts_optional_identity(self):
+        normalized = normalize_remote_member({**self.BRIDGE, "node_id": "n", "state_generation": "g"}, "add")
+        self.assertEqual((normalized["node_id"], normalized["state_generation"]), ("n", "g"))
+
+    def test_peer_api_uses_same_type(self):
+        self.assertIs(peer_api.RemoteMember, RemoteMember)
+
+
+class PeerOutboxContract(unittest.TestCase):
+    def test_outbox_item_fields(self):
+        self.assertEqual(
+            set(PeerOutboxItem.__annotations__),
+            {
+                "delivery_id", "broadcast_id", "group_id", "group_revision", "stream_id", "target_seq", "host_id",
+                "node_id", "state_generation", "target_kind", "runtime", "target_id", "operation_id", "payload",
+                "fingerprint", "seq_kind", "status", "send_status", "processing_status", "receipt", "error",
+                "revision", "cancel_requested", "blocked_by", "created", "updated", "last_attempt",
+            },
+        )
+
+    def test_head_blocking_and_advance_partition(self):
+        blocking = {
+            "pending", "waiting_for_host", "sending", "accepted_remote", "uncertain", "tombstone_pending", "resolving",
+        }
+        advance = {"released", "cancelled", "failed"}
+        for status in PeerDeliveryStatus:
+            self.assertEqual(is_peer_outbox_head_blocking(status), status.value in blocking, status)
+            self.assertEqual(can_advance_peer_stream(status), status.value in advance, status)
+        self.assertFalse(is_peer_outbox_head_blocking("bogus"))
+        self.assertFalse(can_advance_peer_stream("bogus"))
+
+    def test_broadcast_and_resolution_records(self):
+        self.assertEqual(
+            set(GroupBroadcast.__annotations__),
+            {"id", "group_id", "group_revision", "sender_ref", "message", "recipient_snapshot", "request_key",
+             "created", "settled_at"},
+        )
+        self.assertEqual(
+            set(BroadcastRecipient.__annotations__),
+            {"broadcast_id", "recipient_key", "target_ref", "delivery_id", "task_id", "status", "send_status",
+             "processing_status", "error", "updated"},
+        )
+        self.assertEqual(
+            set(DeliveryResolution.__annotations__),
+            {"id", "delivery_id", "request_id", "fingerprint", "group_revision", "delivery_revision",
+             "remote_revision", "request_json", "resolution", "evidence", "actor", "status", "remote_result",
+             "created", "updated"},
+        )
+        self.assertEqual(ResolveDeliveryResult.__annotations__["receipt"].__forward_arg__, "NotRequired[str | None]")
 
 
 if __name__ == "__main__":
