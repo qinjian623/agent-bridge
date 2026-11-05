@@ -5,6 +5,8 @@ No I/O and no behaviour beyond validation helpers, so every other peer module ca
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, NotRequired, TypedDict
@@ -49,6 +51,81 @@ class ObjectRef:
 
     def as_dict(self) -> dict[str, str]:
         return {**self.node.as_dict(), "local_id": self.local_id}
+
+
+DeliverOrderingMode = Literal["legacy", "bootstrap", "ordered"]
+
+
+@dataclass(frozen=True, slots=True)
+class GroupRef:
+    """Group identity: authority (coordinator) node incarnation plus group_id."""
+
+    authority: NodeRef
+    group_id: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"authority": self.authority.as_dict(), "group_id": self.group_id}
+
+
+@dataclass(frozen=True, slots=True)
+class TargetRef:
+    """Complete destination: node incarnation plus kind/runtime/target_id."""
+
+    node: NodeRef
+    kind: str
+    target_id: str
+    runtime: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("bridge", "native"):
+            raise ValueError(f"invalid target kind: {self.kind!r}")
+        if self.kind == "bridge" and self.runtime != "":
+            raise ValueError("bridge target must have empty runtime")
+        if self.kind == "native" and self.runtime not in ("codex", "antigravity"):
+            raise ValueError(f"invalid native runtime: {self.runtime!r}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "host_id": self.node.host_id,
+            "node_id": self.node.node_id,
+            "state_generation": self.node.state_generation,
+            "kind": self.kind,
+            "runtime": self.runtime,
+            "target_id": self.target_id,
+        }
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _node_dict(node: NodeRef | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(node, NodeRef):
+        return node.as_dict()
+    return {k: node[k] for k in ("host_id", "node_id", "state_generation")}
+
+
+def compute_stream_id(authority: NodeRef | dict[str, Any], target: TargetRef | dict[str, Any]) -> str:
+    """stream_id = SHA256(canonical_json(authority NodeRef, TargetRef))."""
+    target_dict = target.as_dict() if isinstance(target, TargetRef) else {
+        k: target[k] for k in ("host_id", "node_id", "state_generation", "kind", "runtime", "target_id")
+    }
+    return hashlib.sha256(_canonical_bytes({"authority": _node_dict(authority), "target": target_dict})).hexdigest()
+
+
+def canonical_operation_id(
+    source_node: NodeRef | dict[str, Any], dest_generation: str, method: str, request_id: str
+) -> str:
+    """Deterministic operation id from full source identity, receiver generation, method and request id."""
+    source = _node_dict(source_node)
+    payload = {
+        "source_node_id": source["node_id"],
+        "source_state_generation": source["state_generation"],
+        "dest_generation": dest_generation,
+        "method": method,
+        "request_id": request_id,
+    }
+    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
 
 # ---------------------------------------------------------------- state enums

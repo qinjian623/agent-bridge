@@ -7,11 +7,15 @@ from agent_bridge.peer_protocol import (
     CAPABILITIES,
     PEER_METHODS,
     PROTOCOL_VERSION,
+    GroupRef,
     NodeRef,
     ObjectRef,
     OperationStatus,
     PeerDeliveryStatus,
     PeerErrorCode,
+    TargetRef,
+    canonical_operation_id,
+    compute_stream_id,
     fail,
     negotiate_version,
     ok,
@@ -84,6 +88,62 @@ class PeerProtocolContract(unittest.TestCase):
     def test_terminal_statuses(self):
         self.assertTrue(OperationStatus.COMPLETED.terminal)
         self.assertFalse(OperationStatus.UNCERTAIN.terminal)
+
+
+class PhaseCRefs(unittest.TestCase):
+    A = NodeRef("h1", "n1", "g1")
+    D = NodeRef("h2", "n2", "g2")
+
+    def test_group_ref(self):
+        self.assertEqual(
+            GroupRef(self.A, "grp").as_dict(),
+            {"authority": self.A.as_dict(), "group_id": "grp"},
+        )
+
+    def test_target_ref_validation(self):
+        t = TargetRef(self.D, "native", "nid", "codex")
+        self.assertEqual(
+            t.as_dict(),
+            {"host_id": "h2", "node_id": "n2", "state_generation": "g2",
+             "kind": "native", "runtime": "codex", "target_id": "nid"},
+        )
+        self.assertEqual(TargetRef(self.D, "bridge", "s1").runtime, "")
+        for args in (
+            (self.D, "other", "x", ""),
+            (self.D, "bridge", "x", "codex"),
+            (self.D, "native", "x", ""),
+            (self.D, "native", "x", "claude"),
+        ):
+            with self.assertRaises((ValueError, BridgeError)):
+                TargetRef(*args)
+
+    def test_stream_id(self):
+        t = TargetRef(self.D, "bridge", "s1")
+        sid = compute_stream_id(self.A, t)
+        self.assertEqual(len(sid), 64)
+        self.assertEqual(sid, compute_stream_id(self.A, t))
+        self.assertEqual(sid, compute_stream_id(self.A.as_dict(), t.as_dict()))
+        self.assertNotEqual(sid, compute_stream_id(self.A, TargetRef(self.D, "bridge", "s2")))
+        self.assertNotEqual(sid, compute_stream_id(self.A, TargetRef(NodeRef("h2", "n2", "g3"), "bridge", "s1")))
+        self.assertNotEqual(sid, compute_stream_id(NodeRef("h1", "n1", "g9"), t))
+        # no ambiguity between authority and target fields
+        self.assertNotEqual(
+            compute_stream_id(NodeRef("a", "bc", "g"), TargetRef(self.D, "bridge", "s")),
+            compute_stream_id(NodeRef("ab", "c", "g"), TargetRef(self.D, "bridge", "s")),
+        )
+
+    def test_canonical_operation_id(self):
+        base = canonical_operation_id(self.A, "g2", "peer.deliver", "r1")
+        self.assertEqual(base, canonical_operation_id(self.A.as_dict(), "g2", "peer.deliver", "r1"))
+        self.assertEqual(len(base), 64)
+        for other in (
+            canonical_operation_id(NodeRef("h1", "n9", "g1"), "g2", "peer.deliver", "r1"),
+            canonical_operation_id(NodeRef("h1", "n1", "g8"), "g2", "peer.deliver", "r1"),
+            canonical_operation_id(self.A, "g3", "peer.deliver", "r1"),
+            canonical_operation_id(self.A, "g2", "peer.control", "r1"),
+            canonical_operation_id(self.A, "g2", "peer.deliver", "r2"),
+        ):
+            self.assertNotEqual(base, other)
 
 
 if __name__ == "__main__":
