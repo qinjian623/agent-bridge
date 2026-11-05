@@ -15,6 +15,7 @@ from typing import Any
 from .config import state_directory
 from .hosts import ConfigHostRegistry
 from .node_identity import FileNodeIdentityStore
+from .store import Store
 
 
 def _is_pid_alive(pid: int | None) -> bool:
@@ -686,25 +687,15 @@ def set_session_name(state: Path | str | None, session_id: str, name: str) -> st
     if not db_path.exists():
         raise ValueError(f"State database not found: {db_path}")
 
+    store = Store(state_dir)
     # Resolve session_id if given as prefix
-    with sqlite3.connect(str(db_path)) as db:
-        cur = db.execute(
+    with store.connection() as db:
+        rows = db.execute(
             "SELECT id FROM sessions WHERE id = ? OR id LIKE ? ORDER BY created DESC",
             (session_id, f"{session_id}%"),
-        )
-        rows = cur.fetchall()
-        if not rows:
-            raise ValueError(f"Session not found matching: {session_id}")
-        full_sid = rows[0][0]
-
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS session_names ("
-            "  session_id TEXT PRIMARY KEY, name TEXT NOT NULL, created REAL NOT NULL"
-            ")"
-        )
-        db.execute(
-            "INSERT INTO session_names(session_id, name, created) VALUES(?, ?, ?) "
-            "ON CONFLICT(session_id) DO UPDATE SET name=excluded.name",
-            (full_sid, name.strip(), time.time()),
-        )
-        return full_sid
+        ).fetchall()
+    if not rows:
+        raise ValueError(f"Session not found matching: {session_id}")
+    full_sid = rows[0]["id"]
+    store.set_session_name(full_sid, name)
+    return full_sid

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from agent_bridge.config import Config, Profile
 from agent_bridge.errors import BridgeError
-from agent_bridge.store import Store
+from agent_bridge.store import Store, validate_session_name
 
 
 class StoreTests(unittest.TestCase):
@@ -280,3 +280,82 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.record("first_output", {}, sid, tid, attempt))
         self.assertEqual(timestamp, self.store.get_task(tid)["attempts"][0]["first_output"])
         self.assertEqual(1, sum(e["kind"] == "first_output" for e in self.store.events(task_id=tid)))
+
+    def test_open_name_is_stored_with_session_and_reported_in_event(self):
+        result = self.store.open(
+            self.profile, str(self.path), "read-only", "open-name", name="  Pipeline Agent  "
+        )
+        self.assertEqual("Pipeline Agent", result["name"])
+        self.assertEqual("Pipeline Agent", self.store.get_session(result["session_id"])["name"])
+        opened = [
+            event for event in self.store.events(session_id=result["session_id"])
+            if event["kind"] == "session_opened"
+        ]
+        self.assertEqual([{"name": "Pipeline Agent"}], [event["data"] for event in opened])
+
+    def test_open_name_is_part_of_request_fingerprint(self):
+        first = self.store.open(self.profile, str(self.path), "read-only", "open-once", name="One")
+        self.assertEqual(
+            first, self.store.open(self.profile, str(self.path), "read-only", "open-once", name="  One ")
+        )
+        with self.assertRaisesRegex(BridgeError, "different content"):
+            self.store.open(self.profile, str(self.path), "read-only", "open-once", name="Two")
+        with self.assertRaisesRegex(BridgeError, "different content"):
+            self.store.open(self.profile, str(self.path), "read-only", "open-once")
+
+    def test_validate_session_name_trims_and_rejects_unsafe_values(self):
+        self.assertIsNone(validate_session_name(None))
+        self.assertEqual("会话 one", validate_session_name("  会话 one  "))
+        self.assertEqual("x" * 128, validate_session_name("x" * 128))
+        for invalid in ("", "   ", "x" * 129, "a\x00b", "a\nb", "a\rb", "a\tb", "\x01", "\x7f"):
+            with self.assertRaises(BridgeError) as caught:
+                validate_session_name(invalid)
+            self.assertEqual("invalid_request", caught.exception.code)
+        with self.assertRaises(BridgeError) as caught:
+            validate_session_name(123)  # type: ignore[arg-type]
+        self.assertEqual("invalid_request", caught.exception.code)
+
+    def test_duplicate_session_names_are_allowed(self):
+        first = self.store.open(self.profile, str(self.path), "read-only", "same-name-1", name="Shared")
+        second = self.store.open(self.profile, str(self.path), "read-only", "same-name-2", name="Shared")
+        self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertEqual("Shared", self.store.get_session(first["session_id"])["name"])
+        self.assertEqual("Shared", self.store.get_session(second["session_id"])["name"])
+
+    def test_set_session_name_upserts_existing_session_only(self):
+        sid = self.session("open")
+        self.assertNotIn("name", self.store.get_session(sid))
+        self.assertEqual("First", self.store.set_session_name(sid, " First "))
+        self.assertEqual("First", self.store.get_session(sid)["name"])
+        self.store.set_session_name(sid, "Second")
+        self.assertEqual("Second", self.store.get_session(sid)["name"])
+        with self.assertRaisesRegex(BridgeError, "sessions"):
+            self.store.set_session_name("missing", "Name")
+        with self.assertRaisesRegex(BridgeError, "1 to 128"):
+            self.store.set_session_name(sid, "   ")
+
+    def test_create_session_name_rolls_back_with_session(self):
+        with self.assertRaises(RuntimeError):
+            with self.store.connection(write=True) as db:
+                session_id, _ = self.store.create_session(
+                    db, self.profile, str(self.path), "read-only", name="Atomic"
+                )
+                raise RuntimeError("rollback")
+        with self.store.connection() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone())
+            self.assertIsNone(
+                db.execute("SELECT 1 FROM session_names WHERE session_id=?", (session_id,)).fetchone()
+            )
+
+    def test_create_session_writes_name_and_event_inside_caller_transaction(self):
+        with self.store.connection(write=True) as db:
+            session_id, _ = self.store.create_session(
+                db, self.profile, str(self.path), "read-only", name=" Peer "
+            )
+            row = db.execute("SELECT name FROM session_names WHERE session_id=?", (session_id,)).fetchone()
+            self.assertEqual("Peer", row["name"])
+        self.assertEqual("Peer", self.store.get_session(session_id)["name"])
+        opened = [
+            event for event in self.store.events(session_id=session_id) if event["kind"] == "session_opened"
+        ]
+        self.assertEqual({"name": "Peer"}, opened[0]["data"])

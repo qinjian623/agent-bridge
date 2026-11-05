@@ -190,6 +190,51 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await request(self.state, "agent_dispatch", {"profile": "fixed", "cwd": str(self.state), "instruction": "task", "request_id": "race"})
         self.assertEqual(["closed"], [s["desired"] for s in self.broker.store.sessions()])
 
+    async def test_open_name_is_recorded_and_existing_session_name_is_rejected(self):
+        opened = await request(
+            self.state,
+            "agent_open",
+            {
+                "profile": "fixed",
+                "cwd": str(self.state),
+                "request_id": "named-open",
+                "name": "  Integration Pipeline  ",
+            },
+        )
+        self.assertEqual("Integration Pipeline", opened["name"])
+        sid = opened["session_id"]
+        self.assertEqual("Integration Pipeline", self.broker.store.get_session(sid)["name"])
+        events = self.broker.store.events(session_id=sid)
+        self.assertEqual(
+            {"name": "Integration Pipeline"},
+            next(event for event in events if event["kind"] == "session_opened")["data"],
+        )
+        with self.assertRaisesRegex(BridgeError, "Cannot set name on an existing session"):
+            await request(
+                self.state,
+                "agent_dispatch",
+                {"session_id": sid, "instruction": "task", "request_id": "named-dispatch", "name": "Other"},
+            )
+
+    async def test_dispatch_created_session_records_name_in_its_fingerprint(self):
+        args = {
+            "profile": "fixed",
+            "cwd": str(self.state),
+            "instruction": "task",
+            "request_id": "named-dispatch-open",
+            "name": "  Dispatch Named  ",
+        }
+        result = await request(self.state, "agent_dispatch", args)
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("Dispatch Named", self.broker.store.get_session(result["session_id"])["name"])
+        with self.assertRaisesRegex(BridgeError, "different API parameters"):
+            await request(self.state, "agent_dispatch", {**args, "name": "Different"})
+
+    async def test_omitted_name_and_explicit_none_share_a_request_fingerprint(self):
+        args = {"profile": "fixed", "cwd": str(self.state), "instruction": "task", "request_id": "none-name"}
+        first = await request(self.state, "agent_dispatch", args)
+        self.assertEqual(first, await request(self.state, "agent_dispatch", {**args, "name": None}))
+
     async def test_explicit_access_must_match_but_omitted_access_inherits(self):
         opened = await request(self.state, "agent_open", {"profile": "fixed", "cwd": str(self.state), "access": "workspace-write", "workspace_mode": "copy", "snapshot_files": [], "request_id": "write"})
         sid = opened["session_id"]

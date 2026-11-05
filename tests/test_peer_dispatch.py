@@ -312,6 +312,48 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
         self.assert_error(conflict, PeerErrorCode.OPERATION_CONFLICT)
         self.assertEqual(1, len(self.store.sessions()))
 
+    async def test_deliver_writes_a_validated_open_name_with_the_session(self):
+        response = await self.peer(
+            "peer.deliver",
+            self.deliver_params(
+                operation=self.operation("op-named"),
+                delivery_id="delivery-named",
+                target_seq=6,
+                open={
+                    "profile": "worker",
+                    "cwd": str(self.state),
+                    "access": "read-only",
+                    "name": "  Remote Worker  ",
+                },
+            ),
+        )
+        self.assertTrue(response["ok"], response)
+        result = response["result"]
+        self.assertEqual("Remote Worker", result["name"])
+        self.assertEqual("Remote Worker", self.store.get_session(result["session_id"])["name"])
+        opened = [
+            event for event in self.store.events(session_id=result["session_id"])
+            if event["kind"] == "session_opened"
+        ]
+        self.assertEqual({"name": "Remote Worker"}, opened[0]["data"])
+
+        invalid = await self.peer(
+            "peer.deliver",
+            self.deliver_params(
+                operation=self.operation("op-bad-name"),
+                delivery_id="delivery-bad-name",
+                target_seq=7,
+                open={
+                    "profile": "worker",
+                    "cwd": str(self.state),
+                    "access": "read-only",
+                    "name": "bad\nname",
+                },
+            ),
+        )
+        self.assert_error(invalid, "invalid_request")
+        self.assertEqual(1, len(self.store.sessions()))
+
     async def test_deliver_rejects_identity_mismatch_and_corrupted_state(self):
         mismatch = self.deliver_params(
             operation={
@@ -793,6 +835,45 @@ class CoordinatorRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("completed", view["status"])
         self.assertEqual("gpu-a", view["host_id"])
         self.assertEqual("remote-session", view["result"]["session_id"])
+
+    async def test_remote_open_forwards_a_validated_session_name(self):
+        self.client.deliver_results.append(
+            {
+                "delivery_id": "delivery-named",
+                "status": "accepted_remote",
+                "session_id": "remote-named",
+                "target_seq": 8,
+                "name": "Remote Name",
+            }
+        )
+        args = {
+            "host_id": "gpu-a",
+            "profile": "fixed",
+            "cwd": str(self.state),
+            "request_id": "open-named",
+            "name": "  Remote Name  ",
+        }
+        opened = await self.broker.call("agent_open", args)
+        [params] = self.client.named("deliver")
+        self.assertEqual("Remote Name", params["open"]["name"])
+        self.assertEqual(opened, await self.broker.call("agent_open", args))
+        self.assertEqual(1, len(self.client.named("deliver")))
+
+    async def test_remote_open_treats_explicit_none_name_as_omitted(self):
+        self.client.deliver_results.append(
+            {
+                "delivery_id": "delivery-none",
+                "status": "accepted_remote",
+                "session_id": "remote-none",
+                "target_seq": 9,
+            }
+        )
+        args = {"host_id": "gpu-a", "profile": "fixed", "cwd": str(self.state), "request_id": "open-none"}
+        first = await self.broker.call("agent_open", args)
+        self.assertEqual(first, await self.broker.call("agent_open", {**args, "name": None}))
+        [params] = self.client.named("deliver")
+        self.assertNotIn("name", params["open"])
+        self.assertEqual(1, len(self.client.named("deliver")))
 
     async def test_remote_dispatch_opens_atomically_or_targets_an_existing_session(self):
         self.client.deliver_results.append(

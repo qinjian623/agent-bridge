@@ -79,8 +79,9 @@ def server(state):
         model: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
+        name: str | None = None,
     ) -> dict:
-        """Create a persistent native session locally or on a registered remote host. Optional model selects an exact discovered ID under this profile's provider/auth/quota. Writes use a Git worktree; snapshot_files selects current file contents. Non-Git workspace_mode=copy requires snapshot_files. For remote hosts, cwd stays the local source directory and project_id names the managed remote project; open+dispatch is one atomic operation there (ADR-13)."""
+        """Create a persistent native session locally or on a registered remote host. Optional model selects an exact discovered ID under this profile's provider/auth/quota. Optional name labels a newly created session (1-128 trimmed characters, no control characters); it is rejected for an existing session. Writes use a Git worktree; snapshot_files selects current file contents. Non-Git workspace_mode=copy requires snapshot_files. For remote hosts, cwd stays the local source directory and project_id names the managed remote project; open+dispatch is one atomic operation there (ADR-13)."""
         return await request(state, "agent_open", locals())
 
     @mcp.tool()
@@ -102,8 +103,9 @@ def server(state):
         model: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
+        name: str | None = None,
     ) -> dict:
-        """Queue one task locally or on a registered remote host. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Optional profile + model selects an exact discovered model; existing sessions cannot change models. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result. No verified hard_budget support. Remote dispatch without session_id uses one atomic open+dispatch operation; cwd is the local source dir and project_id names the remote project."""
+        """Queue one task locally or on a registered remote host. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Optional profile + model selects an exact discovered model; existing sessions cannot change models. Optional name labels a session created by this dispatch (1-128 trimmed characters, no control characters) and is rejected when session_id is given. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result. No verified hard_budget support. Remote dispatch without session_id uses one atomic open+dispatch operation; cwd is the local source dir and project_id names the remote project."""
         return await request(state, "agent_dispatch", locals())
 
     @mcp.tool()

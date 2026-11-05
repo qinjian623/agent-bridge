@@ -31,7 +31,7 @@ from .peer_protocol import (
     peer_error,
     require_method,
 )
-from .store import encode
+from .store import encode, validate_session_name
 
 # ---------------------------------------------------------------- MCP tool parameter contracts
 
@@ -487,6 +487,7 @@ class DirectPeerService:
 
             task_id: str | None = None
             session_id: str | None = None
+            session_name: str | None = None
             status = "accepted_remote"
             if seq_kind == "tombstone":
                 status = "cancelled"
@@ -511,7 +512,8 @@ class DirectPeerService:
                         cwd = "."
                     access = open_spec.get("access") or "read-only"
                     workspace = open_spec.get("workspace")
-                    session_id, _ = store.create_session(db, profile, cwd, access, None, workspace)
+                    session_name = validate_session_name(open_spec.get("name"))
+                    session_id, _ = store.create_session(db, profile, cwd, access, None, workspace, session_name)
                 if message.strip():
                     queued = store.enqueue_task(
                         db,
@@ -535,6 +537,8 @@ class DirectPeerService:
                 "receipt": {"accepted_at": accepted_at},
                 "status": status,
             }
+            if session_name is not None:
+                result["name"] = session_name
             db.execute(
                 "UPDATE peer_operations SET status=?,result=?,updated=? WHERE operation_id=?",
                 ("cancelled" if status == "cancelled" else "completed", encode(result), time.time(), operation["operation_id"]),

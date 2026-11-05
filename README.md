@@ -92,8 +92,8 @@ agent-bridge call agent_dispatch --json '{"session_id":"返回的 ID","instructi
 | 工具 | 行为 |
 | --- | --- |
 | `agent_catalog` | 查询配置对应的模型目录、验证标记、并发限制；`refresh=true` 强制刷新 |
-| `agent_open` | 创建独立会话；写入会话创建 worktree |
-| `agent_dispatch` | 排队、明确指定配置或均衡选择；`retry_task_id` 可保留旧 attempt 后重试 |
+| `agent_open` | 创建独立会话；写入会话创建 worktree；可用 `name` 为新建会话命名 |
+| `agent_dispatch` | 排队、明确指定配置或均衡选择；`retry_task_id` 可保留旧 attempt 后重试；新建会话时可用 `name` 命名 |
 | `agent_control` | pause、pause_drain、resume、close、reopen、respond、resolve，以及 parent_* 操作 |
 | `agent_cancel` | 取消一个任务，不关闭整个会话 |
 | `agent_inspect` | 总览列出会话的软件、供应商、模型和配置名；可指定任务、会话或父会话查询详情 |
@@ -105,6 +105,8 @@ agent-bridge call agent_dispatch --json '{"session_id":"返回的 ID","instructi
 | `agent_broadcast` | 向明确指定组的成员各派发一条任务，返回每个成员的任务 ID 或跳过原因 |
 
 写操作都需要稳定的 `request_id`。重试相同请求返回原结果，复用 ID 改变内容会报错。会话控制和结果检查操作需要 `expected_revision`，从 `agent_inspect` 或 `agent_result.session_revision` 取得。
+
+`name` 只在本次调用创建新会话时生效：去除首尾空白后需为 1～128 个 Unicode 字符，且不能包含 NUL、换行或控制字符；允许中文和重复名称。对已有 `session_id` 传 `name` 会返回 `invalid_request`，改名请使用独立的 `agent-bridge name` 命令。`name` 进入请求 fingerprint，同一 `request_id` 改 name 会冲突。
 
 ### 分组与广播
 

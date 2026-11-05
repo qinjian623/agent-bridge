@@ -25,7 +25,7 @@ from .hosts import ConfigHostRegistry
 from .peer_protocol import PROTOCOL_VERSION, NodeRef, PeerErrorCode
 from .peer_transport import DefaultPeerClientFactory
 from .routing import choose
-from .store import Store, encode, task_input
+from .store import Store, encode, task_input, validate_session_name
 from .worker import alive, owned_processes
 from .workspace import directory_copy, worktree
 
@@ -221,7 +221,7 @@ class Broker:
     @staticmethod
     def _remote_open_spec(args):
         spec = {}
-        for key in ("profile", "cwd", "access", "project_id", "model", "workspace_mode", "base", "snapshot_files"):
+        for key in ("profile", "cwd", "access", "project_id", "model", "workspace_mode", "base", "snapshot_files", "name"):
             value = args.get(key)
             if value is not None:
                 spec[key] = value
@@ -248,6 +248,9 @@ class Broker:
         raise BridgeError(PeerErrorCode.OPERATION_PENDING, "The cross-host operation has no result yet")
 
     async def _remote_deliver(self, host_id, method, args, *, instruction=None, open_only=False):
+        # Omitted and explicit name=None must produce the same stable operation id (pre-upgrade retries).
+        if args.get("name") is None:
+            args = {key: value for key, value in args.items() if key != "name"}
         client = self.peer_factory.client(host_id)
         node = await self._peer_node(host_id, client)
         operation_id = self._stable_operation_id(
@@ -576,6 +579,13 @@ class Broker:
         if method == "agent_operation":
             return await self._operation(args)
         if method == "agent_open":
+            session_name = validate_session_name(args.get("name"))
+            if session_name is not None and args.get("session_id") is not None:
+                raise BridgeError("invalid_request", "Cannot set name on an existing session")
+            if session_name is None:
+                args = {key: value for key, value in args.items() if key != "name"}
+            else:
+                args = {**args, "name": session_name}
             host_id = self._remote_host(args)
             if host_id is not None:
                 return await self._remote_open(host_id, args)
@@ -614,7 +624,7 @@ class Broker:
                         args.get("base", "HEAD"),
                         args.get("snapshot_files"),
                     )
-            result = self.store.open(profile, cwd, access, args["request_id"], args.get("parent"), metadata)
+            result = self.store.open(profile, cwd, access, args["request_id"], args.get("parent"), metadata, session_name)
             return {**result, "cwd": cwd, "workspace": metadata, "profile": profile.public()}
         if method == "agent_dispatch":
             requirements = args.get("requirements")
@@ -624,6 +634,13 @@ class Broker:
                 raise BridgeError("invalid_request", "requirements must be an object")
             if requirements.get("hard_budget"):
                 raise BridgeError("hard_budget_unsupported", "No verified hard cap is available")
+            session_name = validate_session_name(args.get("name"))
+            if session_name is not None and args.get("session_id"):
+                raise BridgeError("invalid_request", "Cannot set name on an existing session")
+            if session_name is None:
+                args = {key: value for key, value in args.items() if key != "name"}
+            else:
+                args = {**args, "name": session_name}
             host_id = self._remote_host(args)
             if host_id is not None:
                 return await self._remote_dispatch(host_id, args)
@@ -653,20 +670,20 @@ class Broker:
                 )
                 if selection.get("execute_locally"):
                     return selection
-                opened = await self.call(
-                    "agent_open",
-                    {
-                        "profile": selection["profile"],
-                        "model": args.get("model"),
-                        "cwd": args["cwd"],
-                        "access": access or "read-only",
-                        "request_id": "session:" + hashlib.sha256(args["request_id"].encode()).hexdigest(),
-                        "parent": args.get("parent"),
-                        "base": args.get("base", "HEAD"),
-                        "snapshot_files": args.get("snapshot_files"),
-                        "workspace_mode": args.get("workspace_mode", "git"),
-                    },
-                )
+                open_request = {
+                    "profile": selection["profile"],
+                    "model": args.get("model"),
+                    "cwd": args["cwd"],
+                    "access": access or "read-only",
+                    "request_id": "session:" + hashlib.sha256(args["request_id"].encode()).hexdigest(),
+                    "parent": args.get("parent"),
+                    "base": args.get("base", "HEAD"),
+                    "snapshot_files": args.get("snapshot_files"),
+                    "workspace_mode": args.get("workspace_mode", "git"),
+                }
+                if session_name is not None:
+                    open_request["name"] = session_name
+                opened = await self.call("agent_open", open_request)
                 session_id = opened["session_id"]
                 selection.update(
                     {k: opened["profile"][k] for k in ("runtime", "provider", "model", "effort", "service_tier")}
@@ -817,6 +834,11 @@ class Broker:
     async def api_call(self, method, args):
         if method not in {"agent_open", "agent_dispatch", "agent_control", "agent_cancel", "agent_review", "agent_group", "agent_broadcast"}:
             return {"result": await self.call(method, args)}
+        if method in {"agent_open", "agent_dispatch"} and "name" in args:
+            name = validate_session_name(args.get("name"))
+            args = {field: value for field, value in args.items() if field != "name"}
+            if name is not None:
+                args["name"] = name
         key = args.get("request_id")
         if not isinstance(key, str) or not key or len(key) > 200:
             raise BridgeError("invalid_request_id", "A request_id of at most 200 characters is required")

@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -23,6 +24,20 @@ def encode(value):
 
 def identifier():
     return str(uuid.uuid4())
+
+
+def validate_session_name(name: str | None) -> str | None:
+    """Return the canonical trimmed session name, or None when no name was supplied."""
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise BridgeError("invalid_request", "name must be a string")
+    value = name.strip()
+    if not 1 <= len(value) <= 128:
+        raise BridgeError("invalid_request", "name must be 1 to 128 characters after trimming whitespace")
+    if any(character in "\x00\n\r" or unicodedata.category(character) == "Cc" for character in value):
+        raise BridgeError("invalid_request", "name must not contain NUL, newline, or control characters")
+    return value
 
 
 def task_input(instruction, reservation, dependencies=None):
@@ -50,6 +65,9 @@ CREATE TABLE IF NOT EXISTS sessions (
  parent TEXT, native_id TEXT, desired TEXT NOT NULL DEFAULT 'open', observed TEXT NOT NULL DEFAULT 'stopped',
  revision INTEGER NOT NULL DEFAULT 0, worker_pid INTEGER, worker_start TEXT,
  generation TEXT, error TEXT, created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_names (
+ session_id TEXT PRIMARY KEY, name TEXT NOT NULL, created REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tasks (
  id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -224,12 +242,22 @@ class Store:
         db.execute("INSERT INTO requests VALUES(?,?,?)", (request_id, fingerprint, encode(result)))
         return result
 
-    def open(self, profile: Profile, cwd: str, access: str, request_id: str, parent: str | None = None, workspace=None):
+    def open(
+        self,
+        profile: Profile,
+        cwd: str,
+        access: str,
+        request_id: str,
+        parent: str | None = None,
+        workspace=None,
+        name: str | None = None,
+    ):
         directory = Path(cwd).expanduser().resolve()
         if not directory.is_dir():
             raise BridgeError("invalid_directory", "Working directory must exist")
         if access not in {"read-only", "workspace-write"}:
             raise BridgeError("invalid_access", "access must be read-only or workspace-write")
+        name = validate_session_name(name)
         payload = {
             "op": "open",
             "profile": asdict(profile),
@@ -238,6 +266,8 @@ class Store:
             "parent": parent,
             "workspace": workspace,
         }
+        if name is not None:
+            payload["name"] = name
         with self.connection(write=True) as db:
             fingerprint, old = self.previous(db, request_id, payload)
             if old is not None:
@@ -257,10 +287,27 @@ class Store:
                     encode(workspace or {}),
                 ),
             )
-            self.event(db, "session_opened", {}, session)
-            return self.remember(db, request_id, fingerprint, {"session_id": session, "revision": 0})
+            if name is not None:
+                db.execute(
+                    "INSERT INTO session_names(session_id,name,created) VALUES(?,?,?)",
+                    (session, name, time.time()),
+                )
+            self.event(db, "session_opened", {"name": name} if name is not None else {}, session)
+            result = {"session_id": session, "revision": 0}
+            if name is not None:
+                result["name"] = name
+            return self.remember(db, request_id, fingerprint, result)
 
-    def create_session(self, db, profile: Profile, cwd: str, access: str, parent: str | None = None, workspace=None):
+    def create_session(
+        self,
+        db,
+        profile: Profile,
+        cwd: str,
+        access: str,
+        parent: str | None = None,
+        workspace=None,
+        name: str | None = None,
+    ):
         """Insert one session inside an existing transaction (peer.deliver composite open, ADR-13).
 
         Unlike `open`, this does not allocate a `requests` row: the caller's peer operation record is the
@@ -271,6 +318,7 @@ class Store:
             raise BridgeError("invalid_directory", "Working directory must exist")
         if access not in {"read-only", "workspace-write"}:
             raise BridgeError("invalid_access", "access must be read-only or workspace-write")
+        name = validate_session_name(name)
         session = identifier()
         native = identifier() if profile.runtime == "claude" else None
         db.execute(
@@ -286,7 +334,12 @@ class Store:
                 encode(workspace or {}),
             ),
         )
-        self.event(db, "session_opened", {}, session)
+        if name is not None:
+            db.execute(
+                "INSERT INTO session_names(session_id,name,created) VALUES(?,?,?)",
+                (session, name, time.time()),
+            )
+        self.event(db, "session_opened", {"name": name} if name is not None else {}, session)
         return session, str(directory)
 
     def dispatch(
@@ -339,11 +392,28 @@ class Store:
                 self.required(db, "tasks", dependency)
         return reservation
 
+    def set_session_name(self, session_id, name):
+        """Validate and upsert a display name for an existing Bridge session."""
+        value = validate_session_name(name)
+        if value is None:
+            raise BridgeError("invalid_request", "name is required")
+        with self.connection(write=True) as db:
+            self.required(db, "sessions", session_id)
+            db.execute(
+                "INSERT INTO session_names(session_id,name,created) VALUES(?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET name=excluded.name",
+                (session_id, value, time.time()),
+            )
+        return value
+
     def get_session(self, session_id):
         with self.connection() as db:
             row = self.required(db, "sessions", session_id)
+            naming = db.execute("SELECT name FROM session_names WHERE session_id=?", (session_id,)).fetchone()
         row["profile"] = json.loads(row["profile"])
         row["workspace"] = json.loads(row["workspace"])
+        if naming is not None:
+            row["name"] = naming["name"]
         return row
 
     def get_task(self, task_id):
