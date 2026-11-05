@@ -17,25 +17,33 @@ from .peer_protocol import (
     INLINE_RESULT_BYTES,
     MAX_PAGE_LIMIT,
     PROTOCOL_VERSION,
+    AckRequestResult,
     ArtifactRef,
     DeliverySource,
     HelloResult,
+    NodeOutboxStatus,
     NodeRef,
     NodeState,
+    NotifyParentResult,
     PeerDeliveryStatus,
     PeerErrorCode,
     PeerEvent,
     PeerRequest,
     PeerResponse,
+    PullRequestsResult,
     RemoteMember,  # noqa: F401  re-exported so peer_api.RemoteMember is the peer_protocol type
     canonical_operation_id,
     fail,
     negotiate_version,
+    normalize_ack_request_params,
+    normalize_notify_parent_params,
+    normalize_outbox_item,
     ok,
     peer_error,
     require_method,
+    validate_object_ref,
 )
-from .store import encode, identifier, validate_session_name
+from .store import Store, encode, identifier, validate_session_name
 
 # ---------------------------------------------------------------- MCP tool parameter contracts
 
@@ -156,11 +164,14 @@ IMPLEMENTED_PEER_METHODS = (
     "peer.hello",
     "peer.inspect",
     "peer.catalog",
+    "peer.pull_requests",
+    "peer.ack_request",
     "peer.deliver",
     "peer.lookup_delivery",
     "peer.cancel",
     "peer.result",
     "peer.events",
+    "peer.notify_parent",
     "peer.resolve_delivery",
 )
 
@@ -211,6 +222,10 @@ class DirectPeerService:
                 result = self._inspect(params)
             elif spec.name == "peer.catalog":
                 result = self._catalog(params)
+            elif spec.name == "peer.pull_requests":
+                result = self._pull_requests(params)
+            elif spec.name == "peer.ack_request":
+                result = self._ack_request(params)
             elif spec.name == "peer.deliver":
                 result = self._deliver(params)
             elif spec.name == "peer.lookup_delivery":
@@ -221,6 +236,8 @@ class DirectPeerService:
                 result = self._result(params)
             elif spec.name == "peer.events":
                 result = self._events(params)
+            elif spec.name == "peer.notify_parent":
+                result = self._notify_parent(params)
             elif spec.name == "peer.resolve_delivery":
                 result = self._resolve_delivery(params)
             else:
@@ -381,6 +398,160 @@ class DirectPeerService:
                 entries.append(profile.public())
         return {"entries": entries, "stale": False, "fetched_at": fetched_at}
 
+    def _pull_requests(self, params: dict[str, Any]) -> PullRequestsResult:
+        store = self._require_store(self._store)
+        after = params.get("after", 0)
+        limit = params.get("limit", MAX_PAGE_LIMIT)
+        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "after must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "limit must be a positive integer")
+        limit = min(limit, MAX_PAGE_LIMIT)
+        rows = store.pull_outbox(after, limit)
+        with store.connection() as db:
+            scan_upper_seq = db.execute("SELECT COALESCE(MAX(seq),0) FROM node_outbox").fetchone()[0]
+        items = [normalize_outbox_item(row) for row in rows]
+        return {
+            "items": items,
+            "cursor": items[-1]["seq"] if items else after,
+            "has_more": len(items) == limit,
+            "scan_upper_seq": scan_upper_seq,
+        }
+
+    def _ack_request(self, params: dict[str, Any]) -> AckRequestResult:
+        store = self._require_store(self._store)
+        normalized = normalize_ack_request_params(params)
+        operation = normalized.get("operation")
+        if operation is not None:
+            identity = self._ready_identity()
+            self._check_operation_identity(operation, identity)
+        row = store.ack_outbox(
+            normalized["operation_id"],
+            result=normalized["result"],
+            outcome=normalized["outcome"],
+            status=str(NodeOutboxStatus.ACKED),
+        )
+        ack_seq = store.record_commit(
+            f"peer.ack_request:{normalized['operation_id']}", "peer.ack_request"
+        )
+        self._identity.advance(ack_seq)
+        return {"operation_id": row["operation_id"], "status": row["status"]}
+
+    @staticmethod
+    def _notification_source(event_data: Any) -> tuple[dict[str, Any], int] | None:
+        if not isinstance(event_data, dict):
+            return None
+        source = event_data.get("source")
+        remote_seq = event_data.get("remote_seq")
+        if isinstance(source, dict) and isinstance(remote_seq, int) and not isinstance(remote_seq, bool):
+            return source, remote_seq
+        return None
+
+    def _notify_parent(self, params: dict[str, Any]) -> NotifyParentResult:
+        store = self._require_store(self._store)
+        normalized = normalize_notify_parent_params(params)
+        operation = normalized["operation"]
+        identity = self._ready_identity()
+        self._check_operation_identity(operation, identity)
+        parent_ref = normalized["parent_ref"]
+        event = normalized["event"]
+        local_id = parent_ref["local_id"]
+        encoded_parent = encode(parent_ref)
+        source_ref = event["ref"]
+        fingerprint = hashlib.sha256(encode(event).encode("utf-8")).hexdigest()
+        with store.connection(write=True) as db:
+            parent = db.execute("SELECT * FROM parents WHERE id=?", (local_id,)).fetchone()
+            session = None
+            if parent is None:
+                session = db.execute("SELECT * FROM sessions WHERE id=?", (local_id,)).fetchone()
+            if parent is None and session is None:
+                raise peer_error(
+                    PeerErrorCode.OPERATION_NOT_FOUND,
+                    f"Parent {local_id!r} is not registered on this host",
+                )
+
+            query = (
+                "SELECT m.*, e.data AS event_data FROM mirrored_parent_notifications m "
+                "JOIN events e ON e.seq=m.local_seq "
+            )
+            existing = db.execute(query + "WHERE m.operation_id=?", (operation["operation_id"],)).fetchone()
+            if existing is not None:
+                source = self._notification_source(Store._decode_json(existing["event_data"]))
+                if existing["parent_ref"] != encoded_parent or source != (event["ref"], event["seq"]):
+                    raise peer_error(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "operation_id was already used for a different parent notification",
+                    )
+                return {"mirror_seq": existing["local_seq"], "duplicate": True}
+
+            for row in db.execute(query + "WHERE m.parent_ref=?", (encoded_parent,)).fetchall():
+                if self._notification_source(Store._decode_json(row["event_data"])) == (event["ref"], event["seq"]):
+                    return {"mirror_seq": row["local_seq"], "duplicate": True}
+
+            mirrored = db.execute(
+                "SELECT * FROM peer_event_mirrors WHERE host_id=? AND node_id=? AND state_generation=? "
+                "AND remote_seq=?",
+                (source_ref["host_id"], source_ref["node_id"], source_ref["state_generation"], event["seq"]),
+            ).fetchone()
+            if mirrored is not None:
+                if mirrored["fingerprint"] != fingerprint:
+                    raise peer_error(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "remote event was mirrored with different content",
+                    )
+                mirror_seq = mirrored["local_seq"]
+            else:
+                data: dict[str, Any] = {
+                    "source": source_ref,
+                    "remote_seq": event["seq"],
+                    "type": event["type"],
+                    "payload": event["payload"],
+                    "created": event["created"],
+                }
+                if "result" in normalized:
+                    data["result"] = normalized["result"]
+                mirror_seq = store.event(
+                    db,
+                    event["type"],
+                    data,
+                    session=None if parent is not None else local_id,
+                )
+                store.mirror_peer_event(
+                    source_ref["host_id"],
+                    source_ref["node_id"],
+                    source_ref["state_generation"],
+                    event["seq"],
+                    fingerprint,
+                    mirror_seq,
+                    db=db,
+                )
+            occupied = db.execute(
+                "SELECT parent_ref FROM mirrored_parent_notifications WHERE local_seq=?", (mirror_seq,)
+            ).fetchone()
+            if occupied is not None and occupied["parent_ref"] != encoded_parent:
+                raise peer_error(
+                    PeerErrorCode.PARENT_ROUTE_CONFLICT,
+                    "this event is already routed to a different parent",
+                )
+            receipt: dict[str, Any] = {
+                "event": {"ref": event["ref"], "seq": event["seq"], "type": event["type"]},
+                "status": "received",
+            }
+            if "result" in normalized:
+                receipt["result"] = normalized["result"]
+            db.execute(
+                "INSERT INTO mirrored_parent_notifications(local_seq,parent_ref,operation_id,status,receipt,updated) "
+                "VALUES(?,?,?,?,?,?)",
+                (mirror_seq, encoded_parent, operation["operation_id"], "received", encode(receipt), time.time()),
+            )
+            if parent is not None and parent["notify"]:
+                db.execute("INSERT INTO deliveries(event_seq,parent_id) VALUES(?,?)", (mirror_seq, local_id))
+            ack_seq = store.record_commit(
+                f"peer.notify_parent:{operation['operation_id']}", "peer.notify_parent", db=db
+            )
+        self._identity.advance(ack_seq)
+        return {"mirror_seq": mirror_seq, "duplicate": False}
+
     def _profile_from_open(self, spec: dict[str, Any]) -> Profile:
         raw = spec.get("profile")
         if isinstance(raw, dict):
@@ -433,6 +604,11 @@ class DirectPeerService:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "ordering_mode must be legacy, bootstrap or ordered")
         stream_id = params.get("stream_id")
         authority_ref = params.get("authority_ref")
+        parent_ref = params.get("parent_ref")
+        if parent_ref is not None:
+            # The execution node retains the coordinator-side parent reference for event attribution; it is
+            # never written to this node's sessions.parent.
+            validate_object_ref(parent_ref, "parent_ref")
         target_runtime = target.get("runtime", "")
         if kind == "bridge":
             if target_runtime not in ("", None):

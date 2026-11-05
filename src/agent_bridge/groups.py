@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .errors import BridgeError
@@ -343,14 +344,24 @@ def settle_broadcast(db, broadcast_id):
         )
 
 
+@contextmanager
+def _transaction(store, db):
+    """Use an existing write transaction when one is supplied, otherwise open one."""
+    if db is not None:
+        yield db
+        return
+    with store.connection(write=True) as connection:
+        yield connection
+
+
 def broadcast(store, group_id, message, revision, request_id, reservation=0, *, token_budget=None,
-              authority_ref=None, sender_ref=None):
+              authority_ref=None, sender_ref=None, db=None):
     validate_group_id(group_id)
     task_input(message, reservation)
     if type(revision) is not int or revision < 0:
         raise BridgeError("invalid_revision", "Provide the group's nonnegative expected_revision")
     payload = {"op": "broadcast", "group_id": group_id, "message": message, "revision": revision, "reservation": reservation}
-    with store.connection(write=True) as db:
+    with _transaction(store, db) as db:
         fingerprint, old = store.previous(db, request_id, payload)
         if old is not None:
             return old

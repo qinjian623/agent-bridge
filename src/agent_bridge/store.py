@@ -1588,6 +1588,8 @@ class Store:
         value = dict(row)
         value["payload"] = cls._decode_json(value.get("payload"))
         value["result"] = cls._decode_json(value.get("result"))
+        value["sender_ref"] = cls._decode_json(value.get("sender_ref"))
+        value["authority_ref"] = cls._decode_json(value.get("authority_ref"))
         return value
 
     # ---------------------------------------------------------------- multi-machine phase C streams and commit log
@@ -1625,27 +1627,33 @@ class Store:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "stream_id must be a non-empty string")
         return stream_id
 
-    def record_commit(self, mutation_key: str, method: str) -> int:
+    def record_commit(self, mutation_key: str, method: str, *, db=None) -> int:
         """Append one committed mutation and return its durable, monotonically increasing ack_seq.
 
         `mutation_key` is the natural key for the mutation, so replaying the same key returns the original
-        sequence instead of allocating a second one.
+        sequence instead of allocating a second one. Pass `db` to participate in an existing transaction.
         """
         if not isinstance(mutation_key, str) or not mutation_key:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "mutation_key must be a non-empty string")
         if not isinstance(method, str) or not method:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "method must be a non-empty string")
-        with self.connection(write=True) as db:
-            existing = db.execute(
-                "SELECT ack_seq FROM peer_commit_log WHERE mutation_key=?", (mutation_key,)
-            ).fetchone()
-            if existing is not None:
-                return existing["ack_seq"]
-            cursor = db.execute(
-                "INSERT INTO peer_commit_log(mutation_key,method,created) VALUES(?,?,?)",
-                (mutation_key, method, time.time()),
-            )
-            return cursor.lastrowid
+        if db is not None:
+            return self._record_commit(db, mutation_key, method)
+        with self.connection(write=True) as connection:
+            return self._record_commit(connection, mutation_key, method)
+
+    @staticmethod
+    def _record_commit(db, mutation_key: str, method: str) -> int:
+        existing = db.execute(
+            "SELECT ack_seq FROM peer_commit_log WHERE mutation_key=?", (mutation_key,)
+        ).fetchone()
+        if existing is not None:
+            return existing["ack_seq"]
+        cursor = db.execute(
+            "INSERT INTO peer_commit_log(mutation_key,method,created) VALUES(?,?,?)",
+            (mutation_key, method, time.time()),
+        )
+        return cursor.lastrowid
 
     def get_or_create_target_stream(self, authority_ref: dict | str, target_ref: dict | str) -> dict:
         """Return the coordination-side ordered stream for one authority/target pair."""
@@ -1887,15 +1895,45 @@ class Store:
             row = db.execute("SELECT * FROM peer_inbox WHERE delivery_id=?", (delivery_id,)).fetchone()
         return None if row is None else self._peer_inbox(row)
 
-    def add_outbox(self, operation_id, method, payload, group_id=None, native_id=None, status="pending"):
+    def add_outbox(
+        self,
+        operation_id,
+        method,
+        payload,
+        group_id=None,
+        native_id=None,
+        status="pending",
+        *,
+        binding_id=None,
+        request_id=None,
+        sender_ref=None,
+        authority_ref=None,
+        authorization_revision=None,
+        fingerprint=None,
+    ):
         """Enqueue one outbound request; duplicate operation_ids are idempotent (ADR-04)."""
         if not isinstance(operation_id, str) or not operation_id:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "operation_id must be a non-empty string")
         if not isinstance(method, str) or not method:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "method must be a non-empty string")
         encoded_payload = encode(payload)
+        encoded_sender = sender_ref if isinstance(sender_ref, str) else (
+            None if sender_ref is None else encode(sender_ref)
+        )
+        encoded_authority = authority_ref if isinstance(authority_ref, str) else (
+            None if authority_ref is None else encode(authority_ref)
+        )
         with self.connection(write=True) as db:
             existing = db.execute("SELECT * FROM node_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+            if existing is None and binding_id is not None and request_id is not None:
+                existing = db.execute(
+                    "SELECT * FROM node_outbox WHERE binding_id=? AND request_id=?", (binding_id, request_id)
+                ).fetchone()
+                if existing is not None and existing["operation_id"] != operation_id:
+                    raise BridgeError(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "request_id was already used by a different member operation",
+                    )
             if existing is not None:
                 if existing["payload"] != encoded_payload or existing["method"] != method:
                     raise BridgeError(
@@ -1904,10 +1942,23 @@ class Store:
                     )
                 return existing["seq"]
             cursor = db.execute(
-                "INSERT INTO node_outbox(operation_id,group_id,native_id,method,payload,status,created) VALUES(?,?,?,?,?,?,?)",
-                (operation_id, group_id, native_id, method, encoded_payload, status, time.time()),
+                "INSERT INTO node_outbox(operation_id,group_id,native_id,method,payload,status,created,"
+                "binding_id,request_id,sender_ref,authority_ref,authorization_revision,fingerprint) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    operation_id, group_id, native_id, method, encoded_payload, status, time.time(),
+                    binding_id, request_id, encoded_sender, encoded_authority, authorization_revision, fingerprint,
+                ),
             )
             return cursor.lastrowid
+
+    def get_node_outbox(self, operation_id):
+        """Return one locally persisted member outbox row, decoded, or None."""
+        if not isinstance(operation_id, str) or not operation_id:
+            return None
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM node_outbox WHERE operation_id=?", (operation_id,)).fetchone()
+        return None if row is None else self._node_outbox(row)
 
     def pull_outbox(self, after=0, limit=100):
         """Return pending/pulled outbox rows after `after`, marking them pulled for retry safety."""
@@ -2030,49 +2081,61 @@ class Store:
             ).fetchone()
         return 0 if row is None else row["after_seq"]
 
-    def advance_peer_event_cursor(self, host_id, node_id, state_generation, after_seq):
+    def advance_peer_event_cursor(self, host_id, node_id, state_generation, after_seq, *, db=None):
         """Move the durable cursor forward only; a lower value never rewinds it. Returns the stored cursor."""
         identity = self._peer_identity(host_id, node_id, state_generation)
         after_seq = self._seq_value(after_seq, "after_seq")
-        with self.connection(write=True) as db:
-            db.execute(
-                "INSERT INTO peer_event_cursors(host_id,node_id,state_generation,after_seq) VALUES(?,?,?,?) "
-                "ON CONFLICT(host_id,node_id,state_generation) DO UPDATE SET after_seq=MAX(after_seq,excluded.after_seq)",
-                (*identity, after_seq),
-            )
-            return db.execute(
-                "SELECT after_seq FROM peer_event_cursors WHERE host_id=? AND node_id=? AND state_generation=?",
-                identity,
-            ).fetchone()["after_seq"]
+        if db is not None:
+            return self._advance_peer_event_cursor(db, identity, after_seq)
+        with self.connection(write=True) as connection:
+            return self._advance_peer_event_cursor(connection, identity, after_seq)
 
-    def mirror_peer_event(self, host_id, node_id, state_generation, remote_seq, fingerprint, local_seq):
+    @staticmethod
+    def _advance_peer_event_cursor(db, identity, after_seq):
+        db.execute(
+            "INSERT INTO peer_event_cursors(host_id,node_id,state_generation,after_seq) VALUES(?,?,?,?) "
+            "ON CONFLICT(host_id,node_id,state_generation) DO UPDATE SET after_seq=MAX(after_seq,excluded.after_seq)",
+            (*identity, after_seq),
+        )
+        return db.execute(
+            "SELECT after_seq FROM peer_event_cursors WHERE host_id=? AND node_id=? AND state_generation=?",
+            identity,
+        ).fetchone()["after_seq"]
+
+    def mirror_peer_event(self, host_id, node_id, state_generation, remote_seq, fingerprint, local_seq, *, db=None):
         """Map a remote event seq to a local events.seq. Same fingerprint is a duplicate; different is a conflict."""
         identity = self._peer_identity(host_id, node_id, state_generation)
         remote_seq = self._seq_value(remote_seq, "remote_seq")
         local_seq = self._seq_value(local_seq, "local_seq", 1)
         if not isinstance(fingerprint, str) or not fingerprint:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "fingerprint must be a non-empty string")
-        with self.connection(write=True) as db:
-            row = db.execute(
-                "SELECT * FROM peer_event_mirrors WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
+        if db is not None:
+            return self._mirror_peer_event(db, identity, remote_seq, fingerprint, local_seq)
+        with self.connection(write=True) as connection:
+            return self._mirror_peer_event(connection, identity, remote_seq, fingerprint, local_seq)
+
+    @staticmethod
+    def _mirror_peer_event(db, identity, remote_seq, fingerprint, local_seq):
+        row = db.execute(
+            "SELECT * FROM peer_event_mirrors WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
+            (*identity, remote_seq),
+        ).fetchone()
+        if row is not None:
+            if row["fingerprint"] != fingerprint:
+                raise BridgeError(PeerErrorCode.OPERATION_CONFLICT, "remote event seq was mirrored with different content")
+            return dict(row)
+        db.execute(
+            "INSERT INTO peer_event_mirrors(host_id,node_id,state_generation,remote_seq,local_seq,fingerprint,created) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (*identity, remote_seq, local_seq, fingerprint, time.time()),
+        )
+        return dict(
+            db.execute(
+                "SELECT * FROM peer_event_mirrors WHERE host_id=? AND node_id=? AND state_generation=? "
+                "AND remote_seq=?",
                 (*identity, remote_seq),
             ).fetchone()
-            if row is not None:
-                if row["fingerprint"] != fingerprint:
-                    raise BridgeError(PeerErrorCode.OPERATION_CONFLICT, "remote event seq was mirrored with different content")
-                return dict(row)
-            db.execute(
-                "INSERT INTO peer_event_mirrors(host_id,node_id,state_generation,remote_seq,local_seq,fingerprint,created) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (*identity, remote_seq, local_seq, fingerprint, time.time()),
-            )
-            return dict(
-                db.execute(
-                    "SELECT * FROM peer_event_mirrors WHERE host_id=? AND node_id=? AND state_generation=? "
-                    "AND remote_seq=?",
-                    (*identity, remote_seq),
-                ).fetchone()
-            )
+        )
 
     def get_mirrored_event(self, host_id, node_id, state_generation, remote_seq):
         identity = self._peer_identity(host_id, node_id, state_generation)
@@ -2091,7 +2154,7 @@ class Store:
         return value
 
     def record_pulled_request_receipt(
-        self, host_id, node_id, state_generation, operation_id, source_seq, fingerprint, outcome, result
+        self, host_id, node_id, state_generation, operation_id, source_seq, fingerprint, outcome, result, *, db=None
     ):
         """Save the coordinator-side receipt; same fingerprint reuses the stored outcome/result."""
         identity = self._peer_identity(host_id, node_id, state_generation)
@@ -2099,26 +2162,35 @@ class Store:
         for name, value in (("operation_id", operation_id), ("fingerprint", fingerprint), ("outcome", outcome)):
             if not isinstance(value, str) or not value:
                 raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{name} must be a non-empty string")
-        with self.connection(write=True) as db:
+        if db is not None:
+            return self._record_pulled_request_receipt(
+                db, identity, operation_id, source_seq, fingerprint, outcome, result
+            )
+        with self.connection(write=True) as connection:
+            return self._record_pulled_request_receipt(
+                connection, identity, operation_id, source_seq, fingerprint, outcome, result
+            )
+
+    def _record_pulled_request_receipt(self, db, identity, operation_id, source_seq, fingerprint, outcome, result):
+        row = db.execute(
+            "SELECT * FROM pulled_request_receipts WHERE host_id=? AND node_id=? AND state_generation=? "
+            "AND operation_id=?",
+            (*identity, operation_id),
+        ).fetchone()
+        if row is None:
+            db.execute(
+                "INSERT INTO pulled_request_receipts(host_id,node_id,state_generation,operation_id,source_seq,"
+                "fingerprint,outcome,result,created) VALUES(?,?,?,?,?,?,?,?,?)",
+                (*identity, operation_id, source_seq, fingerprint, outcome, encode(result), time.time()),
+            )
             row = db.execute(
                 "SELECT * FROM pulled_request_receipts WHERE host_id=? AND node_id=? AND state_generation=? "
                 "AND operation_id=?",
                 (*identity, operation_id),
             ).fetchone()
-            if row is None:
-                db.execute(
-                    "INSERT INTO pulled_request_receipts(host_id,node_id,state_generation,operation_id,source_seq,"
-                    "fingerprint,outcome,result,created) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (*identity, operation_id, source_seq, fingerprint, outcome, encode(result), time.time()),
-                )
-                row = db.execute(
-                    "SELECT * FROM pulled_request_receipts WHERE host_id=? AND node_id=? AND state_generation=? "
-                    "AND operation_id=?",
-                    (*identity, operation_id),
-                ).fetchone()
-            elif row["fingerprint"] != fingerprint:
-                raise BridgeError(PeerErrorCode.OPERATION_CONFLICT, "pulled request was already recorded differently")
-            return self._pulled_receipt(row)
+        elif row["fingerprint"] != fingerprint:
+            raise BridgeError(PeerErrorCode.OPERATION_CONFLICT, "pulled request was already recorded differently")
+        return self._pulled_receipt(row)
 
     def get_pulled_request_receipt(self, host_id, node_id, state_generation, operation_id):
         identity = self._peer_identity(host_id, node_id, state_generation)

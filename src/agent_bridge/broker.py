@@ -136,6 +136,8 @@ class DeliveryScheduler:
             "stream_id": outbox["stream_id"],
             "authority_ref": self._authority(payload),
         }
+        if isinstance(payload.get("parent_ref"), dict):
+            params["parent_ref"] = payload["parent_ref"]
         if outbox["seq_kind"] == "message":
             params["message"] = payload.get("message", "")
             params["reservation"] = int(payload.get("reservation") or 0)
@@ -298,6 +300,551 @@ class DeliveryScheduler:
                 pass
 
 
+class OutboxPuller:
+    """Coordinator-side puller for one execution node's `node_outbox` (design 3.7).
+
+    Authorisation happens here, on the coordinator: the execution node only stores what a local member asked
+    for. Every full scan starts at `after=0`; an in-memory cursor advances through the page range and returns
+    to zero once the scan's fixed `scan_upper_seq` has been consumed. A permanent rejection is persisted in
+    `pulled_request_receipts` and acknowledged so it never blocks later requests.
+    """
+
+    def __init__(self, store, peer_factory, host_registry=None, config=None):
+        self.store = store
+        self.peer_factory = peer_factory
+        self.host_registry = host_registry
+        self.config = config
+        self._temp_after: dict[str, int] = {}
+        self._scan_upper: dict[str, int] = {}
+        self._nodes: dict[str, NodeRef] = {}
+        self._stopping = asyncio.Event()
+
+    def _client(self, host_id):
+        if hasattr(self.peer_factory, "client"):
+            return self.peer_factory.client(host_id)
+        if callable(self.peer_factory):
+            return self.peer_factory(host_id)
+        return self.peer_factory
+
+    def _host_config(self, host_id):
+        getter = getattr(self.host_registry, "get", None)
+        if getter is None:
+            return None
+        try:
+            return getter(host_id)
+        except BridgeError:
+            return None
+
+    def _hosts(self):
+        lister = getattr(self.host_registry, "list", None)
+        return list(lister()) if lister is not None else []
+
+    async def _node(self, host_id, client, items=()):
+        cached = self._nodes.get(host_id)
+        if cached is not None:
+            return cached
+        config = self._host_config(host_id)
+        if config is not None and config.pinned is not None:
+            self._nodes[host_id] = config.pinned
+            return config.pinned
+        hello = getattr(client, "hello", None)
+        if hello is not None:
+            reply = await hello(
+                {
+                    "protocol_versions": [PROTOCOL_VERSION],
+                    "coordinator_id": socket.gethostname(),
+                    "coordinator_generation": "local",
+                }
+            )
+            node = reply.get("node") if isinstance(reply, dict) else None
+            if isinstance(node, dict):
+                node_id = node.get("node_id")
+                generation = node.get("state_generation")
+                if isinstance(node_id, str) and node_id and isinstance(generation, str) and generation:
+                    resolved = NodeRef(host_id, node_id, generation)
+                    self._nodes[host_id] = resolved
+                    return resolved
+        # A minimal transport can omit hello when the first outbox item carries the authenticated sender.
+        for item in items:
+            sender = self._json_object(item.get("sender_ref")) if isinstance(item, dict) else None
+            if sender is None:
+                continue
+            node_id = sender.get("node_id")
+            generation = sender.get("state_generation")
+            if isinstance(node_id, str) and node_id and isinstance(generation, str) and generation:
+                resolved = NodeRef(host_id, node_id, generation)
+                self._nodes[host_id] = resolved
+                return resolved
+        raise BridgeError("invalid_request", f"Could not resolve the node identity of host {host_id!r}")
+
+    @staticmethod
+    def _json_object(value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return None
+        return value if isinstance(value, dict) else None
+
+    @classmethod
+    def _payload(cls, item):
+        return cls._json_object(item.get("payload"))
+
+    @staticmethod
+    def _fingerprint(item, payload):
+        fingerprint = item.get("fingerprint")
+        if isinstance(fingerprint, str) and fingerprint:
+            return fingerprint
+        return hashlib.sha256(encode(payload).encode("utf-8")).hexdigest()
+
+    def _verify(self, host_id, node, item, payload):
+        if item.get("method") != "agent_broadcast":
+            return {"code": "unsupported_method", "message": "Only agent_broadcast may use the member outbox"}
+        group_id = item.get("group_id") or payload.get("group_id")
+        if not isinstance(group_id, str) or not group_id:
+            return {"code": "invalid_group", "message": "group_id is required"}
+        revision = payload.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            return {"code": "invalid_revision", "message": "payload.revision must be a non-negative integer"}
+        sender = self._json_object(item.get("sender_ref"))
+        if sender is None:
+            return {"code": "unverified_sender", "message": "The request has no verified sender reference"}
+        if (
+            sender.get("host_id") != host_id
+            or sender.get("node_id") != node.node_id
+            or sender.get("state_generation") != node.state_generation
+        ):
+            return {"code": "identity_mismatch", "message": "The sender does not belong to this execution node"}
+        sender_id = sender.get("local_id")
+        if not isinstance(sender_id, str) or not sender_id:
+            return {"code": "unverified_sender", "message": "The sender reference has no local_id"}
+        with self.store.connection() as db:
+            group = db.execute("SELECT deleted,revision FROM session_groups WHERE id=?", (group_id,)).fetchone()
+            if group is None:
+                return {"code": "group_not_found", "message": f"Unknown group: {group_id}"}
+            if group["deleted"]:
+                return {"code": "group_deleted", "message": "The group was deleted"}
+            if group["revision"] != revision:
+                return {
+                    "code": "stale_revision",
+                    "message": f"Group revision is {group['revision']}, request expected {revision}",
+                }
+            member = db.execute(
+                "SELECT target_id FROM remote_group_members WHERE group_id=? AND host_id=? AND node_id=? "
+                "AND state_generation=? AND target_id=?",
+                (group_id, host_id, node.node_id, node.state_generation, sender_id),
+            ).fetchone()
+            if member is None:
+                return {"code": "not_a_member", "message": "The sender is not a remote member of this group"}
+        return None
+
+    async def _ack(self, client, node, operation_id, outcome, result):
+        await client.ack_request(
+            {
+                "operation": {
+                    "node_id": node.node_id,
+                    "state_generation": node.state_generation,
+                    "operation_id": operation_id,
+                },
+                "operation_id": operation_id,
+                "outcome": outcome,
+                "result": result,
+            }
+        )
+
+    async def _process(self, host_id, node, item, client):
+        operation_id = item.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            return
+        receipt = self.store.get_pulled_request_receipt(host_id, node.node_id, node.state_generation, operation_id)
+        if receipt is not None:
+            # A previous attempt persisted the receipt but did not receive a durable ACK: never execute twice.
+            await self._ack(client, node, operation_id, receipt["outcome"], receipt["result"] or {})
+            self.store.update_pulled_request_receipt_acked(host_id, node.node_id, node.state_generation, operation_id)
+            return
+
+        payload = self._payload(item)
+        fingerprint = self._fingerprint(item, payload) if payload is not None else operation_id
+        if payload is None:
+            error = {"code": "invalid_payload", "message": "The outbox payload must be an object"}
+        else:
+            error = self._verify(host_id, node, item, payload)
+
+        if error is not None:
+            self.store.record_pulled_request_receipt(
+                host_id, node.node_id, node.state_generation, operation_id,
+                int(item.get("seq") or 0), fingerprint, "rejected", {"error": error},
+            )
+            await self._ack(client, node, operation_id, "rejected", {"error": error})
+            self.store.update_pulled_request_receipt_acked(host_id, node.node_id, node.state_generation, operation_id)
+            return
+
+        group_id = str(item.get("group_id") or payload.get("group_id"))
+        request_id = item.get("request_id") if isinstance(item.get("request_id"), str) else None
+        request_id = request_id or operation_id
+        authority_ref = item.get("authority_ref")
+        sender_ref = self._json_object(item.get("sender_ref"))
+        with self.store.connection(write=True) as db:
+            result = groups.broadcast(
+                self.store,
+                group_id,
+                str(payload.get("message", "")),
+                int(payload["revision"]),
+                request_id,
+                int(payload.get("reservation") or 0),
+                token_budget=getattr(self.config, "token_budget", None),
+                authority_ref=authority_ref,
+                sender_ref=sender_ref,
+                db=db,
+            )
+            self.store.record_pulled_request_receipt(
+                host_id, node.node_id, node.state_generation, operation_id,
+                int(item.get("seq") or 0), fingerprint, "accepted", result, db=db,
+            )
+        await self._ack(client, node, operation_id, "accepted", result)
+        self.store.update_pulled_request_receipt_acked(host_id, node.node_id, node.state_generation, operation_id)
+
+    async def run_once(self, host_id: str) -> int:
+        client = self._client(host_id)
+        after = self._temp_after.get(host_id, 0)
+        response = await client.pull_requests({"after": after, "limit": 100})
+        items = response.get("items") if isinstance(response, dict) else None
+        if not isinstance(items, list):
+            items = []
+        node = await self._node(host_id, client, items)
+        processed = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                await self._process(host_id, node, item, client)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A transient failure leaves the row unacknowledged; the next full scan retries it.
+                pass
+            processed += 1
+
+        seqs = [
+            item["seq"] for item in items
+            if isinstance(item, dict) and isinstance(item.get("seq"), int) and not isinstance(item.get("seq"), bool)
+        ]
+        upper = response.get("scan_upper_seq") if isinstance(response, dict) else None
+        if isinstance(upper, int) and not isinstance(upper, bool):
+            scan_upper = self._scan_upper.setdefault(host_id, upper)
+            if seqs:
+                self._temp_after[host_id] = max(seqs)
+            if not seqs or self._temp_after.get(host_id, 0) >= scan_upper:
+                self._temp_after[host_id] = 0
+                self._scan_upper.pop(host_id, None)
+        elif seqs:
+            self._temp_after[host_id] = max(seqs)
+        else:
+            self._temp_after[host_id] = 0
+        return processed
+
+    async def _host_loop(self, config):
+        while not self._stopping.is_set():
+            try:
+                await self.run_once(config.host_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self._stopping.wait(), config.pull_interval)
+            except TimeoutError:
+                pass
+
+    async def run(self):
+        tasks = {}
+        try:
+            while not self._stopping.is_set():
+                for config in self._hosts():
+                    task = tasks.get(config.host_id)
+                    if task is None or task.done():
+                        tasks[config.host_id] = asyncio.create_task(self._host_loop(config))
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), 0.5)
+                except TimeoutError:
+                    pass
+        finally:
+            for task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    def stop(self):
+        self._stopping.set()
+
+
+class EventMirror:
+    """Mirrors remote events into local `events.seq` and wakes authorised parent routes (design 3.9).
+
+    Dedupe is `(source node, remote seq)`. A different fingerprint for an already mirrored sequence pauses the
+    source instead of overwriting data. The durable cursor advances only after every event on the page has been
+    mapped and its parent notification attempted; a transient notification failure is retried on the next poll.
+    """
+
+    def __init__(self, store, peer_factory, host_registry=None, config=None, *, host_id="local", interval=2.0):
+        self.store = store
+        self.peer_factory = peer_factory
+        self.host_registry = host_registry
+        self.config = config
+        self.host_id = host_id
+        self.interval = interval
+        self._nodes: dict[str, NodeRef] = {}
+        self._paused: set[str] = set()
+        self._stopping = asyncio.Event()
+
+    def _client(self, host_id):
+        if hasattr(self.peer_factory, "client"):
+            return self.peer_factory.client(host_id)
+        if callable(self.peer_factory):
+            return self.peer_factory(host_id)
+        return self.peer_factory
+
+    def _host_config(self, host_id):
+        getter = getattr(self.host_registry, "get", None)
+        if getter is None:
+            return None
+        try:
+            return getter(host_id)
+        except BridgeError:
+            return None
+
+    def _hosts(self):
+        lister = getattr(self.host_registry, "list", None)
+        return list(lister()) if lister is not None else []
+
+    async def _node(self, host_id, client):
+        cached = self._nodes.get(host_id)
+        if cached is not None:
+            return cached
+        config = self._host_config(host_id)
+        if config is not None and config.pinned is not None:
+            self._nodes[host_id] = config.pinned
+            return config.pinned
+        hello = getattr(client, "hello", None)
+        if hello is None:
+            raise BridgeError("invalid_request", f"Could not resolve the node identity of host {host_id!r}")
+        reply = await hello(
+            {
+                "protocol_versions": [PROTOCOL_VERSION],
+                "coordinator_id": socket.gethostname(),
+                "coordinator_generation": "local",
+            }
+        )
+        node = reply.get("node") if isinstance(reply, dict) else None
+        if not isinstance(node, dict) or not isinstance(node.get("node_id"), str) or not isinstance(
+            node.get("state_generation"), str
+        ):
+            raise BridgeError("invalid_request", f"peer.hello returned no identity for host {host_id!r}")
+        resolved = NodeRef(host_id, node["node_id"], node["state_generation"])
+        self._nodes[host_id] = resolved
+        return resolved
+
+    def _parent_is_local(self, parent_ref):
+        local_id = parent_ref.get("local_id")
+        if not isinstance(local_id, str) or not local_id:
+            return False
+        with self.store.connection() as db:
+            return bool(
+                db.execute("SELECT 1 FROM parents WHERE id=?", (local_id,)).fetchone()
+                or db.execute("SELECT 1 FROM sessions WHERE id=?", (local_id,)).fetchone()
+            )
+
+    def _notify_local(self, parent_ref, event):
+        from .node_identity import FileNodeIdentityStore
+
+        identity = FileNodeIdentityStore(self.store.state)
+        operation_id = hashlib.sha256(
+            encode({"method": "peer.notify_parent", "parent_ref": parent_ref, "event": event}).encode("utf-8")
+        ).hexdigest()
+        service = peer_api.DirectPeerService(
+            identity, host_id=self.host_id, store=self.store, config=self.config,
+        )
+        return service._notify_parent(
+            {
+                "operation": {
+                    "node_id": identity.load_or_create().node_id,
+                    "state_generation": identity.load_or_create().state_generation,
+                    "operation_id": operation_id,
+                },
+                "parent_ref": parent_ref,
+                "event": event,
+            }
+        )
+
+    async def _notify_remote(self, event, parent_ref, local_seq, fingerprint):
+        parent_host = parent_ref.get("host_id")
+        if not isinstance(parent_host, str) or not parent_host:
+            raise BridgeError("invalid_request", "parent_ref.host_id is required")
+        client = self._client(parent_host)
+        node = await self._node(parent_host, client)
+        operation_id = hashlib.sha256(
+            encode({"method": "peer.notify_parent", "parent_ref": parent_ref, "event": event}).encode("utf-8")
+        ).hexdigest()
+        with self.store.connection() as db:
+            existing = db.execute(
+                "SELECT 1 FROM mirrored_parent_notifications WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+        if existing is None:
+            result = await client.notify_parent(
+                {
+                    "operation": {
+                        "node_id": node.node_id,
+                        "state_generation": node.state_generation,
+                        "operation_id": operation_id,
+                    },
+                    "parent_ref": parent_ref,
+                    "event": event,
+                }
+            )
+            with self.store.connection(write=True) as db:
+                db.execute(
+                    "INSERT OR IGNORE INTO mirrored_parent_notifications"
+                    "(local_seq,parent_ref,operation_id,status,receipt,updated) VALUES(?,?,?,?,?,?)",
+                    (local_seq, encode(parent_ref), operation_id, "sent", encode(result), time.time()),
+                )
+        return None
+
+    @staticmethod
+    def _canonical_event(value):
+        """Return the exact PeerEvent shape used by peer_protocol's normalizer, or None."""
+        if not isinstance(value, dict):
+            return None
+        ref = value.get("ref")
+        payload = value.get("payload")
+        event_type = value.get("type")
+        created = value.get("created")
+        seq = value.get("seq")
+        if (
+            isinstance(seq, bool) or not isinstance(seq, int) or seq < 0
+            or not isinstance(event_type, str) or not event_type
+            or not isinstance(ref, dict)
+            or not isinstance(payload, dict)
+            or isinstance(created, bool) or not isinstance(created, (int, float))
+        ):
+            return None
+        clean = {
+            "seq": seq,
+            "type": event_type,
+            "ref": {
+                key: ref.get(key) for key in ("host_id", "node_id", "state_generation", "local_id")
+            },
+            "payload": payload,
+            "created": float(created),
+        }
+        if not all(isinstance(clean["ref"][key], str) and clean["ref"][key] for key in clean["ref"]):
+            return None
+        return clean
+
+    def _record_conflict(self, event, existing, fingerprint):
+        with self.store.connection(write=True) as db:
+            self.store.event(
+                db,
+                "peer_event_conflict",
+                {
+                    "source": event.get("ref"),
+                    "remote_seq": event.get("seq"),
+                    "stored_fingerprint": existing.get("fingerprint"),
+                    "received_fingerprint": fingerprint,
+                },
+            )
+
+    async def run_once(self, host_id: str) -> int:
+        if host_id in self._paused:
+            return 0
+        client = self._client(host_id)
+        node = await self._node(host_id, client)
+        cursor = self.store.get_peer_event_cursor(host_id, node.node_id, node.state_generation)
+        response = await client.events({"after": cursor, "limit": 100})
+        items = response.get("items") if isinstance(response, dict) else None
+        if not isinstance(items, list):
+            items = []
+        processed = 0
+        last_seq = None
+        for raw_event in items:
+            event = self._canonical_event(raw_event)
+            if event is None:
+                break
+            source = event["ref"]
+            remote_seq = event["seq"]
+            fingerprint = hashlib.sha256(encode(event).encode("utf-8")).hexdigest()
+            existing = self.store.get_mirrored_event(host_id, node.node_id, node.state_generation, remote_seq)
+            if existing is not None and existing["fingerprint"] != fingerprint:
+                self._record_conflict(event, existing, fingerprint)
+                self._paused.add(host_id)
+                break
+            if existing is not None:
+                local_seq = existing["local_seq"]
+            else:
+                data = {
+                    "source": source,
+                    "remote_seq": remote_seq,
+                    "type": event.get("type"),
+                    "payload": event.get("payload"),
+                    "created": event.get("created"),
+                }
+                with self.store.connection(write=True) as db:
+                    local_seq = self.store.event(db, str(event.get("type", "")), data)
+                    self.store.mirror_peer_event(
+                        host_id, node.node_id, node.state_generation, remote_seq, fingerprint, local_seq, db=db,
+                    )
+            route = self.store.lookup_parent_route(
+                host_id, node.node_id, node.state_generation, source["local_id"],
+            )
+            if route is not None:
+                parent_ref = route["parent_ref"]
+                try:
+                    if self._parent_is_local(parent_ref):
+                        self._notify_local(parent_ref, event)
+                    else:
+                        await self._notify_remote(event, parent_ref, local_seq, fingerprint)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    break
+            last_seq = remote_seq
+            processed += 1
+        if last_seq is not None:
+            self.store.advance_peer_event_cursor(host_id, node.node_id, node.state_generation, last_seq)
+        return processed
+
+    async def _host_loop(self, config):
+        while not self._stopping.is_set():
+            try:
+                await self.run_once(config.host_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self._stopping.wait(), config.pull_interval or self.interval)
+            except TimeoutError:
+                pass
+
+    async def run(self):
+        tasks = {}
+        try:
+            while not self._stopping.is_set():
+                for config in self._hosts():
+                    task = tasks.get(config.host_id)
+                    if task is None or task.done():
+                        tasks[config.host_id] = asyncio.create_task(self._host_loop(config))
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), 0.5)
+                except TimeoutError:
+                    pass
+        finally:
+            for task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    def stop(self):
+        self._stopping.set()
+
+
 class Broker:
     def __init__(self, state: Path, peer_factory=None):
         self.state = state
@@ -318,6 +865,8 @@ class Broker:
         self.stopping = asyncio.Event()
         self.request_locks = {}
         self.delivery_scheduler = DeliveryScheduler(self.store, self.peer_factory, config=self.config)
+        self.outbox_puller = OutboxPuller(self.store, self.peer_factory, self.host_registry, self.config)
+        self.event_mirror = EventMirror(self.store, self.peer_factory, self.host_registry, self.config)
         with self.store.connection(write=True) as db:
             db.execute(
                 "UPDATE deliveries SET status='uncertain',error='Broker restarted before queue acknowledgement' WHERE status='sending'"
@@ -534,6 +1083,114 @@ class Broker:
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _member_binding_args(args):
+        """Return (binding_id, binding_token) from the member-facing broadcast arguments, if present."""
+        binding_id = args.get("binding_id")
+        binding_token = args.get("binding_token")
+        binding = args.get("binding")
+        if isinstance(binding, dict):
+            binding_id = binding_id or binding.get("id") or binding.get("binding_id")
+            binding_token = binding_token or binding.get("token")
+        elif isinstance(binding, str):
+            binding_token = binding_token or binding
+        member = args.get("member")
+        if isinstance(member, dict):
+            binding_id = binding_id or member.get("binding_id")
+            binding_token = binding_token or member.get("binding_token") or member.get("binding")
+        if not isinstance(binding_id, str) or not binding_id:
+            binding_id = None
+        if not isinstance(binding_token, str) or not binding_token:
+            binding_token = None
+        return binding_id, binding_token
+
+    def _member_broadcast(self, args, binding_id, binding_token):
+        """Persist a member's broadcast request in this node's `node_outbox` (design 3.7)."""
+        request_id = args.get("request_id")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 200:
+            raise BridgeError("invalid_request_id", "A nonempty request_id of at most 200 characters is required")
+        group_id = args.get("group_id")
+        if not isinstance(group_id, str) or not group_id:
+            raise BridgeError("invalid_request", "group_id must be a non-empty string")
+        message = args.get("message")
+        if not isinstance(message, str):
+            raise BridgeError("invalid_request", "message must be a string")
+        revision = args.get("expected_revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise BridgeError("invalid_revision", "Provide the group's nonnegative expected_revision")
+        reservation = args.get("reservation", 0)
+        if isinstance(reservation, bool) or not isinstance(reservation, int) or reservation < 0:
+            raise BridgeError("invalid_request", "reservation must be a non-negative integer")
+        payload = {
+            "op": "broadcast",
+            "group_id": group_id,
+            "message": message,
+            "revision": revision,
+            "reservation": reservation,
+        }
+        binding = None
+        if binding_id is not None or binding_token is not None:
+            with self.store.connection() as db:
+                if binding_id is not None:
+                    binding = db.execute("SELECT * FROM member_bindings WHERE id=?", (binding_id,)).fetchone()
+                if binding is None and binding_token is not None:
+                    digest = hashlib.sha256(binding_token.encode("utf-8")).hexdigest()
+                    binding = db.execute(
+                        "SELECT * FROM member_bindings WHERE token_digest=?", (digest,)
+                    ).fetchone()
+                if binding is None and binding_token is not None:
+                    binding = db.execute(
+                        "SELECT * FROM member_bindings WHERE id=?", (binding_token,)
+                    ).fetchone()
+        if binding is not None:
+            allowed = binding["allowed_methods"]
+            try:
+                allowed = json.loads(allowed) if isinstance(allowed, str) else allowed
+            except ValueError:
+                allowed = []
+            if (
+                binding["revoked_at"] is not None
+                or binding["expires_at"] <= time.time()
+                or binding["group_id"] != group_id
+                or "agent_broadcast" not in allowed
+            ):
+                raise BridgeError("forbidden", "The member binding does not authorise this broadcast")
+            binding_id = binding["id"]
+            sender_ref = json.loads(binding["sender_ref"])
+            authority_ref = json.loads(binding["authority_ref"])
+            authorization_revision = binding["authorization_revision"]
+        else:
+            sender_ref = args.get("sender_ref")
+            authority_ref = args.get("authority_ref")
+            authorization_revision = args.get("authorization_revision")
+            if not isinstance(sender_ref, dict) or not isinstance(authority_ref, dict):
+                raise BridgeError("forbidden", "A valid member binding or verified sender reference is required")
+        operation_id = hashlib.sha256(
+            encode(
+                {
+                    "binding_id": binding_id,
+                    "request_id": request_id,
+                    "group_id": group_id,
+                    "payload": payload,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        fingerprint = hashlib.sha256(encode(payload).encode("utf-8")).hexdigest()
+        self.store.add_outbox(
+            operation_id,
+            "agent_broadcast",
+            payload,
+            group_id,
+            args.get("native_id"),
+            binding_id=binding_id,
+            request_id=request_id,
+            sender_ref=sender_ref,
+            authority_ref=authority_ref,
+            authorization_revision=authorization_revision,
+            fingerprint=fingerprint,
+        )
+        return {"operation_id": operation_id, "status": "pending"}
+
+    @staticmethod
     def _remote_open_spec(args):
         spec = {}
         for key in ("profile", "cwd", "access", "project_id", "model", "workspace_mode", "base", "snapshot_files", "name"):
@@ -573,6 +1230,19 @@ class Broker:
         )
         target_seq = self._target_seq(operation_id)
         target_id = args.get("session_id") or ""
+        parent_ref = args.get("parent_ref")
+        if parent_ref is None and args.get("parent"):
+            parent_id = args.get("parent")
+            if not isinstance(parent_id, str) or not parent_id:
+                raise BridgeError("invalid_request", "parent must be a non-empty string")
+            if self.store.get_parent(parent_id) is None:
+                raise BridgeError("not_found", f"parents: {parent_id}")
+            from .node_identity import FileNodeIdentityStore
+
+            local = FileNodeIdentityStore(self.state).node_ref("local").as_dict()
+            parent_ref = {**local, "local_id": parent_id}
+        if parent_ref is not None and not isinstance(parent_ref, dict):
+            raise BridgeError("invalid_request", "parent_ref must be an object")
         parameters = {
             "operation": {
                 "node_id": node.node_id,
@@ -589,6 +1259,8 @@ class Broker:
             "reservation": int(args.get("reservation") or 0),
             "host_id": host_id,
         }
+        if parent_ref is not None:
+            parameters["parent_ref"] = parent_ref
         if open_only or not target_id:
             parameters["open"] = self._remote_open_spec(args)
         if not open_only:
@@ -601,6 +1273,21 @@ class Broker:
                     PeerErrorCode.OPERATION_CONFLICT,
                     "operation_id was already used with different remote parameters",
                 )
+            stored_params = existing.get("params") if isinstance(existing.get("params"), dict) else {}
+            stored_parent = stored_params.get("parent_ref")
+            if isinstance(stored_parent, dict):
+                if target_id:
+                    self.store.register_parent_route(
+                        host_id, node.node_id, node.state_generation, target_id, stored_parent,
+                    )
+                stored_result = existing.get("result")
+                if isinstance(stored_result, dict):
+                    for field in ("session_id", "task_id"):
+                        child_id = stored_result.get(field)
+                        if isinstance(child_id, str) and child_id:
+                            self.store.register_parent_route(
+                                host_id, node.node_id, node.state_generation, child_id, stored_parent,
+                            )
             return self._operation_response(existing)
         self.store.record_operation(
             operation_id,
@@ -611,12 +1298,21 @@ class Broker:
             parameters,
             status="pending",
         )
+        if parent_ref is not None and target_id:
+            self.store.register_parent_route(host_id, node.node_id, node.state_generation, target_id, parent_ref)
         try:
             result = await client.deliver(parameters)  # type: ignore[arg-type]
         except BridgeError as error:
             self.store.update_operation(operation_id, status="uncertain", error=error.as_dict())
             raise
         self.store.update_operation(operation_id, status="completed", result=result)
+        if parent_ref is not None:
+            for field in ("session_id", "task_id"):
+                child_id = result.get(field) if isinstance(result, dict) else None
+                if isinstance(child_id, str) and child_id:
+                    self.store.register_parent_route(
+                        host_id, node.node_id, node.state_generation, child_id, parent_ref,
+                    )
         return {"operation_id": operation_id, "host_id": host_id, **result}
 
     async def _remote_open(self, host_id, args):
@@ -799,6 +1495,29 @@ class Broker:
         while True:
             operation = self.store.get_operation(operation_id)
             if operation is None:
+                outbox = self.store.get_node_outbox(operation_id)
+                if outbox is not None:
+                    view = {
+                        "operation_id": operation_id,
+                        "host_id": "local",
+                        "status": outbox["status"],
+                        "outbox": {
+                            "group_id": outbox.get("group_id"),
+                            "native_id": outbox.get("native_id"),
+                            "method": outbox.get("method"),
+                            "created": outbox.get("created"),
+                            "pulled_at": outbox.get("pulled_at"),
+                            "acked_at": outbox.get("acked_at"),
+                        },
+                    }
+                    if outbox.get("outcome") is not None:
+                        view["outcome"] = outbox["outcome"]
+                    if outbox.get("result") is not None:
+                        view["result"] = outbox["result"]
+                    if outbox["status"] in {"pending", "pulled"} and asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(0.15)
+                        continue
+                    return view
                 raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown operation: {operation_id}")
             params = operation.get("params") if isinstance(operation.get("params"), dict) else {}
             host_id = params.get("host_id")
@@ -848,6 +1567,13 @@ class Broker:
                 args["request_id"], args.get("session_ids"), args.get("native_members"), remote_members,
             )
         if method == "agent_broadcast":
+            binding_id, binding_token = self._member_binding_args(args)
+            if (
+                binding_id is not None
+                or binding_token is not None
+                or isinstance(args.get("sender_ref"), dict)
+            ):
+                return self._member_broadcast(args, binding_id, binding_token)
             return groups.broadcast(
                 self.store, args["group_id"], args["message"], args["expected_revision"],
                 args["request_id"], args.get("reservation", 0), token_budget=self.config.token_budget,
@@ -1242,6 +1968,8 @@ class Broker:
         notifications = asyncio.create_task(self.notifications())
         native_notifications = asyncio.create_task(self.native_notifications())
         delivery_scheduler = asyncio.create_task(self.delivery_scheduler.run())
+        outbox_puller = asyncio.create_task(self.outbox_puller.run())
+        event_mirror = asyncio.create_task(self.event_mirror.run())
         try:
             async with server:
                 await self.stopping.wait()
@@ -1249,8 +1977,9 @@ class Broker:
             await scheduler
             await notifications
             await native_notifications
-            delivery_scheduler.cancel()
-            await asyncio.gather(delivery_scheduler, return_exceptions=True)
+            for task in (delivery_scheduler, outbox_puller, event_mirror):
+                task.cancel()
+            await asyncio.gather(delivery_scheduler, outbox_puller, event_mirror, return_exceptions=True)
             path.unlink(missing_ok=True)
             lock.close()
 
