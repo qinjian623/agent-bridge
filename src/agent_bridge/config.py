@@ -104,6 +104,7 @@ class Config:
     telegram_database: str | None = None
     default_strategy: str = "balanced"
     hosts: dict[str, HostConfig] = field(default_factory=dict)
+    projects: dict[str, str] = field(default_factory=dict)  # project_id -> resolved local root directory
 
     @classmethod
     def load(cls, path: Path):
@@ -114,6 +115,7 @@ class Config:
         profiles = {name: Profile(name=name, **value).validate() for name, value in data.pop("profiles").items()}
         hosts = parse_hosts(data.pop("hosts", {}))
         config = cls(profiles=profiles, hosts=hosts, **data)
+        config.projects = normalize_projects(config.projects)
         if config.default_strategy not in {"balanced", "cost", "speed"}:
             raise BridgeError("invalid_config", "default_strategy must be balanced, cost or speed")
         if config.parallel_limit < 1 or config.quota_limit < 1:
@@ -125,6 +127,21 @@ class Config:
         if config.token_budget is not None and (not isinstance(config.token_budget, int) or config.token_budget <= 0):
             raise BridgeError("invalid_config", "token_budget must be a positive integer")
         return config
+
+
+def normalize_projects(value: object) -> dict[str, str]:
+    """Validate project_id -> directory and return resolved absolute root paths."""
+    if not isinstance(value, dict):
+        raise BridgeError("invalid_config", "projects must map project ids to directory paths")
+    projects: dict[str, str] = {}
+    for project_id, root in value.items():
+        if not isinstance(project_id, str) or not project_id or not isinstance(root, str) or not root.strip():
+            raise BridgeError("invalid_config", "projects must map non-empty project ids to directory paths")
+        resolved = Path(root).expanduser().resolve()
+        if not resolved.is_dir():
+            raise BridgeError("invalid_config", f"Project {project_id!r} root is not a directory")
+        projects[project_id] = str(resolved)
+    return projects
 
 
 def state_directory(value: str | None = None) -> Path:

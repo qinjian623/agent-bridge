@@ -5,8 +5,11 @@ No I/O and no behaviour beyond validation helpers, so every other peer module ca
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, NotRequired, TypedDict
@@ -347,8 +350,13 @@ class CatalogResult(TypedDict):
 
 
 class InspectParams(TypedDict):
-    kind: str  # session | task | group | operation | node
+    kind: str  # session | task | group | operation | node | workspace
     id: NotRequired[str]
+    section: NotRequired[Literal["base", "missing", "status"]]  # kind=workspace
+    project_id: NotRequired[str | None]
+    base_commit: NotRequired[str | None]
+    after: NotRequired[int | None]  # missing-chunk pagination
+    limit: NotRequired[int | None]
 
 
 class InspectResult(TypedDict):
@@ -650,30 +658,301 @@ def normalize_notify_parent_params(data: dict[str, Any]) -> NotifyParentParams:
     return params
 
 
-class WorkspaceParams(TypedDict):
+WorkspaceAction = Literal["prepare", "chunk", "seal", "abort"]
+WORKSPACE_ACTIONS = ("prepare", "chunk", "seal", "abort")
+WORKSPACE_DELIVERY_MODES = ("patch", "snapshot")
+WORKSPACE_MODES = ("git",)
+MAX_WORKSPACE_CHUNK_BYTES = 256 * 1024
+MANIFEST_SCHEMA = 1
+INSPECT_KINDS = ("session", "task", "group", "operation", "node", "workspace")
+WORKSPACE_SECTIONS = ("base", "missing", "status")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+class WorkspacePrepareParams(TypedDict):
     operation: OperationKey
-    action: Literal["prepare", "chunk", "seal", "abort"]
+    action: Literal["prepare"]
+    workspace_id: str
+    project_id: str
+    manifest_sha256: str
+    manifest_size: int
+    delivery_mode: Literal["patch", "snapshot"]
+    workspace_mode: Literal["git"]
+    source_base_commit: str | None
+    estimated_total_bytes: int
+    authority_ref: dict[str, str]
+
+
+class WorkspaceChunkParams(TypedDict):
+    operation: OperationKey
+    action: Literal["chunk"]
+    workspace_id: str
+    blob_sha256: str
+    offset: int
+    size: int
+    chunk_sha256: str
+    data: str  # base64 chunk payload, decoded length == size
+
+
+class WorkspaceSealParams(TypedDict):
+    operation: OperationKey
+    action: Literal["seal"]
+    workspace_id: str
+    manifest_sha256: str
+    expected_revision: int
+
+
+class WorkspaceAbortParams(TypedDict):
+    operation: OperationKey
+    action: Literal["abort"]
+    workspace_id: str
+    reason: str
+    expected_revision: int
+
+
+class WorkspaceParams(TypedDict):
+    """Union of every action's fields; `normalize_workspace_params` enforces the per-action subset."""
+
+    operation: OperationKey
+    action: WorkspaceAction
+    workspace_id: str
     # prepare
     project_id: NotRequired[str]
-    workspace_id: NotRequired[str]
-    manifest: NotRequired[dict[str, Any]]
-    total_size: NotRequired[int]
+    manifest_sha256: NotRequired[str]
+    manifest_size: NotRequired[int]
+    delivery_mode: NotRequired[Literal["patch", "snapshot"]]
+    workspace_mode: NotRequired[Literal["git"]]
+    source_base_commit: NotRequired[str | None]
+    estimated_total_bytes: NotRequired[int]
+    authority_ref: NotRequired[dict[str, str]]
     # chunk
-    upload_id: NotRequired[str]
+    blob_sha256: NotRequired[str]
     offset: NotRequired[int]
-    data: NotRequired[str]  # base64 chunk payload
-    sha256: NotRequired[str]
+    size: NotRequired[int]
+    chunk_sha256: NotRequired[str]
+    data: NotRequired[str]
     # seal / abort
-    expected_sha256: NotRequired[str]
+    expected_revision: NotRequired[int]
     reason: NotRequired[str]
 
 
 class WorkspaceResult(TypedDict):
     action: str
     workspace_id: NotRequired[str]
-    upload_id: NotRequired[str]
-    received: NotRequired[int]  # bytes durably stored so far
     status: NotRequired[str]
+    revision: NotRequired[int]
+    received: NotRequired[int]  # bytes durably stored so far
+    missing_blobs: NotRequired[list[dict[str, Any]]]  # manifest blobs still needed (prepare)
+    limits: NotRequired[dict[str, int]]
+    input_digest: NotRequired[str]  # seal -> ready
+    receipt: NotRequired[str]
+
+
+def normalize_operation_key(value: Any) -> OperationKey:
+    return _operation_key(value)
+
+
+def _sha256(data: dict[str, Any], key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{key} must be a 64-character lowercase hex sha256")
+    return value
+
+
+def _choice(data: dict[str, Any], key: str, choices: tuple[str, ...], default: str | None = None) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str) or value not in choices:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{key} must be one of {', '.join(choices)}")
+    return value
+
+
+def normalize_workspace_params(params: dict[str, Any]) -> dict[str, Any]:
+    params = _object(params, "params")
+    action = _choice(params, "action", WORKSPACE_ACTIONS)
+    out: dict[str, Any] = {"operation": normalize_operation_key(params.get("operation")), "action": action}
+    out["workspace_id"] = _text(params, "workspace_id")
+    if action == "prepare":
+        out["project_id"] = _text(params, "project_id")
+        out["manifest_sha256"] = _sha256(params, "manifest_sha256")
+        out["manifest_size"] = _int(params.get("manifest_size"), "manifest_size", 1)
+        out["delivery_mode"] = _choice(params, "delivery_mode", WORKSPACE_DELIVERY_MODES)
+        out["workspace_mode"] = _choice(params, "workspace_mode", WORKSPACE_MODES, "git")
+        out["source_base_commit"] = _text(params, "source_base_commit", False)
+        out["estimated_total_bytes"] = _int(params.get("estimated_total_bytes"), "estimated_total_bytes")
+        out["authority_ref"] = validate_object_ref(params.get("authority_ref"), "authority_ref")
+    elif action == "chunk":
+        out["blob_sha256"] = _sha256(params, "blob_sha256")
+        out["offset"] = _int(params.get("offset"), "offset")
+        size = _int(params.get("size"), "size", 1)
+        if size > MAX_WORKSPACE_CHUNK_BYTES:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, f"size must be <= {MAX_WORKSPACE_CHUNK_BYTES}")
+        out["size"] = size
+        out["chunk_sha256"] = _sha256(params, "chunk_sha256")
+        data = params.get("data")
+        if not isinstance(data, str) or len(data) > 4 * ((size + 2) // 3):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "data must be a base64 string matching size")
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "data must be valid base64") from None
+        if len(decoded) != size:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "data length does not match size")
+        out["data"] = data
+    elif action == "seal":
+        out["manifest_sha256"] = _sha256(params, "manifest_sha256")
+        out["expected_revision"] = _int(params.get("expected_revision"), "expected_revision")
+    else:
+        out["reason"] = _text(params, "reason")
+        out["expected_revision"] = _int(params.get("expected_revision"), "expected_revision")
+    return out
+
+
+def normalize_inspect_params(params: dict[str, Any]) -> dict[str, Any]:
+    params = _object(params, "params")
+    kind = _choice(params, "kind", INSPECT_KINDS)
+    out: dict[str, Any] = {"kind": kind}
+    if params.get("id") is not None:
+        out["id"] = _text(params, "id")
+    if params.get("after") is not None:
+        out["after"] = _int(params["after"], "after")
+    if params.get("limit") is not None:
+        out["limit"] = _int(params["limit"], "limit", 1)
+        if out["limit"] > MAX_PAGE_LIMIT:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, f"limit must be <= {MAX_PAGE_LIMIT}")
+    if kind != "workspace":
+        for key in ("section", "project_id", "base_commit"):
+            if params.get(key) is not None:
+                raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{key} is only valid for kind=workspace")
+        return out
+    section = _choice(params, "section", WORKSPACE_SECTIONS)
+    out["section"] = section
+    out["project_id"] = _text(params, "project_id", False)
+    out["base_commit"] = _text(params, "base_commit", False)
+    if section == "base":
+        _text(params, "project_id")
+    else:
+        _text(params, "id")
+    return out
+
+
+# ---------------------------------------------------------------- workspace manifest (design 4.3)
+
+class ManifestFile(TypedDict):
+    path: str
+    op: Literal["put", "delete"]
+    size: int
+    before_sha256: str | None
+    sha256: str | None
+    mode: int
+
+
+class WorkspaceManifest(TypedDict):
+    schema: int
+    workspace_id: str
+    project_id: str
+    workspace_mode: str
+    source_base_commit: str | None
+    delivery_mode: Literal["patch", "snapshot"]
+    selected_files: list[str]
+    input_digest: str
+    files: list[ManifestFile]
+    patch: dict[str, Any] | None
+    total_bytes: int
+    file_count: int
+
+
+def validate_manifest_path(value: Any, name: str = "path") -> str:
+    """Canonical UTF-8 relative path: no NUL, '..', '.', empty segments, leading '/' or '.git' component."""
+    if not isinstance(value, str) or not value:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} must be a non-empty string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} must be valid UTF-8") from None
+    if "\0" in value or value.startswith("/"):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} must be a relative path without NUL")
+    for part in value.split("/"):
+        if part in ("", ".", "..", ".git"):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} is not a canonical safe relative path: {value!r}")
+    return value
+
+
+def _normalize_manifest_file(item: Any) -> ManifestFile:
+    item = _object(item, "file")
+    path = validate_manifest_path(item.get("path"))
+    op = _choice(item, "op", ("put", "delete"))
+    before = item.get("before_sha256")
+    if before is not None:
+        before = _sha256(item, "before_sha256")
+    if op == "delete":
+        if item.get("sha256") is not None:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "delete file must not carry sha256")
+        return {"path": path, "op": "delete", "size": 0, "before_sha256": before, "sha256": None, "mode": 0}
+    mode = item.get("mode")
+    if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "mode must be an integer permission in 0..0o777")
+    return {
+        "path": path, "op": "put", "size": _int(item.get("size"), "size"),
+        "before_sha256": before, "sha256": _sha256(item, "sha256"), "mode": mode,
+    }
+
+
+def normalize_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    manifest = _object(manifest, "manifest")
+    if isinstance(manifest.get("schema"), bool) or manifest.get("schema") != MANIFEST_SCHEMA:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"manifest schema must be {MANIFEST_SCHEMA}")
+    delivery_mode = _choice(manifest, "delivery_mode", WORKSPACE_DELIVERY_MODES)
+    selected = manifest.get("selected_files")
+    if not isinstance(selected, list):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "selected_files must be a list")
+    selected = [validate_manifest_path(path, "selected_files[]") for path in selected]
+    raw_files = manifest.get("files")
+    if not isinstance(raw_files, list):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "files must be a list")
+    files = [_normalize_manifest_file(item) for item in raw_files]
+    paths = [file["path"] for file in files]
+    if len(set(paths)) != len(paths):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "duplicate manifest path")
+    path_set = set(paths)
+    for path in paths:
+        parts = path.split("/")
+        if any("/".join(parts[:i]) in path_set for i in range(1, len(parts))):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, f"manifest path conflicts with a parent file: {path!r}")
+    if delivery_mode == "patch" and not path_set <= set(selected):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "patch files must be a subset of selected_files")
+    patch = manifest.get("patch")
+    if patch is not None:
+        patch = _object(patch, "patch")
+        patch = {"sha256": _sha256(patch, "sha256"), "size": _int(patch.get("size"), "patch.size")}
+    file_count = _int(manifest.get("file_count"), "file_count")
+    if file_count != len(files):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "file_count does not match files")
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "workspace_id": _text(manifest, "workspace_id"),
+        "project_id": _text(manifest, "project_id"),
+        "workspace_mode": _choice(manifest, "workspace_mode", WORKSPACE_MODES, "git"),
+        "source_base_commit": _text(manifest, "source_base_commit", False),
+        "delivery_mode": delivery_mode,
+        "selected_files": selected,
+        "input_digest": _text(manifest, "input_digest"),
+        "files": files,
+        "patch": patch,
+        "total_bytes": _int(manifest.get("total_bytes"), "total_bytes"),
+        "file_count": file_count,
+    }
+
+
+def compute_manifest_digest(manifest: dict[str, Any]) -> str:
+    """SHA-256 over the canonical manifest JSON without its own `input_digest` field."""
+    return hashlib.sha256(_canonical_bytes({k: v for k, v in manifest.items() if k != "input_digest"})).hexdigest()
+
+
+def compute_input_digest(files: list[dict[str, Any]]) -> str:
+    """SHA-256 over {mode,path,sha256,size} of non-deleted files sorted by UTF-8 path bytes."""
+    entries = sorted((f for f in files if f.get("op") != "delete"), key=lambda f: f["path"].encode("utf-8"))
+    payload = [{"mode": f["mode"], "path": f["path"], "sha256": f["sha256"], "size": f["size"]} for f in entries]
+    return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
 
 class ResolveDeliveryParams(TypedDict):

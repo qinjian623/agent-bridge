@@ -59,6 +59,30 @@ def check_retry(task, instruction):
         raise BridgeError("invalid_retry", "Retry preserves the task instruction; use a new task to change its objective")
 
 
+WORKSPACE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspace_transfers (
+    workspace_id TEXT PRIMARY KEY, authority_ref TEXT NOT NULL,
+    project_id TEXT NOT NULL, project_config_digest TEXT NOT NULL,
+    project_root TEXT NOT NULL, manifest_sha256 TEXT NOT NULL,
+    source_base_commit TEXT, delivery_mode TEXT NOT NULL,
+    status TEXT NOT NULL, input_digest TEXT,
+    metadata TEXT NOT NULL, ready_path TEXT, attached_session_id TEXT REFERENCES sessions(id),
+    revision INTEGER NOT NULL DEFAULT 0, error TEXT,
+    created REAL NOT NULL, updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workspace_chunks (
+    workspace_id TEXT NOT NULL REFERENCES workspace_transfers(workspace_id),
+    blob_sha256 TEXT NOT NULL, offset INTEGER NOT NULL CHECK(offset>=0),
+    size INTEGER NOT NULL CHECK(size>0), chunk_sha256 TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,blob_sha256,offset)
+);
+CREATE TABLE IF NOT EXISTS workspace_blobs (
+    sha256 TEXT PRIMARY KEY, size INTEGER NOT NULL CHECK(size>=0),
+    stored_path TEXT NOT NULL, verified_at REAL NOT NULL
+);
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
  id TEXT PRIMARY KEY, profile TEXT NOT NULL, cwd TEXT NOT NULL, access TEXT NOT NULL,
@@ -293,7 +317,7 @@ CREATE TABLE IF NOT EXISTS member_bindings (
  pid INTEGER NOT NULL, process_start TEXT NOT NULL,
  expires_at REAL NOT NULL, revoked_at REAL, created REAL NOT NULL
 );
-"""
+""" + WORKSPACE_SCHEMA
 
 
 class Store:
@@ -330,8 +354,15 @@ class Store:
             self._migrate_node_outbox(db)
             self._migrate_peer_inbox(db)
             self._migrate_native_send_queue(db)
+            self._migrate_workspace_tables(db)
             self._initialize_commit_log(db)
         self.path.chmod(0o600)
+
+    @staticmethod
+    def _migrate_workspace_tables(db):
+        for statement in WORKSPACE_SCHEMA.split(";"):
+            if statement.strip():
+                db.execute(statement)
 
     @staticmethod
     def _migrate_node_outbox(db):
@@ -2470,3 +2501,179 @@ class Store:
         with self.connection(write=True) as connection:
             return update(connection)
 
+
+    # ---------------------------------------------------------------- workspace transfers (design 4.4)
+
+    @staticmethod
+    def _workspace_transfer_row(row):
+        if row is None:
+            return None
+        value = dict(row)
+        value["authority_ref"] = Store._decode_json(value.get("authority_ref"))
+        value["metadata"] = Store._decode_json(value.get("metadata"))
+        return value
+
+    def _with_db(self, db, action):
+        if db is not None:
+            return action(db)
+        with self.connection(write=True) as connection:
+            return action(connection)
+
+    def create_workspace_transfer(
+        self,
+        workspace_id: str,
+        authority_ref: dict,
+        project_id: str,
+        project_config_digest: str,
+        project_root: str,
+        manifest_sha256: str,
+        delivery_mode: str,
+        source_base_commit: str | None = None,
+        metadata: dict | None = None,
+        *,
+        db=None,
+    ) -> dict:
+        """Record the initial `receiving` transfer; an identical replay returns the stored row."""
+        encoded_authority = encode(authority_ref)
+
+        def create(connection):
+            now = time.time()
+            connection.execute(
+                "INSERT OR IGNORE INTO workspace_transfers(workspace_id,authority_ref,project_id,project_config_digest,"
+                "project_root,manifest_sha256,source_base_commit,delivery_mode,status,metadata,revision,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,'receiving',?,0,?,?)",
+                (workspace_id, encoded_authority, project_id, project_config_digest, project_root, manifest_sha256,
+                 source_base_commit, delivery_mode, encode(metadata or {}), now, now),
+            )
+            row = connection.execute("SELECT * FROM workspace_transfers WHERE workspace_id=?", (workspace_id,)).fetchone()
+            if (row["authority_ref"], row["project_id"], row["manifest_sha256"], row["delivery_mode"],
+                    row["source_base_commit"], row["project_config_digest"]) != (
+                    encoded_authority, project_id, manifest_sha256, delivery_mode, source_base_commit,
+                    project_config_digest):
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "workspace_id already bound to a different transfer")
+            return self._workspace_transfer_row(row)
+
+        return self._with_db(db, create)
+
+    def get_workspace_transfer(self, workspace_id: str) -> dict | None:
+        with self.connection() as db:
+            return self._workspace_transfer_row(
+                db.execute("SELECT * FROM workspace_transfers WHERE workspace_id=?", (workspace_id,)).fetchone()
+            )
+
+    def update_workspace_transfer_status(
+        self,
+        workspace_id: str,
+        status: str,
+        expected_revision: int,
+        ready_path: str | None = None,
+        input_digest: str | None = None,
+        error: str | None = None,
+        db=None,
+    ) -> int:
+        """Revision-CAS status change; returns the new revision.
+
+        Replaying a change that already took effect (same status, revision moved past `expected_revision`)
+        returns the current revision. Any other revision mismatch is a workspace_conflict.
+        """
+
+        def update(connection):
+            row = connection.execute(
+                "SELECT status,revision,attached_session_id FROM workspace_transfers WHERE workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
+            if row is None:
+                raise BridgeError("not_found", f"workspace_transfers: {workspace_id}")
+            if row["revision"] != expected_revision:
+                if row["status"] == status and row["revision"] > expected_revision:
+                    return row["revision"]
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "workspace revision conflict")
+            if row["attached_session_id"] is not None and status != row["status"]:
+                raise BridgeError(PeerErrorCode.WORKSPACE_ALREADY_ATTACHED, "workspace is already attached")
+            connection.execute(
+                "UPDATE workspace_transfers SET status=?,ready_path=COALESCE(?,ready_path),"
+                "input_digest=COALESCE(?,input_digest),error=?,revision=revision+1,updated=? WHERE workspace_id=?",
+                (status, ready_path, input_digest, error, time.time(), workspace_id),
+            )
+            return expected_revision + 1
+
+        return self._with_db(db, update)
+
+    def record_workspace_chunk(
+        self, workspace_id: str, blob_sha256: str, offset: int, size: int, chunk_sha256: str, stored_path: str,
+        db=None,
+    ) -> None:
+        """Record one verified chunk. Same bytes replay is a no-op; different bytes at that offset conflict."""
+
+        def record(connection):
+            if connection.execute(
+                "SELECT 1 FROM workspace_transfers WHERE workspace_id=?", (workspace_id,)
+            ).fetchone() is None:
+                raise BridgeError("not_found", f"workspace_transfers: {workspace_id}")
+            existing = connection.execute(
+                "SELECT size,chunk_sha256 FROM workspace_chunks WHERE workspace_id=? AND blob_sha256=? AND offset=?",
+                (workspace_id, blob_sha256, offset),
+            ).fetchone()
+            if existing is not None:
+                if (existing["size"], existing["chunk_sha256"]) != (size, chunk_sha256):
+                    raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "chunk differs from the stored bytes")
+                return
+            connection.execute(
+                "INSERT INTO workspace_chunks(workspace_id,blob_sha256,offset,size,chunk_sha256,stored_path) "
+                "VALUES(?,?,?,?,?,?)",
+                (workspace_id, blob_sha256, offset, size, chunk_sha256, stored_path),
+            )
+
+        self._with_db(db, record)
+
+    def get_workspace_chunks(self, workspace_id: str, blob_sha256: str) -> list[dict]:
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT * FROM workspace_chunks WHERE workspace_id=? AND blob_sha256=? ORDER BY offset",
+                (workspace_id, blob_sha256),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_workspace_blob(self, sha256: str) -> bool:
+        return self.get_workspace_blob(sha256) is not None
+
+    def get_workspace_blob(self, sha256: str) -> dict | None:
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM workspace_blobs WHERE sha256=?", (sha256,)).fetchone()
+        return None if row is None else dict(row)
+
+    def record_workspace_blob(self, sha256: str, size: int, stored_path: str, db=None) -> None:
+        """Mark a blob verified in the shared cache; replaying the same digest and size is a no-op."""
+
+        def record(connection):
+            connection.execute(
+                "INSERT OR IGNORE INTO workspace_blobs(sha256,size,stored_path,verified_at) VALUES(?,?,?,?)",
+                (sha256, size, stored_path, time.time()),
+            )
+            if connection.execute("SELECT size FROM workspace_blobs WHERE sha256=?", (sha256,)).fetchone()["size"] != size:
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "blob size differs from the verified cache entry")
+
+        self._with_db(db, record)
+
+    def attach_workspace_transfer(self, workspace_id: str, session_id: str, db=None) -> None:
+        """Bind a `ready` workspace to one session; replaying the same session is a no-op."""
+
+        def attach(connection):
+            row = connection.execute(
+                "SELECT status,attached_session_id FROM workspace_transfers WHERE workspace_id=?", (workspace_id,)
+            ).fetchone()
+            if row is None:
+                raise BridgeError("not_found", f"workspace_transfers: {workspace_id}")
+            if row["attached_session_id"] is not None:
+                if row["attached_session_id"] == session_id:
+                    return
+                raise BridgeError(PeerErrorCode.WORKSPACE_ALREADY_ATTACHED, "workspace is already attached")
+            if row["status"] != "ready":
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "only a ready workspace can be attached")
+            connection.execute(
+                "UPDATE workspace_transfers SET attached_session_id=?,status='attached',revision=revision+1,updated=? "
+                "WHERE workspace_id=?",
+                (session_id, time.time(), workspace_id),
+            )
+
+        self._with_db(db, attach)
