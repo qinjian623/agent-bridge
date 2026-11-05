@@ -8,8 +8,21 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from .errors import BridgeError
+from .peer_protocol import (
+    PeerErrorCode,
+    compute_input_digest,
+    compute_manifest_digest,
+    validate_manifest_path,
+)
+
+MAX_WORKSPACE_CHUNK_BYTES = 256 * 1024
+MAX_WORKSPACE_FILE_BYTES = 64 * 1024 * 1024
+MAX_WORKSPACE_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_WORKSPACE_FILES = 100_000
+MAX_WORKSPACE_MANIFEST_BYTES = 32 * 1024 * 1024
 
 
 def git(directory, *args):
@@ -156,6 +169,268 @@ def directory_copy(state, source, request_id, snapshot_files):
         metadata["ready"] = True
         save_manifest(folder / "workspace.json", metadata)
     return str(target), metadata
+
+
+def chunk_bytes(data: bytes, chunk_size: int = MAX_WORKSPACE_CHUNK_BYTES) -> list[tuple[int, bytes, str]]:
+    """Split `data` into aligned content-addressed chunks: (offset, bytes, sha256(chunk))."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "data must be bytes")
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "chunk_size must be an integer")
+    if not 1 <= chunk_size <= MAX_WORKSPACE_CHUNK_BYTES:
+        raise BridgeError(
+            PeerErrorCode.INVALID_PARAMS,
+            f"chunk_size must be between 1 and {MAX_WORKSPACE_CHUNK_BYTES}",
+        )
+    raw = bytes(data)
+    return [
+        (offset, raw[offset:offset + chunk_size], hashlib.sha256(raw[offset:offset + chunk_size]).hexdigest())
+        for offset in range(0, len(raw), chunk_size)
+    ]
+
+
+def _resolve_manifest_commit(root: Path, value: str) -> str:
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        raise BridgeError("invalid_base", "A valid Git base revision is required")
+    return git(root, "rev-parse", "--verify", value + "^{commit}").decode().strip()
+
+
+def _manifest_repo_root(root: Path) -> Path:
+    resolved = Path(root).expanduser().resolve()
+    if not resolved.is_dir():
+        raise BridgeError("invalid_workspace", "Workspace root must be an existing directory")
+    try:
+        top = Path(git(resolved, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+    except BridgeError as error:
+        raise BridgeError("invalid_workspace", "Git workspace delivery requires a Git repository") from error
+    if top != resolved:
+        raise BridgeError("invalid_workspace", "Workspace delivery requires the repository root")
+    return resolved
+
+
+def _base_inventory(root: Path, commit: str) -> dict[str, dict[str, Any]]:
+    """All supported tracked files at `commit`: path -> {sha256, size, mode}.
+
+    Symlinks, submodules, directories and special Git modes are rejected rather than silently skipped (design 4.3).
+    """
+    output = git(root, "ls-tree", "-r", "-z", "--full-tree", commit)
+    inventory: dict[str, dict[str, Any]] = {}
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        meta, raw_path = record.split(b"\t", 1)
+        mode, kind, object_id = meta.split(b" ")
+        try:
+            name = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            raise BridgeError("invalid_snapshot", "Tracked paths must be valid UTF-8") from None
+        validate_manifest_path(name)
+        if kind != b"blob" or mode not in {b"100644", b"100755"}:
+            raise BridgeError(
+                PeerErrorCode.WORKSPACE_CONFLICT,
+                f"Unsupported tracked entry in the base commit: {name!r}",
+            )
+        content = git(root, "cat-file", "blob", object_id.decode("ascii"))
+        inventory[name] = {
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+            "mode": 0o755 if mode == b"100755" else 0o644,
+        }
+    return inventory
+
+
+def _selected_record(root: Path, name: str) -> dict[str, Any] | None:
+    path = selected_path(root, name)
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+        raise BridgeError("invalid_snapshot", "Select individual regular files, not directories or devices")
+    mode = stat.S_IMODE(before.st_mode)
+    if mode & ~0o777:
+        raise BridgeError("invalid_snapshot", "Files may only carry normal permission bits (0..0777)")
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise BridgeError("invalid_snapshot", f"Could not read selected file {name!r}: {error}") from error
+    return {
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size": len(content),
+        "mode": mode,
+    }
+
+
+def _normalize_selection(selected_files: list[str] | None) -> list[str]:
+    if selected_files is None:
+        return []
+    if not isinstance(selected_files, list):
+        raise BridgeError("invalid_snapshot", "selected_files must be a list of relative file names")
+    names = []
+    for name in selected_files:
+        validate_manifest_path(name, "selected_files[]")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise BridgeError("invalid_snapshot", "selected_files must contain unique paths")
+    return names
+
+
+def _check_workspace_limits(files: list[dict[str, Any]], final_files: dict[str, dict[str, Any]]) -> int:
+    if len(files) > MAX_WORKSPACE_FILES or len(final_files) > MAX_WORKSPACE_FILES:
+        raise BridgeError(
+            PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED,
+            f"Workspace exceeds the {MAX_WORKSPACE_FILES}-file limit",
+        )
+    total = 0
+    for record in final_files.values():
+        size = record["size"]
+        if size > MAX_WORKSPACE_FILE_BYTES:
+            raise BridgeError(
+                PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED,
+                f"Workspace file exceeds the {MAX_WORKSPACE_FILE_BYTES}-byte limit",
+            )
+        total += size
+    if total > MAX_WORKSPACE_TOTAL_BYTES:
+        raise BridgeError(
+            PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED,
+            f"Workspace exceeds the {MAX_WORKSPACE_TOTAL_BYTES}-byte total limit",
+        )
+    return total
+
+
+def create_workspace_manifest(
+    project_id: str,
+    workspace_id: str,
+    root: Path,
+    delivery_mode: str,
+    base_commit: str | None = None,
+    selected_files: list[str] | None = None,
+    authority_ref: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build an immutable workspace manifest (design 4.3) without reading anything after capture.
+
+    Patch mode lists only the selected differences from the fixed base commit; snapshot mode lists the complete
+    final input (base tracked files overlaid with the selected current bytes). Both digest the complete final
+    input, never just the transferred difference. `authority_ref` belongs to the caller's identity envelope and
+    is intentionally not covered by the immutable manifest digest.
+    """
+    if not isinstance(project_id, str) or not project_id:
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "project_id must be a non-empty string")
+    if (
+        not isinstance(workspace_id, str)
+        or not workspace_id
+        or "\0" in workspace_id
+        or "/" in workspace_id
+        or "\\" in workspace_id
+        or workspace_id in {".", ".."}
+    ):
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "workspace_id must be a safe path component")
+    if delivery_mode not in {"patch", "snapshot"}:
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "delivery_mode must be patch or snapshot")
+    selection = _normalize_selection(selected_files)
+    resolved_root = Path(root).expanduser().resolve()
+
+    base: dict[str, dict[str, Any]] = {}
+    source_base_commit: str | None = None
+    if base_commit is not None:
+        resolved_root = _manifest_repo_root(resolved_root)
+        source_base_commit = _resolve_manifest_commit(resolved_root, base_commit)
+        base = _base_inventory(resolved_root, source_base_commit)
+    elif delivery_mode == "patch":
+        raise BridgeError("invalid_workspace", "Patch delivery requires a base commit")
+    else:
+        resolved_root = Path(root).expanduser().resolve()
+        if resolved_root.is_dir():
+            try:
+                resolved_root = _manifest_repo_root(resolved_root)
+                default_base = _resolve_manifest_commit(resolved_root, "HEAD")
+            except BridgeError:
+                default_base = None
+            if default_base is not None:
+                base = _base_inventory(resolved_root, default_base)
+
+    final: dict[str, dict[str, Any]] = {
+        path: {"sha256": record["sha256"], "size": record["size"], "mode": record["mode"]}
+        for path, record in base.items()
+    }
+    files: list[dict[str, Any]] = []
+
+    for name in selection:
+        current = _selected_record(resolved_root, name)
+        before = base.get(name)
+        if current is None:
+            if before is None:
+                raise BridgeError("invalid_snapshot", f"Selected file does not exist: {name}")
+            files.append({
+                "path": name, "op": "delete", "size": 0,
+                "before_sha256": before["sha256"], "sha256": None, "mode": 0,
+            })
+            final.pop(name, None)
+            continue
+        changed = (
+            before is None
+            or before["sha256"] != current["sha256"]
+            or before["size"] != current["size"]
+            or before["mode"] != current["mode"]
+        )
+        if delivery_mode == "patch":
+            if changed:
+                files.append({
+                    "path": name, "op": "put", "size": current["size"],
+                    "before_sha256": before["sha256"] if before else None,
+                    "sha256": current["sha256"], "mode": current["mode"],
+                })
+        final[name] = current
+
+    if delivery_mode == "snapshot":
+        files = [
+            {
+                "path": path, "op": "put", "size": record["size"], "before_sha256": None,
+                "sha256": record["sha256"], "mode": record["mode"],
+            }
+            for path, record in final.items()
+        ]
+        files.extend(
+            {
+                "path": name, "op": "delete", "size": 0, "before_sha256": base[name]["sha256"],
+                "sha256": None, "mode": 0,
+            }
+            for name in selection
+            if name not in final
+        )
+    files.sort(key=lambda entry: entry["path"].encode("utf-8"))
+
+    _check_workspace_limits(files, final)
+    final_entries = [
+        {
+            "path": path, "op": "put", "size": record["size"],
+            "before_sha256": None, "sha256": record["sha256"], "mode": record["mode"],
+        }
+        for path, record in final.items()
+    ]
+    manifest: dict[str, Any] = {
+        "schema": 1,
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "workspace_mode": "git",
+        "source_base_commit": source_base_commit,
+        "delivery_mode": delivery_mode,
+        "selected_files": selection,
+        "input_digest": compute_input_digest(final_entries),
+        "files": files,
+        "patch": None,
+        "total_bytes": sum(entry["size"] for entry in files if entry["op"] == "put"),
+        "file_count": len(files),
+    }
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > MAX_WORKSPACE_MANIFEST_BYTES:
+        raise BridgeError(
+            PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED,
+            f"Workspace manifest exceeds the {MAX_WORKSPACE_MANIFEST_BYTES}-byte limit",
+        )
+    # Compute eagerly so an unsendable manifest fails at generation time.
+    compute_manifest_digest(manifest)
+    return manifest
 
 
 def capture_patch(directory, destination, workspace=None):

@@ -76,11 +76,10 @@ class PeerProtocolContract(unittest.TestCase):
             "workspace_v1", "session_name_v1", "prune_guard_v1",
         ))
 
-    def test_unimplemented_phase_c_methods_are_rejected_by_service(self):
-        for name in ("peer.workspace",):
-            service = peer_api.DirectPeerService(None)  # type: ignore[arg-type]
-            response = asyncio.run(service.handle({"v": 1, "id": "1", "method": name, "params": {}}))
-            self.assertEqual(response["error"]["code"], PeerErrorCode.NOT_IMPLEMENTED)
+    def test_workspace_method_is_implemented_and_validates_its_operation(self):
+        service = peer_api.DirectPeerService(None)  # type: ignore[arg-type]
+        response = asyncio.run(service.handle({"v": 1, "id": "1", "method": "peer.workspace", "params": {}}))
+        self.assertEqual(response["error"]["code"], PeerErrorCode.INVALID_PARAMS)
 
     def test_mutating_methods_carry_operation_or_natural_key(self):
         for spec in PEER_METHODS.values():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -22,12 +23,31 @@ from .config import Config, Profile, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
-from .peer_protocol import PROTOCOL_VERSION, NodeRef, PeerDeliveryStatus, PeerErrorCode, canonical_operation_id
+from .peer_protocol import (
+    MAX_WORKSPACE_CHUNK_BYTES,
+    PROTOCOL_VERSION,
+    NodeRef,
+    PeerDeliveryStatus,
+    PeerErrorCode,
+    canonical_operation_id,
+    compute_manifest_digest,
+)
 from .peer_transport import DefaultPeerClientFactory
 from .routing import choose
 from .store import Store, encode, task_input, validate_session_name
 from .worker import alive, owned_processes
-from .workspace import directory_copy, worktree
+from .workspace import (
+    MAX_WORKSPACE_FILE_BYTES,
+    MAX_WORKSPACE_FILES,
+    MAX_WORKSPACE_TOTAL_BYTES,
+    create_workspace_manifest,
+    directory_copy,
+    selected_path,
+    worktree,
+)
+from .workspace import (
+    git as workspace_git,
+)
 
 
 def unit_name(state, session_id):
@@ -1193,7 +1213,10 @@ class Broker:
     @staticmethod
     def _remote_open_spec(args):
         spec = {}
-        for key in ("profile", "cwd", "access", "project_id", "model", "workspace_mode", "base", "snapshot_files", "name"):
+        for key in (
+            "profile", "cwd", "access", "project_id", "model", "workspace_mode", "base",
+            "snapshot_files", "name", "workspace_ref",
+        ):
             value = args.get(key)
             if value is not None:
                 spec[key] = value
@@ -1203,6 +1226,284 @@ class Broker:
     def _target_seq(operation_id):
         # Deterministic from the stable operation id: retries reuse the same target_seq (ADR-05/ADR-09).
         return int(operation_id[:16], 16) % (1 << 62)
+
+    @staticmethod
+    def _remote_workspace_requested(method, args, target_id):
+        return (
+            method in {"agent_open", "agent_dispatch"}
+            and not target_id
+            and args.get("access") == "workspace-write"
+            and args.get("workspace_mode", "git") == "git"
+        )
+
+    @staticmethod
+    def _workspace_operation(host_id, node, request_id, payload):
+        operation_id = Broker._stable_operation_id(host_id, "peer.workspace", request_id, payload)
+        return {
+            "node_id": node.node_id,
+            "state_generation": node.state_generation,
+            "operation_id": operation_id,
+        }
+
+    @staticmethod
+    def _source_repository(cwd):
+        if not isinstance(cwd, str) or not cwd:
+            raise BridgeError(
+                "invalid_request", "cwd (the local source checkout) is required for a remote workspace-write open"
+            )
+        root = Path(cwd).expanduser().resolve()
+        if not root.is_dir():
+            raise BridgeError("invalid_directory", "The local workspace source directory must exist")
+        try:
+            top = Path(workspace_git(root, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+        except BridgeError as error:
+            raise BridgeError("invalid_workspace", "Remote workspace-write requires a Git source checkout") from error
+        if top != root:
+            raise BridgeError("invalid_workspace", "Writing sessions require the repository root")
+        return root
+
+    @staticmethod
+    def _resolve_source_commit(root, value):
+        if not isinstance(value, str) or not value or value.startswith("-"):
+            raise BridgeError("invalid_base", "Invalid Git revision")
+        try:
+            return workspace_git(root, "rev-parse", "--verify", value + "^{commit}").decode().strip()
+        except BridgeError as error:
+            raise BridgeError("invalid_base", f"Invalid Git revision: {value}") from error
+
+    @staticmethod
+    def _source_entry_bytes(root, base_commit, entry, selected):
+        path_name = entry["path"]
+        if path_name in selected:
+            path = selected_path(root, path_name)
+            if not path.is_file() or path.is_symlink():
+                raise BridgeError("snapshot_changed", f"Source file changed during workspace capture: {path_name}")
+            data = path.read_bytes()
+        else:
+            try:
+                listing = workspace_git(root, "ls-tree", "-z", base_commit, "--", path_name)
+            except BridgeError as error:
+                raise BridgeError("snapshot_changed", f"Source base blob is unavailable: {path_name}") from error
+            record = listing.split(b"\0", 1)[0]
+            parts = record.split(b"\t", 1)[0].split(b" ")
+            if len(parts) != 3 or parts[1] != b"blob":
+                raise BridgeError("snapshot_changed", f"Source base blob is unavailable: {path_name}")
+            data = workspace_git(root, "cat-file", "blob", parts[2].decode())
+        if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            raise BridgeError("snapshot_changed", f"Source file changed during workspace capture: {path_name}")
+        return data
+
+    async def _workspace_missing(self, client, workspace_id):
+        items = []
+        after = 0
+        while True:
+            result = await client.inspect(
+                {
+                    "kind": "workspace",
+                    "id": workspace_id,
+                    "section": "missing",
+                    "after": after,
+                    "limit": 100,
+                }
+            )
+            page = result.get("items") if isinstance(result, dict) else None
+            if not isinstance(page, list):
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "peer.inspect returned no workspace items")
+            items.extend(page)
+            if not result.get("has_more"):
+                return items
+            cursor = result.get("cursor")
+            if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor <= after:
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "peer.inspect returned an invalid cursor")
+            after = cursor
+
+    async def _send_workspace_chunk(self, client, node, workspace_id, blob_sha256, chunk, offset):
+        operation_id = hashlib.sha256(
+            encode(
+                {
+                    "action": "chunk",
+                    "workspace_id": workspace_id,
+                    "blob_sha256": blob_sha256,
+                    "offset": offset,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        await client.workspace(
+            {
+                "operation": {
+                    "node_id": node.node_id,
+                    "state_generation": node.state_generation,
+                    "operation_id": operation_id,
+                },
+                "action": "chunk",
+                "workspace_id": workspace_id,
+                "blob_sha256": blob_sha256,
+                "offset": offset,
+                "size": len(chunk),
+                "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
+                "data": base64.b64encode(chunk).decode("ascii"),
+            }
+        )
+
+    async def _upload_workspace_blob(self, client, node, workspace_id, blob_sha256, data):
+        for offset in range(0, len(data), MAX_WORKSPACE_CHUNK_BYTES):
+            await self._send_workspace_chunk(
+                client,
+                node,
+                workspace_id,
+                blob_sha256,
+                data[offset:offset + MAX_WORKSPACE_CHUNK_BYTES],
+                offset,
+            )
+
+    async def _prepare_remote_workspace(self, host_id, client, node, args):
+        request_id = str(args.get("request_id") or "")
+        project_id = args.get("project_id")
+        if not isinstance(project_id, str) or not project_id:
+            raise BridgeError("invalid_request", "project_id is required for a remote workspace-write open")
+        root = self._source_repository(args.get("cwd"))
+        base_commit = self._resolve_source_commit(root, args.get("base") or "HEAD")
+        selection = args.get("snapshot_files")
+        if selection is None:
+            selection = []
+        if not isinstance(selection, list):
+            raise BridgeError("invalid_snapshot", "snapshot_files must be a list")
+        selected = set(selection)
+
+        inspected = await client.inspect(
+            {
+                "kind": "workspace",
+                "section": "base",
+                "project_id": project_id,
+                "base_commit": base_commit,
+            }
+        )
+        base_items = inspected.get("items") if isinstance(inspected, dict) else None
+        remote_has_base = bool(
+            isinstance(base_items, list) and base_items and isinstance(base_items[0], dict)
+            and base_items[0].get("exists")
+        )
+        delivery_mode = "patch" if remote_has_base else "snapshot"
+        identity_material = encode(
+            {
+                "host_id": host_id,
+                "project_id": project_id,
+                "request_id": request_id,
+                "base_commit": base_commit,
+                "selected_files": selection,
+                "delivery_mode": delivery_mode,
+            }
+        )
+        workspace_id = "ws-" + hashlib.sha256(identity_material.encode("utf-8")).hexdigest()[:32]
+        authority_ref = {
+            **groups.resolve_authority_ref(self.store, None),
+            "local_id": request_id or workspace_id,
+        }
+        manifest = create_workspace_manifest(
+            project_id,
+            workspace_id,
+            root,
+            delivery_mode,
+            base_commit=base_commit,
+            selected_files=selection,
+            authority_ref=None,
+        )
+        manifest_sha256 = compute_manifest_digest(manifest)
+        manifest_data = encode(manifest).encode("utf-8")
+        if len(manifest_data) > 32 * 1024 * 1024:
+            raise BridgeError(PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED, "The workspace manifest exceeds 32 MiB")
+        unique_sizes: dict[str, int] = {}
+        for entry in manifest["files"]:
+            if entry["op"] == "put":
+                unique_sizes.setdefault(entry["sha256"], entry["size"])
+        if len(unique_sizes) > MAX_WORKSPACE_FILES:
+            raise BridgeError(PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED, "The workspace exceeds 100000 files")
+        if any(size > MAX_WORKSPACE_FILE_BYTES for size in unique_sizes.values()):
+            raise BridgeError(PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED, "A workspace file exceeds 64 MiB")
+        estimated_total = len(manifest_data) + sum(unique_sizes.values())
+        if estimated_total > MAX_WORKSPACE_TOTAL_BYTES:
+            raise BridgeError(PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED, "The workspace exceeds 1 GiB")
+
+        prepare_payload = {
+            "action": "prepare",
+            "workspace_id": workspace_id,
+            "project_id": project_id,
+            "manifest_sha256": manifest_sha256,
+            "manifest_size": len(manifest_data),
+            "delivery_mode": delivery_mode,
+            "workspace_mode": "git",
+            "source_base_commit": manifest["source_base_commit"],
+            "estimated_total_bytes": estimated_total,
+            "authority_ref": authority_ref,
+        }
+        await client.workspace(
+            {
+                "operation": self._workspace_operation(host_id, node, request_id, prepare_payload),
+                **prepare_payload,
+            }
+        )
+
+        await self._upload_workspace_blob(client, node, workspace_id, manifest_sha256, manifest_data)
+        missing = await self._workspace_missing(client, workspace_id)
+        for item in missing:
+            if item.get("blob_sha256") != manifest_sha256:
+                continue
+            offset = item.get("offset")
+            size = item.get("size")
+            if not isinstance(offset, int) or not isinstance(size, int):
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "peer.inspect returned an invalid manifest chunk")
+            chunk = manifest_data[offset:offset + size]
+            if len(chunk) != size:
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "peer.inspect returned an out-of-range manifest chunk")
+            await self._send_workspace_chunk(client, node, workspace_id, manifest_sha256, chunk, offset)
+        if any(item.get("blob_sha256") == manifest_sha256 for item in missing):
+            missing = await self._workspace_missing(client, workspace_id)
+
+        entries_by_sha: dict[str, dict] = {}
+        for entry in manifest["files"]:
+            if entry["op"] == "put":
+                entries_by_sha.setdefault(entry["sha256"], entry)
+        for item in missing:
+            digest = item.get("sha256")
+            if digest is None:
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "The workspace manifest was not verified")
+            entry = entries_by_sha.get(digest)
+            if entry is None:
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "The remote requested an unknown workspace blob")
+            data = self._source_entry_bytes(root, manifest["source_base_commit"], entry, selected)
+            await self._upload_workspace_blob(client, node, workspace_id, digest, data)
+
+        status = await client.inspect({"kind": "workspace", "id": workspace_id, "section": "status"})
+        status_items = status.get("items") if isinstance(status, dict) else None
+        if not isinstance(status_items, list) or not status_items or not isinstance(status_items[0], dict):
+            raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "peer.inspect returned no workspace status")
+        revision = status_items[0].get("revision")
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "peer.inspect returned an invalid workspace revision")
+        seal_payload = {
+            "action": "seal",
+            "workspace_id": workspace_id,
+            "manifest_sha256": manifest_sha256,
+            "expected_revision": revision,
+        }
+        sealed = await client.workspace(
+            {
+                "operation": self._workspace_operation(host_id, node, request_id, seal_payload),
+                **seal_payload,
+            }
+        )
+        if not isinstance(sealed, dict) or sealed.get("status") != "ready":
+            raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "The remote workspace did not become ready")
+        return {
+            **args,
+            "access": "workspace-write",
+            "workspace_mode": "git",
+            "workspace_ref": {
+                "workspace_id": workspace_id,
+                "manifest_sha256": manifest_sha256,
+                "input_digest": manifest["input_digest"],
+            },
+        }
 
     def _operation_response(self, operation):
         result = operation.get("result")
@@ -1225,11 +1526,13 @@ class Broker:
             args = {key: value for key, value in args.items() if key != "name"}
         client = self.peer_factory.client(host_id)
         node = await self._peer_node(host_id, client)
+        target_id = args.get("session_id") or ""
+        if self._remote_workspace_requested(method, args, target_id):
+            args = await self._prepare_remote_workspace(host_id, client, node, args)
         operation_id = self._stable_operation_id(
             host_id, method, str(args.get("request_id") or ""), args
         )
         target_seq = self._target_seq(operation_id)
-        target_id = args.get("session_id") or ""
         parent_ref = args.get("parent_ref")
         if parent_ref is None and args.get("parent"):
             parent_id = args.get("parent")

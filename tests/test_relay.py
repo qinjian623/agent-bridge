@@ -86,6 +86,7 @@ class DirectPeerServiceTests(unittest.IsolatedAsyncioTestCase):
                 "peer.result",
                 "peer.events",
                 "peer.notify_parent",
+                "peer.workspace",
                 "peer.resolve_delivery",
                 "groups_v1",
                 "ordered_delivery_v1",

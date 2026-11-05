@@ -1,11 +1,18 @@
 """Coordinator-side orchestration interfaces and new/extended MCP tool contracts (design 7 and 8)."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
+import shutil
 import socket
 import sqlite3
+import stat
+import subprocess
+import threading
 import time
+from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 from . import __version__, groups
@@ -16,6 +23,7 @@ from .peer_protocol import (
     CAPABILITIES,
     INLINE_RESULT_BYTES,
     MAX_PAGE_LIMIT,
+    MAX_WORKSPACE_CHUNK_BYTES,
     PROTOCOL_VERSION,
     AckRequestResult,
     ArtifactRef,
@@ -33,17 +41,24 @@ from .peer_protocol import (
     PullRequestsResult,
     RemoteMember,  # noqa: F401  re-exported so peer_api.RemoteMember is the peer_protocol type
     canonical_operation_id,
+    compute_input_digest,
+    compute_manifest_digest,
     fail,
     negotiate_version,
     normalize_ack_request_params,
+    normalize_inspect_params,
+    normalize_manifest,
     normalize_notify_parent_params,
     normalize_outbox_item,
+    normalize_workspace_params,
     ok,
     peer_error,
     require_method,
+    validate_manifest_path,
     validate_object_ref,
 )
 from .store import Store, encode, identifier, validate_session_name
+from .workspace import git as workspace_git
 
 # ---------------------------------------------------------------- MCP tool parameter contracts
 
@@ -172,6 +187,7 @@ IMPLEMENTED_PEER_METHODS = (
     "peer.result",
     "peer.events",
     "peer.notify_parent",
+    "peer.workspace",
     "peer.resolve_delivery",
 )
 
@@ -199,6 +215,8 @@ class DirectPeerService:
         self._store = store
         self._config = config
         self._broker_version = broker_version
+        self._workspace_locks: dict[str, threading.Lock] = {}
+        self._workspace_locks_guard = threading.Lock()
 
     async def handle(self, request: PeerRequest) -> PeerResponse:
         if not isinstance(request, dict):
@@ -238,6 +256,8 @@ class DirectPeerService:
                 result = self._events(params)
             elif spec.name == "peer.notify_parent":
                 result = self._notify_parent(params)
+            elif spec.name == "peer.workspace":
+                result = self._workspace(params)
             elif spec.name == "peer.resolve_delivery":
                 result = self._resolve_delivery(params)
             else:
@@ -309,6 +329,8 @@ class DirectPeerService:
         elif kind == "task" and self._store is not None:
             task_id = params.get("id")
             items = [self._store.get_task(task_id)] if isinstance(task_id, str) and task_id else []
+        elif kind == "workspace":
+            return self._inspect_workspace(params)
         elif kind in {"session", "task", "group", "operation"}:
             items = []
         else:
@@ -552,6 +574,693 @@ class DirectPeerService:
         self._identity.advance(ack_seq)
         return {"mirror_seq": mirror_seq, "duplicate": False}
 
+    # ---------------------------------------------------------------- workspace upload and preparation (design 4)
+
+    def _workspace_lock(self, workspace_id: str) -> threading.Lock:
+        with self._workspace_locks_guard:
+            return self._workspace_locks.setdefault(workspace_id, threading.Lock())
+
+    @staticmethod
+    def _safe_workspace_id(workspace_id: str) -> str:
+        if (
+            not isinstance(workspace_id, str)
+            or not workspace_id
+            or "\0" in workspace_id
+            or "/" in workspace_id
+            or "\\" in workspace_id
+            or workspace_id in {".", ".."}
+        ):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "workspace_id must be a safe path component")
+        return workspace_id
+
+    @staticmethod
+    def _project_config_digest(project_id: str, project_root: str) -> str:
+        material = json.dumps(
+            {"project_id": project_id, "project_root": project_root},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _project_roots(self) -> dict[str, str]:
+        projects = getattr(self._config, "projects", None) if self._config is not None else None
+        return projects if isinstance(projects, dict) else {}
+
+    @staticmethod
+    def _git_commit_exists(root: str, commit: str) -> bool:
+        if not isinstance(commit, str) or not commit or commit.startswith("-"):
+            return False
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "cat-file", "-e", commit + "^{commit}"],
+                capture_output=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    def _workspace_path(self, workspace_id: str) -> Path:
+        return Path(self._store.state) / "workspaces" / self._safe_workspace_id(workspace_id)
+
+    def _workspace_chunk_path(self, workspace_id: str, blob_sha256: str, offset: int) -> Path:
+        return (
+            Path(self._store.state) / "workspace_chunks" / self._safe_workspace_id(workspace_id)
+            / blob_sha256 / f"{offset}.chunk"
+        )
+
+    def _workspace_blob_path(self, sha256: str) -> Path:
+        return Path(self._store.state) / "workspace_blobs" / sha256[:2] / f"{sha256}.blob"
+
+    @staticmethod
+    def _workspace_snapshot_ref(workspace_id: str) -> str:
+        key = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:24]
+        return f"refs/cli-agent-bridge/workspaces/{key}"
+
+    def _workspace_snapshot_tree(self, transfer: dict[str, Any]) -> str:
+        ready_path = transfer.get("ready_path")
+        if not isinstance(ready_path, str) or not ready_path:
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace has no ready path")
+        try:
+            if transfer["delivery_mode"] == "patch":
+                output = workspace_git(
+                    ready_path, "rev-parse", "--verify", self._workspace_snapshot_ref(transfer["workspace_id"]),
+                )
+            else:
+                output = workspace_git(ready_path, "rev-parse", "--verify", "HEAD^{commit}")
+        except BridgeError as error:
+            raise peer_error(
+                PeerErrorCode.WORKSPACE_CONFLICT,
+                f"workspace input tree is unavailable: {error}",
+            ) from None
+        return output.decode().strip()
+
+    @staticmethod
+    def _write_bytes_atomic(path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_name(path.name + ".tmp")
+        with temporary.open("wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _read_bytes(path: str | Path) -> bytes:
+        try:
+            return Path(path).read_bytes()
+        except OSError as error:
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, f"Workspace content is unavailable: {error}") from error
+
+    def _inspect_workspace(self, params: dict[str, Any]) -> dict[str, Any]:
+        normalized = normalize_inspect_params({**params, "kind": "workspace"})
+        section = normalized["section"]
+        if section == "base":
+            project_id = normalized["project_id"]
+            root = self._project_roots().get(project_id)
+            if root is None:
+                raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown project: {project_id}")
+            base_commit = normalized.get("base_commit")
+            exists = True if base_commit is None else self._git_commit_exists(root, base_commit)
+            return {
+                "items": [{
+                    "exists": exists,
+                    "project_id": project_id,
+                    "project_config_digest": self._project_config_digest(project_id, root),
+                }]
+            }
+
+        store = self._require_store(self._store)
+        workspace_id = normalized["id"]
+        transfer = store.get_workspace_transfer(workspace_id)
+        if transfer is None:
+            raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown workspace: {workspace_id}")
+        if section == "status":
+            return {"items": [transfer]}
+
+        after = normalized.get("after", 0)
+        limit = min(normalized.get("limit", MAX_PAGE_LIMIT), MAX_PAGE_LIMIT)
+        verified = transfer["status"] in {"verified", "preparing", "ready", "attached"}
+        if not verified:
+            metadata = transfer.get("metadata") if isinstance(transfer.get("metadata"), dict) else {}
+            manifest_size = metadata.get("manifest_size")
+            present = {
+                chunk["offset"] for chunk in store.get_workspace_chunks(
+                    workspace_id, transfer["manifest_sha256"]
+                )
+            }
+            missing = []
+            if isinstance(manifest_size, int) and not isinstance(manifest_size, bool):
+                for offset in range(0, manifest_size, MAX_WORKSPACE_CHUNK_BYTES):
+                    if offset not in present:
+                        missing.append({
+                            "blob_sha256": transfer["manifest_sha256"],
+                            "offset": offset,
+                            "size": min(MAX_WORKSPACE_CHUNK_BYTES, manifest_size - offset),
+                        })
+            page = missing[after:after + limit]
+            return {
+                "items": page,
+                "cursor": after + len(page),
+                "has_more": after + len(page) < len(missing),
+            }
+
+        manifest = self._workspace_manifest(store, transfer)
+        missing_blobs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in manifest["files"]:
+            if entry["op"] != "put" or entry["size"] == 0:
+                continue
+            digest = entry["sha256"]
+            if digest in seen:
+                continue
+            seen.add(digest)
+            if not store.has_workspace_blob(digest):
+                missing_blobs.append({"sha256": digest, "size": entry["size"]})
+        page = missing_blobs[after:after + limit]
+        return {
+            "items": page,
+            "cursor": after + len(page),
+            "has_more": after + len(page) < len(missing_blobs),
+        }
+
+    def _workspace(self, params: dict[str, Any]) -> dict[str, Any]:
+        normalized = normalize_workspace_params(params)
+        identity = self._ready_identity()
+        self._check_operation_identity(normalized["operation"], identity)
+        store = self._require_store(self._store)
+        self._safe_workspace_id(normalized["workspace_id"])
+        action = normalized["action"]
+        if action == "prepare":
+            return self._workspace_prepare(store, normalized)
+        if action == "chunk":
+            return self._workspace_chunk(store, normalized)
+        if action == "seal":
+            return self._workspace_seal(store, normalized)
+        with self._workspace_lock(normalized["workspace_id"]):
+            return self._workspace_abort(store, normalized)
+
+    def _workspace_prepare(self, store: Any, params: dict[str, Any]) -> dict[str, Any]:
+        project_id = params["project_id"]
+        project_root = self._project_roots().get(project_id)
+        if project_root is None:
+            raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown project: {project_id}")
+        if params["manifest_size"] > 32 * 1024 * 1024:
+            raise peer_error(PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED, "manifest_size exceeds the 32 MiB limit")
+        if params["estimated_total_bytes"] > 1024 * 1024 * 1024:
+            raise peer_error(PeerErrorCode.WORKSPACE_LIMIT_EXCEEDED, "estimated_total_bytes exceeds the 1 GiB limit")
+        digest = self._project_config_digest(project_id, project_root)
+        try:
+            transfer = store.create_workspace_transfer(
+                params["workspace_id"],
+                params["authority_ref"],
+                project_id,
+                digest,
+                project_root,
+                params["manifest_sha256"],
+                params["delivery_mode"],
+                params["source_base_commit"],
+                metadata={
+                    "manifest_size": params["manifest_size"],
+                    "estimated_total_bytes": params["estimated_total_bytes"],
+                    "workspace_mode": params["workspace_mode"],
+                },
+            )
+        except BridgeError as error:
+            if str(error.code) == str(PeerErrorCode.WORKSPACE_CONFLICT):
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "transfer parameters conflict") from None
+            raise
+        self._advance_workspace_commit(store, f"peer.workspace:prepare:{params['workspace_id']}")
+        return {
+            "action": "prepare",
+            "workspace_id": transfer["workspace_id"],
+            "status": transfer["status"],
+            "revision": transfer["revision"],
+        }
+
+    def _expected_blob_size(self, store: Any, transfer: dict[str, Any], blob_sha256: str) -> int | None:
+        metadata = transfer.get("metadata") if isinstance(transfer.get("metadata"), dict) else {}
+        if blob_sha256 == transfer["manifest_sha256"]:
+            size = metadata.get("manifest_size")
+            if isinstance(size, int) and not isinstance(size, bool):
+                return size
+        manifest = self._try_workspace_manifest(store, transfer)
+        if manifest is None:
+            return None
+        sizes = {
+            entry["sha256"]: entry["size"]
+            for entry in manifest["files"]
+            if entry["op"] == "put"
+        }
+        return sizes.get(blob_sha256)
+
+    def _workspace_chunk(self, store: Any, params: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = params["workspace_id"]
+        blob_sha256 = params["blob_sha256"]
+        offset = params["offset"]
+        size = params["size"]
+        transfer = store.get_workspace_transfer(workspace_id)
+        if transfer is None:
+            raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown workspace: {workspace_id}")
+        existing = [
+            chunk for chunk in store.get_workspace_chunks(workspace_id, blob_sha256)
+            if chunk["offset"] == offset
+        ]
+        if transfer["status"] not in {"receiving", "verified"}:
+            if (
+                existing
+                and existing[0]["size"] == size
+                and existing[0]["chunk_sha256"] == params["chunk_sha256"]
+            ):
+                received = sum(
+                    chunk["size"] for chunk in store.get_workspace_chunks(workspace_id, blob_sha256)
+                )
+                return {
+                    "action": "chunk",
+                    "workspace_id": workspace_id,
+                    "blob_sha256": blob_sha256,
+                    "offset": offset,
+                    "size": size,
+                    "received": received,
+                }
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace is not receiving chunks")
+
+        try:
+            decoded = base64.b64decode(params["data"], validate=True)
+        except (ValueError, TypeError):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "data must be valid base64") from None
+        if len(decoded) != size or hashlib.sha256(decoded).hexdigest() != params["chunk_sha256"]:
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "chunk digest does not match its content")
+        expected_size = self._expected_blob_size(store, transfer, blob_sha256)
+        if expected_size is not None and offset + size > expected_size:
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "chunk exceeds the declared blob size")
+        for chunk in store.get_workspace_chunks(workspace_id, blob_sha256):
+            if chunk["offset"] == offset:
+                continue
+            if offset < chunk["offset"] + chunk["size"] and chunk["offset"] < offset + size:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "chunk overlaps a stored chunk")
+
+        stored_path = self._workspace_chunk_path(workspace_id, blob_sha256, offset)
+        self._write_bytes_atomic(stored_path, decoded)
+        store.record_workspace_chunk(
+            workspace_id, blob_sha256, offset, size, params["chunk_sha256"], str(stored_path),
+        )
+
+        assembled = self._assemble_blob(store, workspace_id, blob_sha256)
+        verified_manifest = False
+        if assembled is not None:
+            verified_manifest = self._record_complete_blob(store, transfer, blob_sha256, assembled)
+        received = sum(chunk["size"] for chunk in store.get_workspace_chunks(workspace_id, blob_sha256))
+        self._advance_workspace_commit(
+            store, f"peer.workspace:chunk:{workspace_id}:{blob_sha256}:{offset}",
+        )
+        result: dict[str, Any] = {
+            "action": "chunk",
+            "workspace_id": workspace_id,
+            "blob_sha256": blob_sha256,
+            "offset": offset,
+            "size": size,
+            "received": received,
+        }
+        if verified_manifest:
+            result["status"] = "verified"
+        return result
+
+    def _assemble_blob(self, store: Any, workspace_id: str, blob_sha256: str) -> bytes | None:
+        chunks = store.get_workspace_chunks(workspace_id, blob_sha256)
+        if not chunks:
+            return None
+        position = 0
+        payload = bytearray()
+        for chunk in chunks:
+            if chunk["offset"] != position:
+                return None
+            content = self._read_bytes(chunk["stored_path"])
+            if len(content) != chunk["size"] or hashlib.sha256(content).hexdigest() != chunk["chunk_sha256"]:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "stored chunk does not match its digest")
+            payload.extend(content)
+            position += len(content)
+        return bytes(payload)
+
+    def _record_blob(self, store: Any, digest: str, data: bytes) -> None:
+        blob_path = self._workspace_blob_path(digest)
+        self._write_bytes_atomic(blob_path, data)
+        store.record_workspace_blob(digest, len(data), str(blob_path))
+
+    def _record_complete_blob(
+        self, store: Any, transfer: dict[str, Any], blob_sha256: str, data: bytes,
+    ) -> bool:
+        actual = hashlib.sha256(data).hexdigest()
+        manifest: dict[str, Any] | None = None
+        if blob_sha256 == transfer["manifest_sha256"]:
+            # The manifest digest covers the canonical manifest without `input_digest`, so it is not the
+            # SHA-256 of the uploaded document. Verify the parsed manifest against the declared digest and
+            # record the bytes under both digests.
+            manifest = self._parse_manifest(data, required=True)
+            assert manifest is not None
+            if compute_manifest_digest(manifest) != transfer["manifest_sha256"]:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "manifest digest does not match its content")
+            self._check_manifest_transfer(manifest, transfer)
+            self._record_blob(store, actual, data)
+            if actual != blob_sha256:
+                self._record_blob(store, blob_sha256, data)
+        else:
+            if actual != blob_sha256:
+                if transfer["status"] == "receiving":
+                    parsed = self._parse_manifest(data, required=False)
+                    if parsed is not None and compute_manifest_digest(parsed) == transfer["manifest_sha256"]:
+                        manifest = parsed
+                if manifest is None:
+                    raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "blob digest does not match its content")
+            self._record_blob(store, actual, data)
+            if manifest is None and transfer["status"] == "receiving":
+                parsed = self._parse_manifest(data, required=False)
+                if parsed is not None and compute_manifest_digest(parsed) == transfer["manifest_sha256"]:
+                    manifest = parsed
+                    self._check_manifest_transfer(manifest, transfer)
+                    self._record_blob(store, transfer["manifest_sha256"], data)
+        if manifest is None:
+            return False
+        if transfer["status"] == "receiving":
+            store.update_workspace_transfer_status(
+                transfer["workspace_id"], "verified", transfer["revision"],
+            )
+        return True
+
+    def _parse_manifest(self, data: bytes, *, required: bool) -> dict[str, Any] | None:
+        try:
+            parsed = json.loads(data)
+            if not isinstance(parsed, dict):
+                raise ValueError("manifest must be a JSON object")
+            return normalize_manifest(parsed)
+        except (ValueError, TypeError, BridgeError) as error:
+            if required:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, f"manifest is invalid: {error}") from None
+            return None
+
+    def _try_workspace_manifest(self, store: Any, transfer: dict[str, Any]) -> dict[str, Any] | None:
+        blob = store.get_workspace_blob(transfer["manifest_sha256"])
+        if blob is None:
+            return None
+        try:
+            return self._workspace_manifest(store, transfer)
+        except BridgeError:
+            return None
+
+    def _workspace_manifest(self, store: Any, transfer: dict[str, Any]) -> dict[str, Any]:
+        blob = store.get_workspace_blob(transfer["manifest_sha256"])
+        if blob is None:
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "manifest has not been received")
+        data = self._read_bytes(blob["stored_path"])
+        manifest = self._parse_manifest(data, required=True)
+        assert manifest is not None
+        self._check_manifest_transfer(manifest, transfer)
+        return manifest
+
+    @staticmethod
+    def _check_manifest_transfer(manifest: dict[str, Any], transfer: dict[str, Any]) -> None:
+        if (
+            manifest.get("workspace_id") != transfer["workspace_id"]
+            or manifest.get("project_id") != transfer["project_id"]
+            or manifest.get("delivery_mode") != transfer["delivery_mode"]
+            or manifest.get("source_base_commit") != transfer["source_base_commit"]
+        ):
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "manifest does not match the prepared transfer")
+
+    def _check_project_config(self, transfer: dict[str, Any]) -> None:
+        if self._config is None:
+            return
+        projects = getattr(self._config, "projects", None)
+        if not isinstance(projects, dict):
+            return
+        project_root = projects.get(transfer["project_id"])
+        if (
+            project_root is None
+            or project_root != transfer["project_root"]
+            or self._project_config_digest(transfer["project_id"], project_root)
+            != transfer["project_config_digest"]
+        ):
+            raise peer_error(
+                PeerErrorCode.WORKSPACE_PROJECT_CHANGED,
+                "The execution project mapping changed after this workspace was prepared",
+            )
+
+    def _advance_workspace_commit(self, store: Any, mutation_key: str) -> None:
+        seq = store.record_commit(mutation_key, "peer.workspace")
+        self._identity.advance(seq)
+
+    def _workspace_seal(self, store: Any, params: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = params["workspace_id"]
+        with self._workspace_lock(workspace_id):
+            transfer = store.get_workspace_transfer(workspace_id)
+            if transfer is None:
+                raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown workspace: {workspace_id}")
+            if transfer["manifest_sha256"] != params["manifest_sha256"]:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "manifest digest does not match the transfer")
+            if transfer["attached_session_id"] is not None:
+                raise peer_error(PeerErrorCode.WORKSPACE_ALREADY_ATTACHED, "workspace is already attached")
+            if transfer["status"] == "ready":
+                if params["expected_revision"] > transfer["revision"]:
+                    raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace revision conflict")
+                return {
+                    "action": "seal",
+                    "workspace_id": workspace_id,
+                    "status": "ready",
+                    "ready_path": transfer["ready_path"],
+                    "input_digest": transfer["input_digest"],
+                    "revision": transfer["revision"],
+                }
+            if transfer["status"] not in {"verified", "preparing"}:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace is not verified")
+            if params["expected_revision"] != transfer["revision"]:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace revision conflict")
+            manifest = self._workspace_manifest(store, transfer)
+            self._check_project_config(transfer)
+            preparing_revision = store.update_workspace_transfer_status(
+                workspace_id, "preparing", params["expected_revision"],
+            )
+            try:
+                ready_path = self._build_workspace(transfer, manifest)
+                actual_digest = self._workspace_digest(Path(ready_path))
+                if actual_digest != manifest["input_digest"]:
+                    raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "input digest mismatch")
+                ready_revision = store.update_workspace_transfer_status(
+                    workspace_id, "ready", preparing_revision,
+                    ready_path=str(ready_path), input_digest=manifest["input_digest"],
+                )
+            except BaseException as error:
+                self._remove_workspace(transfer)
+                try:
+                    store.update_workspace_transfer_status(
+                        workspace_id, "failed", preparing_revision, error=str(error)[:1000],
+                    )
+                except BridgeError:
+                    pass
+                raise
+            self._advance_workspace_commit(
+                store, f"peer.workspace:seal:{workspace_id}:{ready_revision}",
+            )
+            return {
+                "action": "seal",
+                "workspace_id": workspace_id,
+                "status": "ready",
+                "ready_path": str(ready_path),
+                "input_digest": manifest["input_digest"],
+                "revision": ready_revision,
+            }
+
+    def _workspace_abort(self, store: Any, params: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = params["workspace_id"]
+        transfer = store.get_workspace_transfer(workspace_id)
+        if transfer is None:
+            raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown workspace: {workspace_id}")
+        if transfer["attached_session_id"] is not None:
+            raise peer_error(PeerErrorCode.WORKSPACE_ALREADY_ATTACHED, "workspace is already attached")
+        revision = store.update_workspace_transfer_status(
+            workspace_id, "aborted", params["expected_revision"], error=params["reason"],
+        )
+        self._remove_workspace(transfer)
+        self._advance_workspace_commit(
+            store, f"peer.workspace:abort:{workspace_id}:{revision}",
+        )
+        return {
+            "action": "abort",
+            "workspace_id": workspace_id,
+            "status": "aborted",
+            "revision": revision,
+        }
+
+    def _remove_workspace(self, transfer: dict[str, Any]) -> None:
+        workspace_id = transfer["workspace_id"]
+        path = Path(transfer.get("ready_path") or self._workspace_path(workspace_id))
+        if transfer["delivery_mode"] == "patch" and transfer.get("project_root"):
+            try:
+                workspace_git(transfer["project_root"], "worktree", "remove", "--force", str(path))
+            except BridgeError:
+                pass
+            try:
+                workspace_git(transfer["project_root"], "worktree", "prune")
+            except BridgeError:
+                pass
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+
+    @staticmethod
+    def _safe_workspace_file(root: Path, name: str, *, create_parents: bool) -> Path:
+        validate_manifest_path(name)
+        current = Path(root)
+        parts = name.split("/")
+        for part in parts[:-1]:
+            current = current / part
+            if current.is_symlink():
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace path traverses a symlink")
+            if create_parents:
+                current.mkdir(parents=True, exist_ok=True, mode=0o700)
+            elif not current.is_dir():
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace path has a missing parent")
+        target = current / parts[-1]
+        if target.is_symlink():
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace path is a symlink")
+        return target
+
+    def _workspace_blob_bytes(self, store: Any, entry: dict[str, Any]) -> bytes:
+        digest = entry["sha256"]
+        size = entry["size"]
+        if size == 0:
+            data = b""
+        else:
+            blob = store.get_workspace_blob(digest)
+            if blob is None:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, f"Missing workspace blob: {digest}")
+            data = self._read_bytes(blob["stored_path"])
+            if blob["size"] != size:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace blob size mismatch")
+        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace blob digest mismatch")
+        return data
+
+    def _write_workspace_file(self, root: Path, name: str, data: bytes, mode: int) -> None:
+        target = self._safe_workspace_file(root, name, create_parents=True)
+        self._write_bytes_atomic(target, data)
+        target.chmod(mode)
+
+    def _verify_workspace_before(self, root: Path, entry: dict[str, Any]) -> None:
+        target = self._safe_workspace_file(root, entry["path"], create_parents=False)
+        before = entry.get("before_sha256")
+        if entry["op"] == "put" and before is None:
+            if target.exists():
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace base unexpectedly contains a new file")
+            return
+        if before is None:
+            return
+        if not target.is_file() or target.is_symlink():
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace base file is missing")
+        if hashlib.sha256(target.read_bytes()).hexdigest() != before:
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace base file digest mismatch")
+
+    def _normalize_workspace_modes(self, workspace_path: Path, commit: str) -> None:
+        """Give checked-out base files the 0644/0755 modes recorded in Git, independent of the process umask."""
+        output = workspace_git(workspace_path, "ls-tree", "-r", "-z", "--full-tree", commit)
+        for record in output.split(b"\0"):
+            if not record:
+                continue
+            meta, raw_path = record.split(b"\t", 1)
+            mode, kind, _ = meta.split(b" ")
+            if kind != b"blob" or mode not in {b"100644", b"100755"}:
+                continue
+            target = Path(workspace_path) / raw_path.decode("utf-8")
+            if target.is_symlink() or not target.is_file():
+                continue
+            target.chmod(0o755 if mode == b"100755" else 0o644)
+
+    def _build_workspace(self, transfer: dict[str, Any], manifest: dict[str, Any]) -> Path:
+        store = self._require_store(self._store)
+        workspace_path = self._workspace_path(transfer["workspace_id"])
+        if manifest["delivery_mode"] == "patch":
+            source_commit = manifest["source_base_commit"]
+            if not source_commit:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "patch delivery has no base commit")
+            project_root = transfer["project_root"]
+            if not self._git_commit_exists(project_root, source_commit):
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "base commit is not available in the project")
+            self._remove_workspace(transfer)
+            workspace_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            workspace_git(project_root, "worktree", "add", "--detach", str(workspace_path), source_commit)
+            self._normalize_workspace_modes(workspace_path, source_commit)
+            for entry in manifest["files"]:
+                self._verify_workspace_before(workspace_path, entry)
+                if entry["op"] == "delete":
+                    target = self._safe_workspace_file(workspace_path, entry["path"], create_parents=False)
+                    target.unlink(missing_ok=True)
+                else:
+                    data = self._workspace_blob_bytes(store, entry)
+                    self._write_workspace_file(workspace_path, entry["path"], data, entry["mode"])
+            if manifest["files"]:
+                paths = [entry["path"] for entry in manifest["files"]]
+                workspace_git(workspace_path, "add", "-A", "-f", "--", *paths)
+            tree = workspace_git(workspace_path, "write-tree").decode().strip()
+            workspace_git(
+                workspace_path, "update-ref", self._workspace_snapshot_ref(transfer["workspace_id"]), tree,
+            )
+            return workspace_path
+
+        self._remove_workspace(transfer)
+        workspace_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for entry in manifest["files"]:
+            if entry["op"] != "put":
+                continue
+            data = self._workspace_blob_bytes(store, entry)
+            self._write_workspace_file(workspace_path, entry["path"], data, entry["mode"])
+        workspace_git(workspace_path, "init", "-q")
+        workspace_git(workspace_path, "add", "-A", "-f")
+        workspace_git(
+            workspace_path,
+            "-c", "user.name=agent-bridge",
+            "-c", "user.email=agent-bridge@localhost",
+            "commit", "--allow-empty", "--no-gpg-sign", "-q", "-m", "Workspace input",
+        )
+        return workspace_path
+
+    def _workspace_digest(self, root: Path) -> str:
+        entries: list[dict[str, Any]] = []
+        for directory, directories, filenames in os.walk(root):
+            current = Path(directory)
+            if current == root:
+                directories[:] = [name for name in directories if name != ".git"]
+            for name in filenames:
+                if current == root and name == ".git":
+                    continue
+                path = current / name
+                info = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+                    raise peer_error(
+                        PeerErrorCode.WORKSPACE_CONFLICT,
+                        "workspace contains a non-regular file",
+                    )
+                mode = stat.S_IMODE(info.st_mode)
+                if mode & ~0o777:
+                    raise peer_error(
+                        PeerErrorCode.WORKSPACE_CONFLICT,
+                        "workspace file has unsupported permission bits",
+                    )
+                relative = path.relative_to(root).as_posix()
+                validate_manifest_path(relative)
+                content = path.read_bytes()
+                entries.append({
+                    "path": relative,
+                    "op": "put",
+                    "size": len(content),
+                    "before_sha256": None,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "mode": mode,
+                })
+        return compute_input_digest(entries)
+
     def _profile_from_open(self, spec: dict[str, Any]) -> Profile:
         raw = spec.get("profile")
         if isinstance(raw, dict):
@@ -566,6 +1275,52 @@ class DirectPeerService:
                 return profiles[raw]
             raise BridgeError("unknown_profile", raw)
         raise peer_error(PeerErrorCode.INVALID_PARAMS, "A bridge delivery without a session_id requires open.profile")
+
+    def _workspace_ref_metadata(self, db: Any, value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(value, dict):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "open.workspace_ref must be an object")
+        workspace_id = value.get("workspace_id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "open.workspace_ref.workspace_id is required")
+        self._safe_workspace_id(workspace_id)
+        digests = {}
+        for name in ("manifest_sha256", "input_digest"):
+            digest = value.get(name)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise peer_error(PeerErrorCode.INVALID_PARAMS, f"open.workspace_ref.{name} must be a SHA-256 digest")
+            digests[name] = digest
+        row = db.execute(
+            "SELECT * FROM workspace_transfers WHERE workspace_id=?", (workspace_id,),
+        ).fetchone()
+        if row is None:
+            raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown workspace: {workspace_id}")
+        transfer = self._store._workspace_transfer_row(row)
+        if transfer["attached_session_id"] is not None or transfer["status"] == "attached":
+            raise peer_error(PeerErrorCode.WORKSPACE_ALREADY_ATTACHED, "workspace is already attached")
+        if transfer["status"] != "ready":
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace is not ready")
+        if (
+            transfer["manifest_sha256"] != digests["manifest_sha256"]
+            or transfer["input_digest"] != digests["input_digest"]
+        ):
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace_ref does not match the ready transfer")
+        self._check_project_config(transfer)
+        ready_path = transfer.get("ready_path")
+        if not isinstance(ready_path, str) or not Path(ready_path).is_dir():
+            raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace ready path is unavailable")
+        metadata = {
+            "kind": "git",
+            "workspace_id": workspace_id,
+            "manifest_sha256": transfer["manifest_sha256"],
+            "input_digest": transfer["input_digest"],
+            "source_base_commit": transfer["source_base_commit"],
+            "snapshot_tree": self._workspace_snapshot_tree(transfer),
+        }
+        return transfer, metadata
 
     def _deliver(self, params: dict[str, Any]) -> dict[str, Any]:
         store = self._require_store(self._store)
@@ -749,8 +1504,24 @@ class DirectPeerService:
                         cwd = "."
                     access = open_spec.get("access") or "read-only"
                     workspace = open_spec.get("workspace")
+                    workspace_ref = open_spec.get("workspace_ref")
+                    if workspace_ref is not None:
+                        if access != "workspace-write":
+                            raise peer_error(
+                                PeerErrorCode.INVALID_PARAMS,
+                                "open.workspace_ref requires access=workspace-write",
+                            )
+                        if workspace is not None:
+                            raise peer_error(
+                                PeerErrorCode.INVALID_PARAMS,
+                                "open.workspace and open.workspace_ref are mutually exclusive",
+                            )
+                        transfer, workspace = self._workspace_ref_metadata(db, workspace_ref)
+                        cwd = transfer["ready_path"]
                     session_name = validate_session_name(open_spec.get("name"))
                     session_id, _ = store.create_session(db, profile, cwd, access, None, workspace, session_name)
+                    if workspace_ref is not None:
+                        store.attach_workspace_transfer(workspace_ref["workspace_id"], session_id, db=db)
                 if message.strip():
                     queued = store.enqueue_task(
                         db,
