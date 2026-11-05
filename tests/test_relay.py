@@ -83,6 +83,7 @@ class DirectPeerServiceTests(unittest.IsolatedAsyncioTestCase):
                 "peer.cancel",
                 "peer.result",
                 "peer.events",
+                "peer.resolve_delivery",
                 "groups_v1",
                 "ordered_delivery_v1",
                 "member_outbox_v1",

@@ -217,7 +217,9 @@ def view(store, broadcast_id):
                 delivery = db.execute(
                     "SELECT status,receipt,native_turn_id,processing_status,error FROM native_broadcast_deliveries WHERE id=?", (member["delivery_id"],),
                 ).fetchone()
-                member.update(dict(delivery))
+                # Remote deliveries live in peer_outbox/scheduler state, not the legacy native table.
+                if delivery is not None:
+                    member.update(dict(delivery))
             elif "task_id" in member:
                 task = db.execute("SELECT status FROM tasks WHERE id=?", (member["task_id"],)).fetchone()
                 member["status"] = task["status"]

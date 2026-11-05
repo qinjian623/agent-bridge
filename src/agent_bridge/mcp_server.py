@@ -31,12 +31,14 @@ def server(state):
     @mcp.tool()
     async def agent_group(
         group_id: str, action: str, expected_revision: int, request_id: str, session_ids: list[str] | None = None,
-        native_members: list[dict] | None = None,
+        native_members: list[dict] | None = None, remote_members: list[dict] | None = None,
     ) -> dict:
-        """Create/add/remove/delete a group. session_ids are existing bridge IDs. native_members register existing native sessions as {runtime, native_id, cwd, label}; remove only needs runtime/native_id. Registration never starts a session. Codex uses its native queue; Antigravity restores the original session when completely closed and waits while any original or unidentified instance is active. Create requires revision 0; other changes use the inspected revision. Delete retires the ID but never cancels queued tasks/messages."""
+        """Create/add/remove/delete a group. session_ids are existing bridge IDs. native_members register existing native sessions as {runtime, native_id, cwd, label}; remove only needs runtime/native_id. remote_members register execution-node targets as {host_id, target_kind, session_id|runtime+native_id, cwd, label}; node identity is resolved from the registered host and must match when supplied. Registration never starts a session. Codex uses its native queue; Antigravity restores the original session when completely closed and waits while any original or unidentified instance is active. Create requires revision 0; other changes use the inspected revision. Delete retires the ID but never cancels queued tasks/messages."""
         params = locals()
         if native_members is None:
             params.pop("native_members")
+        if remote_members is None:
+            params.pop("remote_members")
         return await request(state, "agent_group", params)
 
     @mcp.tool()
@@ -55,6 +57,14 @@ def server(state):
     async def agent_group_inbox(group_id: str, runtime: str, native_id: str, after: int = 0, limit: int = 10) -> dict:
         """Read saved broadcasts addressed to one current native member of an explicit group. Antigravity can pull messages here even when push delivery was skipped. Does not start/resume/interrupt any session or mark messages received. A coordinator reading on behalf of a target is not native receipt. Remember cursor and pass it as after to avoid reading old messages again; has_more indicates another page. Requires normal bridge management access."""
         return await request(state, "agent_group_inbox", locals())
+
+    @mcp.tool()
+    async def agent_delivery_resolve(
+        delivery_id: str, resolution: str, evidence: str, expected_revision: int,
+        expected_delivery_revision: int, expected_remote_revision: int, request_id: str,
+    ) -> dict:
+        """Administrator-only repair for an uncertain head of a remote broadcast stream. resolution=received records that the execution node already has the delivery; resolution=not_received cancels that original sequence and never resends it. evidence must be non-empty (at most 16 KiB) and name what was inspected plus the conclusion. All three revisions are required: the group revision, this delivery's peer_outbox revision, and the execution node's inspection revision. Offline peers return resolving and keep later messages blocked."""
+        return await request(state, "agent_delivery_resolve", locals())
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True))
     async def agent_catalog(refresh: bool = False, profile: str | None = None, host_id: str | None = None) -> dict:

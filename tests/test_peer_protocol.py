@@ -77,7 +77,7 @@ class PeerProtocolContract(unittest.TestCase):
         ))
 
     def test_unimplemented_phase_c_methods_are_rejected_by_service(self):
-        for name in ("peer.workspace", "peer.resolve_delivery"):
+        for name in ("peer.workspace",):
             service = peer_api.DirectPeerService(None)  # type: ignore[arg-type]
             response = asyncio.run(service.handle({"v": 1, "id": "1", "method": name, "params": {}}))
             self.assertEqual(response["error"]["code"], PeerErrorCode.NOT_IMPLEMENTED)

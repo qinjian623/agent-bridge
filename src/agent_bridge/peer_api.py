@@ -8,7 +8,7 @@ import sqlite3
 import time
 from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
-from . import __version__
+from . import __version__, groups
 from .config import Profile
 from .errors import BridgeError
 from .node_identity import NodeIdentityStore
@@ -18,6 +18,7 @@ from .peer_protocol import (
     MAX_PAGE_LIMIT,
     PROTOCOL_VERSION,
     ArtifactRef,
+    DeliverySource,
     HelloResult,
     NodeRef,
     NodeState,
@@ -27,13 +28,14 @@ from .peer_protocol import (
     PeerRequest,
     PeerResponse,
     RemoteMember,  # noqa: F401  re-exported so peer_api.RemoteMember is the peer_protocol type
+    canonical_operation_id,
     fail,
     negotiate_version,
     ok,
     peer_error,
     require_method,
 )
-from .store import encode, validate_session_name
+from .store import encode, identifier, validate_session_name
 
 # ---------------------------------------------------------------- MCP tool parameter contracts
 
@@ -85,6 +87,15 @@ class RemoteOpenFields(TypedDict):
 
 
 CATALOG_HOST_FIELDS = ("host_id", "stale", "fetched_at")  # added to every agent_catalog entry; param: host_id|None
+
+
+def _decode_json(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
 
 
 # ---------------------------------------------------------------- coordinator components
@@ -150,6 +161,7 @@ IMPLEMENTED_PEER_METHODS = (
     "peer.cancel",
     "peer.result",
     "peer.events",
+    "peer.resolve_delivery",
 )
 
 
@@ -209,6 +221,8 @@ class DirectPeerService:
                 result = self._result(params)
             elif spec.name == "peer.events":
                 result = self._events(params)
+            elif spec.name == "peer.resolve_delivery":
+                result = self._resolve_delivery(params)
             else:
                 raise peer_error(
                     PeerErrorCode.NOT_IMPLEMENTED,
@@ -414,6 +428,25 @@ class DirectPeerService:
             reservation = 0
         if type(reservation) is not int or reservation < 0:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "reservation must be a non-negative integer")
+        ordering_mode = params.get("ordering_mode", "legacy")
+        if ordering_mode not in {"legacy", "bootstrap", "ordered"}:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "ordering_mode must be legacy, bootstrap or ordered")
+        stream_id = params.get("stream_id")
+        authority_ref = params.get("authority_ref")
+        target_runtime = target.get("runtime", "")
+        if kind == "bridge":
+            if target_runtime not in ("", None):
+                raise peer_error(PeerErrorCode.INVALID_PARAMS, "bridge target runtime must be empty")
+            target_runtime = ""
+        elif target_runtime not in ("codex", "antigravity"):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "native target runtime must be codex or antigravity")
+        if ordering_mode == "ordered":
+            if not isinstance(stream_id, str) or not stream_id:
+                raise peer_error(PeerErrorCode.INVALID_PARAMS, "ordered delivery requires stream_id")
+            if target_seq < 1:
+                raise peer_error(PeerErrorCode.INVALID_PARAMS, "ordered delivery requires target_seq >= 1")
+            if not isinstance(authority_ref, dict):
+                raise peer_error(PeerErrorCode.INVALID_PARAMS, "ordered delivery requires authority_ref")
 
         fingerprint = self._fingerprint("peer.deliver", params)
         accepted_at = time.time()
@@ -446,10 +479,40 @@ class DirectPeerService:
             )
             inbox = db.execute("SELECT * FROM peer_inbox WHERE delivery_id=?", (delivery_id,)).fetchone()
             if inbox is None:
+                if ordering_mode == "ordered":
+                    incoming = db.execute(
+                        "SELECT admitted_seq FROM incoming_streams WHERE stream_id=?", (stream_id,)
+                    ).fetchone()
+                    if incoming is None:
+                        if target_seq != 1:
+                            raise peer_error(
+                                PeerErrorCode.SEQUENCE_GAP,
+                                f"target_seq {target_seq} arrived before sequence 1",
+                            )
+                        local_target = {
+                            "host_id": self._host_id, "node_id": identity.node_id,
+                            "state_generation": identity.state_generation, "kind": kind,
+                            "runtime": target_runtime, "target_id": target_id,
+                        }
+                        db.execute(
+                            "INSERT INTO incoming_streams(stream_id,authority_ref,target_ref,admitted_seq) "
+                            "VALUES(?,?,?,?)",
+                            (stream_id, encode(authority_ref), encode(local_target), target_seq),
+                        )
+                    else:
+                        if target_seq != incoming["admitted_seq"] + 1:
+                            raise peer_error(
+                                PeerErrorCode.SEQUENCE_GAP,
+                                f"target_seq {target_seq} does not follow {incoming['admitted_seq']}",
+                            )
+                        db.execute(
+                            "UPDATE incoming_streams SET admitted_seq=? WHERE stream_id=?",
+                            (target_seq, stream_id),
+                        )
                 try:
                     db.execute(
-                        "INSERT INTO peer_inbox(delivery_id,host_id,node_id,state_generation,target_seq,seq_kind,operation_id,payload,status,receipt,created) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO peer_inbox(delivery_id,host_id,node_id,state_generation,target_seq,seq_kind,operation_id,payload,status,receipt,created,ordering_mode,stream_id,authority_ref,target_kind,runtime,target_id,revision) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             delivery_id,
                             self._host_id,
@@ -462,6 +525,13 @@ class DirectPeerService:
                             "cancelled" if seq_kind == "tombstone" else "received",
                             encode({"accepted_at": accepted_at}),
                             accepted_at,
+                            ordering_mode,
+                            stream_id,
+                            encode(authority_ref) if authority_ref is not None else None,
+                            kind,
+                            target_runtime,
+                            target_id,
+                            0,
                         ),
                     )
                 except sqlite3.IntegrityError as error:
@@ -478,6 +548,7 @@ class DirectPeerService:
             task_id: str | None = None
             session_id: str | None = None
             session_name: str | None = None
+            send_status: str | None = None
             status = "accepted_remote"
             if seq_kind == "tombstone":
                 status = "cancelled"
@@ -518,6 +589,40 @@ class DirectPeerService:
                         },
                     )
                     task_id = queued["task_id"]
+            elif kind == "native":
+                if not target_id:
+                    raise peer_error(PeerErrorCode.INVALID_PARAMS, "native delivery requires target.id")
+                if db.execute("SELECT 1 FROM sessions WHERE native_id=?", (target_id,)).fetchone():
+                    raise BridgeError(
+                        "native_owned_by_bridge", "Use the existing bridge session for this native session"
+                    )
+                queue = db.execute(
+                    "SELECT * FROM native_send_queue WHERE delivery_source=? AND delivery_id=?",
+                    (DeliverySource.PEER_DELIVER, delivery_id),
+                ).fetchone()
+                if seq_kind == "tombstone":
+                    if queue is not None:
+                        if queue["status"] in {"pending", "sending", "uncertain"}:
+                            queue = store.update_native_send(
+                                queue["id"], "cancelled",
+                                receipt=encode({"cancelled_at": accepted_at, "resolution": "not_received"}),
+                                db=db,
+                            )
+                        elif queue["status"] != "cancelled":
+                            raise peer_error(
+                                PeerErrorCode.DELIVERY_BLOCKED,
+                                f"native delivery is already {queue['status']}; cannot cancel it",
+                            )
+                        send_status = queue["status"]
+                    status = "cancelled"
+                else:
+                    if queue is None:
+                        queue = store.enqueue_native_send(
+                            target_runtime, target_id, DeliverySource.PEER_DELIVER,
+                            delivery_id, message, db=db,
+                        )
+                    send_status = queue["status"]
+                    status = "accepted_remote"
             result: dict[str, Any] = {
                 "delivery_id": delivery_id,
                 "accepted": True,
@@ -527,6 +632,8 @@ class DirectPeerService:
                 "receipt": {"accepted_at": accepted_at},
                 "status": status,
             }
+            if send_status is not None:
+                result["send_status"] = send_status
             if session_name is not None:
                 result["name"] = session_name
             db.execute(
@@ -663,6 +770,144 @@ class DirectPeerService:
         store.update_operation(operation["operation_id"], status="completed", result=result)
         return result
 
+    def _resolve_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
+        store = self._require_store(self._store)
+        operation = self._operation_key(params)
+        identity = self._ready_identity()
+        self._check_operation_identity(operation, identity)
+        delivery_id = self._required_string(params, "delivery_id")
+        resolution = params.get("resolution")
+        if resolution not in {"received", "not_received"}:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "resolution must be received or not_received")
+        evidence = params.get("evidence")
+        if not isinstance(evidence, str):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "evidence must be a string")
+        evidence = evidence.strip()
+        if not evidence:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "evidence must not be empty")
+        if len(evidence.encode("utf-8")) > 16 * 1024:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "evidence must be at most 16 KiB")
+        expected_revision = params.get("expected_delivery_revision")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "expected_delivery_revision must be a non-negative integer")
+        fingerprint = self._fingerprint("peer.resolve_delivery", params)
+        resolved_at = time.time()
+        with store.connection(write=True) as db:
+            existing = db.execute(
+                "SELECT * FROM peer_operations WHERE operation_id=?", (operation["operation_id"],)
+            ).fetchone()
+            if existing is not None:
+                current = store._peer_operation(existing)
+                if current["fingerprint"] != fingerprint:
+                    raise peer_error(
+                        PeerErrorCode.OPERATION_CONFLICT,
+                        "operation_id was already used with different resolution parameters",
+                    )
+                return self._operation_outcome(current)
+            db.execute(
+                "INSERT INTO peer_operations(operation_id,node_id,state_generation,fingerprint,method,params,status,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    operation["operation_id"], identity.node_id, identity.state_generation, fingerprint,
+                    "peer.resolve_delivery", encode(params), "running", resolved_at, resolved_at,
+                ),
+            )
+            inbox = db.execute("SELECT * FROM peer_inbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            if inbox is None:
+                if resolution == "received":
+                    raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown delivery: {delivery_id}")
+                if expected_revision != 0:
+                    raise peer_error(
+                        PeerErrorCode.REVISION_CONFLICT,
+                        f"Delivery revision {expected_revision} does not match the absent inbox row",
+                    )
+                result: dict[str, Any] = {
+                    "delivery_id": delivery_id,
+                    "status": "cancelled",
+                    "delivery_revision": 0,
+                    "receipt": encode({"cancelled_at": resolved_at, "resolution": "not_received"}),
+                }
+            else:
+                if inbox["revision"] != expected_revision:
+                    raise peer_error(
+                        PeerErrorCode.REVISION_CONFLICT,
+                        f"Delivery revision changed: expected {expected_revision}, found {inbox['revision']}",
+                    )
+                queue = db.execute(
+                    "SELECT * FROM native_send_queue WHERE delivery_source=? AND delivery_id=?",
+                    (DeliverySource.PEER_DELIVER, delivery_id),
+                ).fetchone()
+                if resolution == "received":
+                    if inbox["seq_kind"] == "tombstone" or inbox["status"] == "cancelled":
+                        raise peer_error(
+                            PeerErrorCode.OPERATION_CONFLICT,
+                            "The execution node already recorded this delivery as cancelled",
+                        )
+                    if queue is not None:
+                        if queue["status"] in {"cancelled", "failed"}:
+                            raise peer_error(
+                                PeerErrorCode.OPERATION_CONFLICT,
+                                f"Native queue already recorded {queue['status']} for this delivery",
+                            )
+                        if queue["status"] not in {"received", "enqueued"}:
+                            queue = store.update_native_send(
+                                queue["id"], "received",
+                                receipt=encode({"received_at": resolved_at, "resolution": "received"}),
+                                processing_status=queue["processing_status"], db=db,
+                            )
+                    receipt = encode({"received_at": resolved_at, "resolution": "received"})
+                    final_status = "received"
+                else:
+                    if queue is not None and queue["status"] in {"enqueued", "received"}:
+                        raise peer_error(
+                            PeerErrorCode.OPERATION_CONFLICT,
+                            f"Native queue already recorded {queue['status']} for this delivery",
+                        )
+                    if inbox["seq_kind"] != "tombstone" and inbox["status"] == "received":
+                        delivered = db.execute(
+                            "SELECT result FROM peer_operations WHERE operation_id=?",
+                            (inbox["operation_id"],),
+                        ).fetchone()
+                        delivered_result = _decode_json(delivered["result"]) if delivered is not None else None
+                        task_id = delivered_result.get("task_id") if isinstance(delivered_result, dict) else None
+                        if isinstance(task_id, str) and db.execute(
+                            "SELECT 1 FROM tasks WHERE id=?", (task_id,)
+                        ).fetchone():
+                            raise peer_error(
+                                PeerErrorCode.OPERATION_CONFLICT,
+                                "The execution node already has a queued task for this delivery",
+                            )
+                    if queue is not None and queue["status"] in {"pending", "sending", "uncertain"}:
+                        store.update_native_send(
+                            queue["id"], "cancelled",
+                            receipt=encode({"cancelled_at": resolved_at, "resolution": "not_received"}),
+                            db=db,
+                        )
+                    receipt = encode({"cancelled_at": resolved_at, "resolution": "not_received"})
+                    final_status = "cancelled"
+                revision = inbox["revision"] + 1
+                db.execute(
+                    "UPDATE peer_inbox SET status=?,receipt=?,revision=? WHERE delivery_id=?",
+                    (final_status, receipt, revision, delivery_id),
+                )
+                result = {
+                    "delivery_id": delivery_id,
+                    "status": final_status,
+                    "delivery_revision": revision,
+                    "receipt": receipt,
+                }
+            cursor = db.execute(
+                "INSERT INTO peer_commit_log(mutation_key,method,created) VALUES(?,?,?)",
+                (f"peer.resolve_delivery:{operation['operation_id']}", "peer.resolve_delivery", resolved_at),
+            )
+            ack_seq = cursor.lastrowid
+            db.execute(
+                "UPDATE peer_operations SET status=?,result=?,updated=? WHERE operation_id=?",
+                ("completed", encode(result), time.time(), operation["operation_id"]),
+            )
+        self._identity.advance(ack_seq)
+        return result
+
     def _artifact_refs(self, task_id: str) -> list[dict[str, Any]]:
         store = self._require_store(self._store)
         with store.connection() as db:
@@ -763,3 +1008,349 @@ class DirectPeerService:
             )
         cursor = items[-1]["seq"] if items else after
         return {"items": items, "cursor": cursor, "has_more": has_more}
+
+
+# ---------------------------------------------------------------- coordinator manual resolution (design 3.8)
+
+_OFFLINE_RESOLUTION_CODES = {
+    str(PeerErrorCode.HOST_OFFLINE),
+    str(PeerErrorCode.HOST_UNKNOWN),
+    str(PeerErrorCode.IDENTITY_MISMATCH),
+    str(PeerErrorCode.STATE_CORRUPTED),
+    str(PeerErrorCode.OPERATION_PENDING),
+    str(PeerErrorCode.DELIVERY_UNCERTAIN),
+}
+
+
+def _resolution_response(db, resolution_row, outbox_row=None):
+    if outbox_row is None:
+        outbox_row = db.execute(
+            "SELECT status,revision FROM peer_outbox WHERE delivery_id=?", (resolution_row["delivery_id"],)
+        ).fetchone()
+    remote = _decode_json(resolution_row["remote_result"])
+    receipt = remote.get("receipt") if isinstance(remote, dict) else None
+    remote_revision = remote.get("delivery_revision") if isinstance(remote, dict) else None
+    if isinstance(remote_revision, bool) or not isinstance(remote_revision, int):
+        remote_revision = resolution_row["remote_revision"]
+    status = outbox_row["status"] if outbox_row is not None else resolution_row["resolution"]
+    response = {
+        "resolution_id": resolution_row["id"],
+        "status": status,
+        "delivery_id": resolution_row["delivery_id"],
+        "revision": outbox_row["revision"] if outbox_row is not None else resolution_row["delivery_revision"],
+        "remote_revision": remote_revision,
+    }
+    if receipt is not None:
+        response["receipt"] = _decode_json(receipt)
+    if status in {
+        str(PeerDeliveryStatus.UNCERTAIN), str(PeerDeliveryStatus.RESOLVING),
+        str(PeerDeliveryStatus.SENDING), str(PeerDeliveryStatus.WAITING_FOR_HOST),
+        str(PeerDeliveryStatus.PENDING), str(PeerDeliveryStatus.TOMBSTONE_PENDING),
+        str(PeerDeliveryStatus.ACCEPTED_REMOTE),
+    }:
+        response["blocked_by"] = status
+    return response
+
+
+def _resolution_client(peer_factory, host_id):
+    if peer_factory is None:
+        raise BridgeError(PeerErrorCode.HOST_UNKNOWN, "No peer client factory is configured")
+    if hasattr(peer_factory, "client"):
+        candidate = peer_factory.client(host_id)
+    elif callable(peer_factory):
+        candidate = peer_factory(host_id)
+    else:
+        candidate = peer_factory
+    if not hasattr(candidate, "resolve_delivery"):
+        raise BridgeError(PeerErrorCode.NOT_IMPLEMENTED, "The peer client cannot resolve deliveries")
+    return candidate
+
+
+async def resolve_delivery(
+    store,
+    peer_factory=None,
+    params: dict[str, Any] | None = None,
+    *,
+    delivery_id: str | None = None,
+    resolution: str | None = None,
+    evidence: str | None = None,
+    expected_revision: int | None = None,
+    expected_delivery_revision: int | None = None,
+    expected_remote_revision: int | None = None,
+    request_id: str | None = None,
+    actor: str = "admin",
+    admin: bool = True,
+    client=None,
+    **kwargs,
+):
+    """Record and deliver an evidence-based decision for an uncertain broadcast head.
+
+    The pending decision and the CAS to `resolving` commit before the network call. Only a positive remote
+    acknowledgement moves the coordinator delivery to `released`/`cancelled`; an offline or timed-out peer
+    leaves it `resolving` so the head continues to block later messages.
+    """
+    values = dict(params or {})
+    for key, value in (
+        ("delivery_id", delivery_id), ("resolution", resolution), ("evidence", evidence),
+        ("expected_revision", expected_revision),
+        ("expected_delivery_revision", expected_delivery_revision),
+        ("expected_remote_revision", expected_remote_revision), ("request_id", request_id),
+    ):
+        if value is not None:
+            values[key] = value
+    if client is not None and peer_factory is None:
+        peer_factory = client
+    if "is_admin" in kwargs:
+        admin = kwargs.pop("is_admin")
+    if kwargs:
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "Unknown resolve_delivery parameters")
+    if not admin:
+        raise BridgeError(PeerErrorCode.PERMISSION_DENIED, "Only an administrator can resolve a delivery")
+    if not isinstance(actor, str) or not actor.strip():
+        raise BridgeError(PeerErrorCode.PERMISSION_DENIED, "A non-empty administrator identity is required")
+    delivery_id = values.get("delivery_id")
+    if not isinstance(delivery_id, str) or not delivery_id:
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "delivery_id must be a non-empty string")
+    resolution = values.get("resolution")
+    if resolution not in {"received", "not_received"}:
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "resolution must be received or not_received")
+    evidence = values.get("evidence")
+    if not isinstance(evidence, str):
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "evidence must be a string")
+    evidence = evidence.strip()
+    if not evidence:
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "evidence must not be empty")
+    if len(evidence.encode("utf-8")) > 16 * 1024:
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "evidence must be at most 16 KiB")
+    for key in ("expected_revision", "expected_delivery_revision", "expected_remote_revision"):
+        value = values.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{key} must be a non-negative integer")
+    request_id = values.get("request_id")
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 200:
+        raise BridgeError("invalid_request_id", "A request_id of at most 200 characters is required")
+    expected_revision = values["expected_revision"]
+    expected_delivery_revision = values["expected_delivery_revision"]
+    expected_remote_revision = values["expected_remote_revision"]
+    normalized = {
+        "delivery_id": delivery_id, "resolution": resolution, "evidence": evidence,
+        "expected_revision": expected_revision,
+        "expected_delivery_revision": expected_delivery_revision,
+        "expected_remote_revision": expected_remote_revision,
+        "request_id": request_id, "actor": actor,
+    }
+    fingerprint = hashlib.sha256(encode(normalized).encode("utf-8")).hexdigest()
+
+    with store.connection(write=True) as db:
+        existing = db.execute(
+            "SELECT * FROM delivery_resolutions WHERE request_id=?", (request_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["fingerprint"] != fingerprint:
+                raise BridgeError(
+                    PeerErrorCode.OPERATION_CONFLICT,
+                    "request_id already represents a different resolution decision",
+                )
+            outbox = db.execute(
+                "SELECT * FROM peer_outbox WHERE delivery_id=?", (existing["delivery_id"],)
+            ).fetchone()
+            if outbox is None:
+                raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown delivery: {existing['delivery_id']}")
+            if outbox["status"] != str(PeerDeliveryStatus.RESOLVING) or existing["status"] not in {
+                "pending", "resolving",
+            }:
+                return _resolution_response(db, existing, outbox)
+            resolution_row = existing
+        else:
+            outbox = db.execute(
+                "SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)
+            ).fetchone()
+            if outbox is None:
+                raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown delivery: {delivery_id}")
+            if outbox["group_id"] is None:
+                raise BridgeError(
+                    PeerErrorCode.DELIVERY_BLOCKED,
+                    "agent_delivery_resolve only handles group broadcast deliveries",
+                )
+            group = db.execute("SELECT * FROM session_groups WHERE id=?", (outbox["group_id"],)).fetchone()
+            if group is None or group["deleted"]:
+                raise BridgeError("group_deleted", "This group was deleted")
+            if group["revision"] != expected_revision:
+                raise BridgeError(
+                    PeerErrorCode.REVISION_CONFLICT,
+                    "Group revision changed; inspect the group before resolving",
+                )
+            member = db.execute(
+                "SELECT 1 FROM remote_group_members WHERE group_id=? AND host_id=? AND node_id=? "
+                "AND state_generation=? AND target_kind=? AND runtime=? AND target_id=?",
+                (outbox["group_id"], outbox["host_id"], outbox["node_id"], outbox["state_generation"],
+                 outbox["target_kind"], outbox["runtime"], outbox["target_id"]),
+            ).fetchone()
+            if member is None:
+                raise BridgeError(
+                    PeerErrorCode.IDENTITY_MISMATCH,
+                    "The remote member identity changed after this broadcast",
+                )
+            if outbox["status"] != str(PeerDeliveryStatus.UNCERTAIN):
+                raise BridgeError(
+                    PeerErrorCode.DELIVERY_BLOCKED,
+                    f"Delivery is {outbox['status']}; only an uncertain head can be resolved",
+                )
+            if outbox["revision"] != expected_delivery_revision:
+                raise BridgeError(
+                    PeerErrorCode.REVISION_CONFLICT,
+                    "Delivery revision changed; inspect the delivery before resolving",
+                )
+            head = db.execute(
+                "SELECT MIN(target_seq) FROM peer_outbox WHERE stream_id=? "
+                "AND status NOT IN ('released','cancelled','failed')",
+                (outbox["stream_id"],),
+            ).fetchone()[0]
+            if head != outbox["target_seq"]:
+                raise BridgeError(
+                    PeerErrorCode.DELIVERY_BLOCKED,
+                    "This delivery is not the blocking head of its target stream",
+                )
+            changed = db.execute(
+                "UPDATE peer_outbox SET status='resolving',revision=revision+1,updated=? "
+                "WHERE delivery_id=? AND status='uncertain' AND revision=?",
+                (time.time(), delivery_id, expected_delivery_revision),
+            ).rowcount
+            if not changed:
+                raise BridgeError(
+                    PeerErrorCode.REVISION_CONFLICT,
+                    "Delivery changed while its resolution was being recorded",
+                )
+            resolution_id = identifier()
+            now = time.time()
+            db.execute(
+                "INSERT INTO delivery_resolutions(id,delivery_id,request_id,fingerprint,group_revision,"
+                "delivery_revision,remote_revision,request_json,resolution,evidence,actor,status,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (resolution_id, delivery_id, request_id, fingerprint, expected_revision,
+                 expected_delivery_revision, expected_remote_revision, encode(normalized), resolution,
+                 evidence, actor, "pending", now, now),
+            )
+            resolution_row = db.execute(
+                "SELECT * FROM delivery_resolutions WHERE id=?", (resolution_id,)
+            ).fetchone()
+            outbox = db.execute(
+                "SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)
+            ).fetchone()
+
+    payload = _decode_json(outbox["payload"])
+    authority = payload.get("authority_ref") if isinstance(payload, dict) else None
+    if not isinstance(authority, dict):
+        from .node_identity import FileNodeIdentityStore
+
+        authority = FileNodeIdentityStore(store.state).node_ref("local").as_dict()
+    operation_id = canonical_operation_id(
+        authority, outbox["state_generation"], "peer.resolve_delivery", resolution_row["id"],
+    )
+    remote_params = {
+        "operation": {
+            "node_id": outbox["node_id"],
+            "state_generation": outbox["state_generation"],
+            "operation_id": operation_id,
+        },
+        "delivery_id": delivery_id,
+        "resolution": resolution,
+        "evidence": evidence,
+        "expected_delivery_revision": expected_remote_revision,
+    }
+
+    def mark_pending():
+        with store.connection(write=True) as db:
+            db.execute(
+                "UPDATE delivery_resolutions SET status='resolving',updated=? WHERE id=?",
+                (time.time(), resolution_row["id"]),
+            )
+            refreshed = db.execute(
+                "SELECT * FROM delivery_resolutions WHERE id=?", (resolution_row["id"],)
+            ).fetchone()
+            current = db.execute(
+                "SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)
+            ).fetchone()
+            return _resolution_response(db, refreshed, current)
+
+    def restore_uncertain(error):
+        with store.connection(write=True) as db:
+            db.execute(
+                "UPDATE peer_outbox SET status='uncertain',revision=revision+1,error=?,updated=? "
+                "WHERE delivery_id=? AND status='resolving'",
+                (error, time.time(), delivery_id),
+            )
+            db.execute(
+                "UPDATE delivery_resolutions SET status='failed',remote_result=?,updated=? WHERE id=?",
+                (encode({"error": error}), time.time(), resolution_row["id"]),
+            )
+
+    try:
+        remote_result = await _resolution_client(peer_factory, outbox["host_id"]).resolve_delivery(remote_params)
+    except BridgeError as error:
+        if str(error.code) in _OFFLINE_RESOLUTION_CODES:
+            return mark_pending()
+        restore_uncertain(str(error))
+        raise
+    except (TimeoutError, ConnectionError, OSError):
+        return mark_pending()
+    if not isinstance(remote_result, dict):
+        restore_uncertain("The execution node returned an invalid resolution response")
+        raise BridgeError(PeerErrorCode.INVALID_PARAMS, "The execution node returned an invalid resolution response")
+
+    remote_status = remote_result.get("status")
+    if resolution == "received":
+        if remote_status not in {"received", "accepted_remote"}:
+            restore_uncertain(f"Remote reported {remote_status!r} instead of a receipt")
+            raise BridgeError(
+                PeerErrorCode.OPERATION_CONFLICT,
+                "The execution node has a contradictory delivery fact; inspect both sides",
+            )
+        final_status = str(PeerDeliveryStatus.RELEASED)
+    else:
+        if remote_status != "cancelled":
+            restore_uncertain(f"Remote reported {remote_status!r} instead of cancellation")
+            raise BridgeError(
+                PeerErrorCode.OPERATION_CONFLICT,
+                "The execution node has a contradictory delivery fact; inspect both sides",
+            )
+        final_status = str(PeerDeliveryStatus.CANCELLED)
+
+    receipt = remote_result.get("receipt")
+    encoded_receipt = receipt if isinstance(receipt, str) else (encode(receipt) if receipt is not None else None)
+    remote_revision = remote_result.get("delivery_revision", expected_remote_revision)
+    send_status = remote_result.get("send_status")
+    processing_status = remote_result.get("processing_status")
+    with store.connection(write=True) as db:
+        changed = db.execute(
+            "UPDATE peer_outbox SET status=?,receipt=COALESCE(?,receipt),send_status=?,processing_status=?,"
+            "error=NULL,revision=revision+1,updated=? WHERE delivery_id=? AND status='resolving'",
+            (final_status, encoded_receipt, send_status, processing_status, time.time(), delivery_id),
+        ).rowcount
+        if not changed:
+            raise BridgeError(
+                PeerErrorCode.REVISION_CONFLICT,
+                "Delivery changed while its resolution was in flight",
+            )
+        db.execute(
+            "UPDATE target_streams SET released_seq=MAX(released_seq,?) WHERE stream_id=?",
+            (outbox["target_seq"], outbox["stream_id"]),
+        )
+        groups.update_broadcast_recipient(
+            db, delivery_id, final_status,
+            send_status=send_status, processing_status=processing_status, error=None,
+        )
+        groups.settle_broadcast(db, outbox["broadcast_id"])
+        db.execute(
+            "UPDATE delivery_resolutions SET status='completed',remote_result=?,updated=? WHERE id=?",
+            (encode(remote_result), time.time(), resolution_row["id"]),
+        )
+        refreshed = db.execute(
+            "SELECT * FROM delivery_resolutions WHERE id=?", (resolution_row["id"],)
+        ).fetchone()
+        current = db.execute(
+            "SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)
+        ).fetchone()
+        response = _resolution_response(db, refreshed, current)
+    response["remote_revision"] = remote_revision
+    return response

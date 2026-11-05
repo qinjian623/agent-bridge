@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
 );
 CREATE TABLE IF NOT EXISTS session_groups (
  id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,
- deleted INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL
+ deleted INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL,
+ last_activity_at REAL
 );
 CREATE TABLE IF NOT EXISTS session_group_members (
  group_id TEXT NOT NULL REFERENCES session_groups(id), session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -302,6 +303,9 @@ class Store:
                 db.execute("UPDATE attempts SET reservation=(SELECT reservation FROM tasks WHERE id=attempts.task_id)")
             if "last_attempt" not in {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}:
                 db.execute("ALTER TABLE deliveries ADD COLUMN last_attempt REAL NOT NULL DEFAULT 0")
+            if "last_activity_at" not in {row[1] for row in db.execute("PRAGMA table_info(session_groups)")}:
+                db.execute("ALTER TABLE session_groups ADD COLUMN last_activity_at REAL")
+                db.execute("UPDATE session_groups SET last_activity_at=created")
             self._migrate_node_outbox(db)
             self._migrate_peer_inbox(db)
             self._migrate_native_send_queue(db)

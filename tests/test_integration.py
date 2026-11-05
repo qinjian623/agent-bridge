@@ -74,7 +74,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({"agent_catalog", "agent_open", "agent_dispatch", "agent_control", "agent_cancel",
                               "agent_inspect", "agent_wait", "agent_result", "agent_review", "agent_hosts",
                               "agent_monitor", "agent_operation",
-                              "agent_groups", "agent_group", "agent_broadcast", "agent_broadcast_status", "agent_group_inbox"}, {t.name for t in tools.tools})
+                              "agent_groups", "agent_group", "agent_broadcast", "agent_broadcast_status",
+                              "agent_group_inbox", "agent_delivery_resolve"}, {t.name for t in tools.tools})
             for name in ("agent_open", "agent_dispatch"):
                 self.assertIn("model", next(t for t in tools.tools if t.name == name).inputSchema["properties"])
             schema = next(t for t in tools.tools if t.name == "agent_dispatch").inputSchema["properties"]

@@ -17,12 +17,12 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from . import groups, native_broadcast
+from . import groups, native_broadcast, peer_api
 from .config import Config, Profile, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
-from .peer_protocol import PROTOCOL_VERSION, NodeRef, PeerErrorCode
+from .peer_protocol import PROTOCOL_VERSION, NodeRef, PeerDeliveryStatus, PeerErrorCode, canonical_operation_id
 from .peer_transport import DefaultPeerClientFactory
 from .routing import choose
 from .store import Store, encode, task_input, validate_session_name
@@ -32,6 +32,270 @@ from .workspace import directory_copy, worktree
 
 def unit_name(state, session_id):
     return "agent-bridge-" + hashlib.sha256(str(state).encode()).hexdigest()[:8] + "-" + session_id + ".service"
+
+
+_TERMINAL_PEER_STATUSES = (
+    str(PeerDeliveryStatus.RELEASED), str(PeerDeliveryStatus.CANCELLED), str(PeerDeliveryStatus.FAILED),
+)
+_HOST_BLOCKING_CODES = {
+    str(PeerErrorCode.HOST_OFFLINE), str(PeerErrorCode.HOST_UNKNOWN),
+    str(PeerErrorCode.IDENTITY_MISMATCH), str(PeerErrorCode.STATE_CORRUPTED),
+}
+
+
+class DeliveryScheduler:
+    """Two-layer ordered sender for coordinator `peer_outbox` rows (design 3.5).
+
+    One scheduler pass examines only the lowest non-terminal `target_seq` of each target stream. A head that is
+    already in flight (`sending`, `uncertain`, `waiting_for_host`, `tombstone_pending`, `resolving`) blocks every
+    later sequence for that target and is never skipped. Network I/O happens outside the CAS transaction.
+    """
+
+    def __init__(self, store, peer_factory=None, *, authority_ref=None, config=None):
+        self.store = store
+        self.peer_factory = peer_factory
+        self.authority_ref = authority_ref
+        self.config = config
+        self._stopping = asyncio.Event()
+
+    def _decode(self, value):
+        if value is None:
+            return {}
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+
+    def _authority(self, payload):
+        value = payload.get("authority_ref") if isinstance(payload, dict) else None
+        if isinstance(value, dict):
+            return value
+        return groups.resolve_authority_ref(self.store, self.authority_ref)
+
+    def _client(self, host_id):
+        if self.peer_factory is None:
+            raise BridgeError(PeerErrorCode.HOST_UNKNOWN, f"Host is not registered: {host_id}")
+        if hasattr(self.peer_factory, "client"):
+            return self.peer_factory.client(host_id)
+        if callable(self.peer_factory):
+            return self.peer_factory(host_id)
+        return self.peer_factory
+
+    def heads(self, host_id=None):
+        """Return the blocking head row of every target stream (optionally one host)."""
+        placeholders = ",".join("?" for _ in _TERMINAL_PEER_STATUSES)
+        sql = (
+            "SELECT o.* FROM peer_outbox o JOIN ("
+            "SELECT stream_id,MIN(target_seq) AS target_seq FROM peer_outbox "
+            f"WHERE status NOT IN ({placeholders}) GROUP BY stream_id"
+            ") h ON h.stream_id=o.stream_id AND h.target_seq=o.target_seq "
+            f"WHERE o.status NOT IN ({placeholders})"
+        )
+        values = [*_TERMINAL_PEER_STATUSES, *_TERMINAL_PEER_STATUSES]
+        if host_id is not None:
+            sql += " AND o.host_id=?"
+            values.append(host_id)
+        sql += " ORDER BY o.host_id,o.stream_id,o.target_seq"
+        with self.store.connection() as db:
+            return [dict(row) for row in db.execute(sql, values)]
+
+    def _claim(self, delivery_id):
+        with self.store.connection(write=True) as db:
+            row = db.execute("SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            if row is None or row["status"] not in {
+                str(PeerDeliveryStatus.PENDING), str(PeerDeliveryStatus.TOMBSTONE_PENDING),
+            }:
+                return None
+            changed = db.execute(
+                "UPDATE peer_outbox SET status='sending',last_attempt=?,revision=revision+1,updated=? "
+                "WHERE delivery_id=? AND status=?",
+                (time.time(), time.time(), delivery_id, row["status"]),
+            ).rowcount
+            if not changed:
+                return None
+            return dict(db.execute("SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)).fetchone())
+
+    def _deliver_params(self, outbox, payload):
+        target = {"kind": outbox["target_kind"], "id": outbox["target_id"]}
+        if outbox["target_kind"] == "native":
+            target["runtime"] = outbox["runtime"]
+        params = {
+            "operation": {
+                "node_id": outbox["node_id"],
+                "state_generation": outbox["state_generation"],
+                "operation_id": outbox["operation_id"],
+            },
+            "delivery_id": outbox["delivery_id"],
+            "group_id": outbox["group_id"] or "",
+            "broadcast_id": outbox["broadcast_id"] or "",
+            "target": target,
+            "target_seq": outbox["target_seq"],
+            "seq_kind": outbox["seq_kind"],
+            "expected_group_revision": outbox["group_revision"] or 0,
+            "ordering_mode": "ordered",
+            "stream_id": outbox["stream_id"],
+            "authority_ref": self._authority(payload),
+        }
+        if outbox["seq_kind"] == "message":
+            params["message"] = payload.get("message", "")
+            params["reservation"] = int(payload.get("reservation") or 0)
+        return params
+
+    def _finish(self, outbox, status, *, result=None, error=None, release=False):
+        receipt = None
+        send_status = None
+        processing_status = None
+        if isinstance(result, dict):
+            value = result.get("receipt")
+            if value is not None:
+                receipt = value if isinstance(value, str) else encode(value)
+            send_status = result.get("send_status")
+            processing_status = result.get("processing_status")
+        encoded_error = None
+        if error is not None:
+            encoded_error = error if isinstance(error, str) else encode(error)
+        with self.store.connection(write=True) as db:
+            db.execute(
+                "UPDATE peer_outbox SET status=?,receipt=COALESCE(?,receipt),send_status=?,"
+                "processing_status=?,error=?,revision=revision+1,updated=? WHERE delivery_id=?",
+                (status, receipt, send_status, processing_status, encoded_error, time.time(),
+                 outbox["delivery_id"]),
+            )
+            if release:
+                db.execute(
+                    "UPDATE target_streams SET released_seq=MAX(released_seq,?) WHERE stream_id=?",
+                    (outbox["target_seq"], outbox["stream_id"]),
+                )
+            groups.update_broadcast_recipient(
+                db, outbox["delivery_id"], status,
+                send_status=send_status, processing_status=processing_status, error=encoded_error,
+            )
+            if outbox["broadcast_id"]:
+                groups.settle_broadcast(db, outbox["broadcast_id"])
+            return dict(db.execute(
+                "SELECT * FROM peer_outbox WHERE delivery_id=?", (outbox["delivery_id"],)
+            ).fetchone())
+
+    async def _dispatch(self, outbox):
+        payload = self._decode(outbox["payload"])
+        params = self._deliver_params(outbox, payload)
+        try:
+            result = await self._client(outbox["host_id"]).deliver(params)
+        except BridgeError as error:
+            if str(error.code) in _HOST_BLOCKING_CODES:
+                return self._finish(outbox, str(PeerDeliveryStatus.WAITING_FOR_HOST), error=error.as_dict())
+            return self._finish(outbox, str(PeerDeliveryStatus.FAILED), error=error.as_dict())
+        except (TimeoutError, ConnectionError, OSError) as error:
+            return self._finish(outbox, str(PeerDeliveryStatus.UNCERTAIN), error=safe_error(error))
+        except Exception as error:
+            return self._finish(outbox, str(PeerDeliveryStatus.UNCERTAIN), error=safe_error(error))
+        if not isinstance(result, dict):
+            return self._finish(
+                outbox, str(PeerDeliveryStatus.UNCERTAIN),
+                error="The execution node returned an invalid delivery response",
+            )
+        remote_status = result.get("status")
+        if outbox["seq_kind"] == "tombstone" or remote_status == "cancelled":
+            return self._finish(
+                outbox, str(PeerDeliveryStatus.CANCELLED), result=result, release=True,
+            )
+        if remote_status == "uncertain" or remote_status == "sending":
+            return self._finish(outbox, str(PeerDeliveryStatus.UNCERTAIN), result=result)
+        if remote_status not in {"accepted_remote", "released", "received"}:
+            return self._finish(
+                outbox, str(PeerDeliveryStatus.FAILED),
+                result=result, error=f"Unexpected remote delivery status: {remote_status!r}",
+            )
+        if outbox["target_kind"] == "bridge":
+            # A bridge ACK means the task was committed to the remote durable queue: network order is safe.
+            return self._finish(
+                outbox, str(PeerDeliveryStatus.RELEASED), result=result, release=True,
+            )
+        # Native ACK only commits the send-queue row; the stream stays blocked until native receipt.
+        return self._finish(outbox, str(PeerDeliveryStatus.ACCEPTED_REMOTE), result=result)
+
+    async def step(self, host_id=None):
+        """Launch at most one pending head per target stream; blocked heads are left untouched."""
+        processed = []
+        for head in self.heads(host_id):
+            if head["status"] not in {
+                str(PeerDeliveryStatus.PENDING), str(PeerDeliveryStatus.TOMBSTONE_PENDING),
+            }:
+                continue
+            claimed = self._claim(head["delivery_id"])
+            if claimed is None:
+                continue
+            processed.append(await self._dispatch(claimed))
+        return processed
+
+    async def pump(self, host_id=None):
+        """Drain every runnable stream for one host (or all hosts) without crossing blocked heads."""
+        processed = []
+        while True:
+            rows = await self.step(host_id)
+            if not rows:
+                return processed
+            processed.extend(rows)
+
+    def cancel(self, delivery_id):
+        """Turn a still-pending logical message into a tombstone at its original target_seq."""
+        if not isinstance(delivery_id, str) or not delivery_id:
+            raise BridgeError("invalid_request", "delivery_id must be a non-empty string")
+        with self.store.connection(write=True) as db:
+            row = db.execute("SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)).fetchone()
+            if row is None:
+                raise BridgeError("not_found", f"peer_outbox: {delivery_id}")
+            if row["status"] in _TERMINAL_PEER_STATUSES:
+                return dict(row)
+            if row["status"] == str(PeerDeliveryStatus.TOMBSTONE_PENDING) or row["seq_kind"] == "tombstone":
+                return dict(row)
+            if row["status"] != str(PeerDeliveryStatus.PENDING):
+                raise BridgeError(
+                    PeerErrorCode.DELIVERY_BLOCKED,
+                    f"Delivery is {row['status']}; prove its outcome with lookup/resolve before cancelling",
+                )
+            payload = self._decode(row["payload"])
+            payload["seq_kind"] = "tombstone"
+            payload.pop("message", None)
+            payload.pop("reservation", None)
+            authority = self._authority(payload)
+            operation_id = canonical_operation_id(
+                authority, row["state_generation"], "peer.deliver", f"{delivery_id}:tombstone",
+            )
+            payload["operation_id"] = operation_id
+            fingerprint = hashlib.sha256(encode(payload).encode("utf-8")).hexdigest()
+            changed = db.execute(
+                "UPDATE peer_outbox SET status='tombstone_pending',seq_kind='tombstone',operation_id=?,"
+                "payload=?,fingerprint=?,cancel_requested=1,revision=revision+1,updated=? "
+                "WHERE delivery_id=? AND status='pending'",
+                (operation_id, encode(payload), fingerprint, time.time(), delivery_id),
+            ).rowcount
+            if not changed:
+                current = db.execute(
+                    "SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)
+                ).fetchone()
+                return dict(current)
+            groups.update_broadcast_recipient(db, delivery_id, str(PeerDeliveryStatus.TOMBSTONE_PENDING))
+            return dict(db.execute("SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)).fetchone())
+
+    def stop(self):
+        self._stopping.set()
+
+    async def resolve(self, params=None, **kwargs):
+        return await peer_api.resolve_delivery(self.store, self.peer_factory, params, **kwargs)
+
+    async def run(self):
+        while not self._stopping.is_set():
+            try:
+                await self.step()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self._stopping.wait(), 0.5)
+            except TimeoutError:
+                pass
 
 
 class Broker:
@@ -53,6 +317,7 @@ class Broker:
         self.launching = set()
         self.stopping = asyncio.Event()
         self.request_locks = {}
+        self.delivery_scheduler = DeliveryScheduler(self.store, self.peer_factory, config=self.config)
         with self.store.connection(write=True) as db:
             db.execute(
                 "UPDATE deliveries SET status='uncertain',error='Broker restarted before queue acknowledgement' WHERE status='sending'"
@@ -76,6 +341,11 @@ class Broker:
                 "WHERE status IN ('pending','sending') AND id IN ("
                 "SELECT delivery_id FROM native_send_queue WHERE delivery_source IN ('local_broadcast','native_broadcast') "
                 "AND status='uncertain' AND last_attempt>0)"
+            )
+            # ADR-05/3.5: an in-flight ordered network write is never retried until its outcome is proven.
+            db.execute(
+                "UPDATE peer_outbox SET status='uncertain',error='Broker restarted before peer acknowledgement' "
+                "WHERE status='sending'"
             )
 
     async def notifications(self):
@@ -224,6 +494,37 @@ class Broker:
         if not isinstance(node_id, str) or not node_id or not isinstance(generation, str) or not generation:
             raise BridgeError("invalid_request", "peer.hello returned an invalid node identity")
         return NodeRef(host_id, node_id, generation)
+
+    async def _resolve_remote_members(self, members):
+        """Fill omitted node_id/state_generation from the pinned or handshaken host identity.
+
+        Explicit values must match exactly; a mismatch is an identity change, not a member edit.
+        """
+        if not isinstance(members, list):
+            return members
+        resolved = []
+        cache = {}
+        for member in members:
+            if not isinstance(member, dict):
+                resolved.append(member)
+                continue
+            host_id = member.get("host_id")
+            if not isinstance(host_id, str) or not host_id:
+                resolved.append(member)
+                continue
+            node = cache.get(host_id)
+            if node is None:
+                node = await self._peer_node(host_id)
+                cache[host_id] = node
+            for field, actual in (("node_id", node.node_id), ("state_generation", node.state_generation)):
+                supplied = member.get(field)
+                if isinstance(supplied, str) and supplied and supplied != actual:
+                    raise BridgeError(
+                        PeerErrorCode.IDENTITY_MISMATCH,
+                        f"Remote member {field} does not match the registered identity of host {host_id}",
+                    )
+            resolved.append({**member, "node_id": node.node_id, "state_generation": node.state_generation})
+        return resolved
 
     @staticmethod
     def _stable_operation_id(host_id, method, request_id, params):
@@ -539,9 +840,12 @@ class Broker:
         if method == "agent_groups":
             return groups.inspect_groups(self.store, args.get("group_id"))
         if method == "agent_group":
+            remote_members = args.get("remote_members")
+            if remote_members is not None and args.get("action") in {"create", "add"}:
+                remote_members = await self._resolve_remote_members(remote_members)
             return groups.control_group(
                 self.store, args["group_id"], args["action"], args["expected_revision"],
-                args["request_id"], args.get("session_ids"), args.get("native_members"),
+                args["request_id"], args.get("session_ids"), args.get("native_members"), remote_members,
             )
         if method == "agent_broadcast":
             return groups.broadcast(
@@ -549,9 +853,19 @@ class Broker:
                 args["request_id"], args.get("reservation", 0), token_budget=self.config.token_budget,
             )
         if method == "agent_broadcast_status":
-            return await native_broadcast.inspect(
-                self.store, self.config, args["broadcast_id"], refresh=args.get("refresh", False),
-            )
+            broadcast_id = args["broadcast_id"]
+            with self.store.connection() as db:
+                unified = db.execute("SELECT 1 FROM group_broadcasts WHERE id=?", (broadcast_id,)).fetchone()
+            if unified is None:
+                return await native_broadcast.inspect(
+                    self.store, self.config, broadcast_id, refresh=args.get("refresh", False),
+                )
+            if args.get("refresh", False):
+                # Refresh only legacy native receipts; remote queue state belongs to the scheduler.
+                await native_broadcast.inspect(self.store, self.config, broadcast_id, refresh=True)
+            return groups.broadcast_status(self.store, broadcast_id)
+        if method == "agent_delivery_resolve":
+            return await peer_api.resolve_delivery(self.store, self.peer_factory, args)
         if method == "agent_group_inbox":
             return native_broadcast.inbox(
                 self.store, args["group_id"], args["runtime"], args["native_id"],
@@ -846,7 +1160,7 @@ class Broker:
         raise BridgeError("unknown_method", method)
 
     async def api_call(self, method, args):
-        if method not in {"agent_open", "agent_dispatch", "agent_control", "agent_cancel", "agent_review", "agent_group", "agent_broadcast"}:
+        if method not in {"agent_open", "agent_dispatch", "agent_control", "agent_cancel", "agent_review", "agent_group", "agent_broadcast", "agent_delivery_resolve"}:
             return {"result": await self.call(method, args)}
         if method in {"agent_open", "agent_dispatch"} and "name" in args:
             name = validate_session_name(args.get("name"))
@@ -927,6 +1241,7 @@ class Broker:
         scheduler = asyncio.create_task(self.scheduler())
         notifications = asyncio.create_task(self.notifications())
         native_notifications = asyncio.create_task(self.native_notifications())
+        delivery_scheduler = asyncio.create_task(self.delivery_scheduler.run())
         try:
             async with server:
                 await self.stopping.wait()
@@ -934,6 +1249,8 @@ class Broker:
             await scheduler
             await notifications
             await native_notifications
+            delivery_scheduler.cancel()
+            await asyncio.gather(delivery_scheduler, return_exceptions=True)
             path.unlink(missing_ok=True)
             lock.close()
 
