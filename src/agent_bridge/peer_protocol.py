@@ -362,16 +362,18 @@ class PullRequestsParams(TypedDict):
 
 class OutboxItem(TypedDict):
     operation_id: str
-    binding_id: str
-    request_id: str
+    binding_id: str | None
+    request_id: str | None
     method: str  # agent_broadcast | agent_group_inbox ... (member-role MCP methods only)
     payload: dict[str, Any]
     created: float
-    seq: NotRequired[int]  # node_outbox sequence
-    sender_ref: NotRequired[dict[str, str]]  # ObjectRef.as_dict() of the sending member
-    authority_ref: NotRequired[dict[str, str]]  # ObjectRef.as_dict() of the authorising object
-    authorization_revision: NotRequired[int]
-    fingerprint: NotRequired[str]
+    seq: int | None  # node_outbox sequence
+    sender_ref: dict[str, str] | None  # ObjectRef.as_dict() of the sending member
+    authority_ref: dict[str, str] | None  # ObjectRef.as_dict() of the authorising object
+    authorization_revision: int | None
+    fingerprint: str | None
+    group_id: str | None
+    native_id: str | None
 
 
 class PullRequestsResult(Page):
@@ -380,6 +382,7 @@ class PullRequestsResult(Page):
 
 
 class AckRequestParams(TypedDict):
+    operation: NotRequired[OperationKey]
     operation_id: str
     outcome: str  # accepted | rejected | failed
     result: dict[str, Any]
@@ -531,6 +534,120 @@ class NotifyParentParams(TypedDict):
 class NotifyParentResult(TypedDict):
     mirror_seq: int  # coordinator-local events.seq assigned after dedupe by (NodeRef, event.seq)
     duplicate: bool
+
+
+_OBJECT_REF_KEYS = ("host_id", "node_id", "state_generation", "local_id")
+
+
+def validate_object_ref(value: Any, name: str = "ref") -> dict[str, str]:
+    """Return a clean ObjectRef dict (host_id,node_id,state_generation,local_id) or raise INVALID_PARAMS."""
+    if not isinstance(value, dict):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} must be an object")
+    for key in _OBJECT_REF_KEYS:
+        item = value.get(key)
+        if not isinstance(item, str) or not item:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name}.{key} must be a non-empty string")
+    return {key: value[key] for key in _OBJECT_REF_KEYS}
+
+
+def _text(data: dict[str, Any], key: str, required: bool = True) -> str | None:
+    value = data.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{key} must be a non-empty string")
+    return value
+
+
+def _int(value: Any, name: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} must be a number")
+    return float(value)
+
+
+def _object(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{name} must be an object")
+    return value
+
+
+def _operation_key(value: Any) -> OperationKey:
+    value = _object(value, "operation")
+    return {
+        "node_id": _text(value, "node_id"),  # type: ignore[typeddict-item]
+        "state_generation": _text(value, "state_generation"),  # type: ignore[typeddict-item]
+        "operation_id": _text(value, "operation_id"),  # type: ignore[typeddict-item]
+    }
+
+
+def normalize_outbox_item(data: dict[str, Any]) -> OutboxItem:
+    data = _object(data, "outbox item")
+    revision = data.get("authorization_revision")
+    seq = data.get("seq")
+    return {
+        "operation_id": _text(data, "operation_id"),  # type: ignore[typeddict-item]
+        "binding_id": _text(data, "binding_id", False),
+        "request_id": _text(data, "request_id", False),
+        "method": _text(data, "method"),  # type: ignore[typeddict-item]
+        "payload": _object(data.get("payload"), "payload"),
+        "created": _number(data.get("created"), "created"),
+        "seq": None if seq is None else _int(seq, "seq", 1),
+        "sender_ref": None if data.get("sender_ref") is None else validate_object_ref(data["sender_ref"], "sender_ref"),
+        "authority_ref": (
+            None if data.get("authority_ref") is None else validate_object_ref(data["authority_ref"], "authority_ref")
+        ),
+        "authorization_revision": None if revision is None else _int(revision, "authorization_revision"),
+        "fingerprint": _text(data, "fingerprint", False),
+        "group_id": _text(data, "group_id", False),
+        "native_id": _text(data, "native_id", False),
+    }
+
+
+def normalize_ack_request_params(data: dict[str, Any]) -> AckRequestParams:
+    data = _object(data, "params")
+    params: AckRequestParams = {
+        "operation_id": _text(data, "operation_id"),  # type: ignore[typeddict-item]
+        "outcome": _text(data, "outcome"),  # type: ignore[typeddict-item]
+        "result": _object(data.get("result"), "result"),
+    }
+    if data.get("operation") is not None:
+        params["operation"] = _operation_key(data["operation"])
+    return params
+
+
+def _normalize_peer_event(value: Any) -> PeerEvent:
+    value = _object(value, "event")
+    return {
+        "seq": _int(value.get("seq"), "event.seq"),
+        "type": _text(value, "type"),  # type: ignore[typeddict-item]
+        "ref": validate_object_ref(value.get("ref"), "event.ref"),
+        "payload": _object(value.get("payload"), "event.payload"),
+        "created": _number(value.get("created"), "event.created"),
+    }
+
+
+def normalize_notify_parent_params(data: dict[str, Any]) -> NotifyParentParams:
+    data = _object(data, "params")
+    params: NotifyParentParams = {
+        "operation": _operation_key(data.get("operation")),
+        "parent_ref": validate_object_ref(data.get("parent_ref"), "parent_ref"),
+        "event": _normalize_peer_event(data.get("event")),
+    }
+    if data.get("result") is not None:
+        artifact = _object(data["result"], "result")
+        params["result"] = {
+            "host_id": _text(artifact, "host_id"),  # type: ignore[typeddict-item]
+            "artifact_id": _text(artifact, "artifact_id"),  # type: ignore[typeddict-item]
+            "sha256": _text(artifact, "sha256"),  # type: ignore[typeddict-item]
+            "size": _int(artifact.get("size"), "result.size"),
+        }
+    return params
 
 
 class WorkspaceParams(TypedDict):
