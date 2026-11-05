@@ -19,7 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import groups, native_broadcast, peer_api
-from .config import Config, Profile, safe_error
+from .config import Config, Profile, read_admin_token, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
@@ -880,7 +880,6 @@ class Broker:
             with token_path.open("x") as token_file:
                 token_file.write(secrets.token_urlsafe(32))
             token_path.chmod(0o600)
-        self.token = token_path.read_text().strip()
         self.launching = set()
         self.stopping = asyncio.Event()
         self.request_locks = {}
@@ -2237,6 +2236,14 @@ class Broker:
                 db.execute("UPDATE api_requests SET response=? WHERE id=?", (encode(response), key))
             return response
 
+    @property
+    def token(self) -> str:
+        """Current admin token, re-read from disk on every access so rotation applies immediately."""
+        try:
+            return read_admin_token(self.state)
+        except (BridgeError, ValueError) as error:
+            raise BridgeError("forbidden", "Management token is unavailable or insecure: " + safe_error(error)) from error
+
     async def connection(self, reader, writer):
         try:
             _, uid, _ = struct.unpack(
@@ -2258,7 +2265,8 @@ class Broker:
             writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode())
             await writer.drain()
         writer.close()
-        await writer.wait_closed()
+        with contextlib.suppress(ConnectionError):
+            await writer.wait_closed()
 
     async def serve(self):
         lock = (self.state / "broker.lock").open("a")
@@ -2298,7 +2306,7 @@ async def request(state: Path, method, params):
         raise BridgeError("forbidden", "Child runtimes may not administer parent or sibling sessions")
     reader, writer = await asyncio.open_unix_connection(str(state / "broker.sock"), limit=16 * 1024 * 1024)
     try:
-        token = os.environ.get("AGENT_BRIDGE_TOKEN") or (state / "admin.token").read_text().strip()
+        token = os.environ.get("AGENT_BRIDGE_TOKEN") or read_admin_token(state)
         params = {key: value for key, value in params.items() if key != "state"}
         writer.write((json.dumps({"version": 1, "token": token, "method": method, "params": params}) + "\n").encode())
         await writer.drain()

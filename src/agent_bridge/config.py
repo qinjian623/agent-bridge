@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shutil
+import stat as stat_module
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -162,3 +163,47 @@ def safe_error(value: object) -> str:
     text = re.sub(r"(?i)(bearer\s+)[^\s\"']+", r"\1[redacted]", text)
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}", "[redacted]", text)
     return text[:4000]
+
+
+MAX_TOKEN_BYTES = 8192
+
+
+def read_admin_token(state: Path | str) -> str:
+    """Safely read the shared admin token.
+
+    The file must exist, be a regular file owned by the current UID, and have mode 0600. A missing,
+    insecure, empty, oversized or malformed token is rejected instead of being used.
+    """
+    path = Path(state) / "admin.token"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as error:
+        raise BridgeError(
+            "permission_denied", "Admin token is missing; run init or start the Broker first"
+        ) from error
+    except OSError as error:
+        raise BridgeError("permission_denied", "Admin token cannot be opened safely") from error
+
+    try:
+        info = os.fstat(descriptor)
+        if not stat_module.S_ISREG(info.st_mode):
+            raise BridgeError("permission_denied", "Admin token must be a regular file")
+        if info.st_uid != os.getuid():
+            raise BridgeError("permission_denied", "Admin token must be owned by the current user")
+        if stat_module.S_IMODE(info.st_mode) != 0o600:
+            raise BridgeError("permission_denied", "Admin token permissions must be 0600")
+        if info.st_size <= 0 or info.st_size > MAX_TOKEN_BYTES:
+            raise BridgeError("permission_denied", "Admin token is empty or too large")
+        data = os.read(descriptor, MAX_TOKEN_BYTES + 1)
+    finally:
+        os.close(descriptor)
+
+    try:
+        token = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("Admin token is not valid UTF-8") from error
+    token = token.strip()
+    if not token or any(character.isspace() for character in token):
+        raise ValueError("Admin token is malformed")
+    return token
