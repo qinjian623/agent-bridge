@@ -169,7 +169,31 @@ class MonitorCollector:
         hosts: list[dict[str, Any]] = []
         try:
             registry = ConfigHostRegistry(self.state)
-            hosts = registry.status()
+            for st in registry.status():
+                host_id = st.host_id
+                cfg = None
+                try:
+                    cfg = registry.get(host_id)
+                except Exception:
+                    pass
+                node_id = st.node.node_id if st.node else None
+                state_gen = st.node.state_generation if st.node else None
+                state_val = st.state.value if hasattr(st.state, "value") else str(st.state)
+                hosts.append(
+                    {
+                        "host_id": host_id,
+                        "state": state_val,
+                        "ssh_target": cfg.ssh_target if cfg else "-",
+                        "remote_executable": cfg.remote_executable if cfg else "-",
+                        "projects": dict(cfg.projects) if cfg and cfg.projects else {},
+                        "node_id": node_id,
+                        "state_generation": state_gen,
+                        "last_contact": st.last_contact,
+                        "last_contact_rel": _format_relative_time(st.last_contact),
+                        "protocol_version": st.protocol_version,
+                        "detail": st.detail,
+                    }
+                )
         except Exception:
             pass
 
@@ -178,9 +202,11 @@ class MonitorCollector:
         pending_questions: list[dict[str, Any]] = []
         groups: list[dict[str, Any]] = []
         broadcasts: list[dict[str, Any]] = []
-        peer_queues: dict[str, Any] = {"inbox": {}, "outbox": {}, "operations": {}}
+        peer_queues: dict[str, Any] = {"inbox": {}, "outbox": {}, "member_outbox": {}, "operations": {}}
         events: list[dict[str, Any]] = []
         metrics: dict[str, Any] = {
+            "total_hosts": len(hosts) + 1,
+            "online_hosts": sum(1 for h in hosts if h.get("state") == "online") + 1,
             "total_sessions": 0,
             "active_sessions": 0,
             "running_tasks": 0,
@@ -233,6 +259,18 @@ class MonitorCollector:
                     for r in g_cur.fetchall():
                         if r[0] and r[1]:
                             group_labels[r[0]] = r[1]
+
+                session_hosts: dict[str, str] = {}
+                if self._has_table(db, "peer_outbox"):
+                    for r in db.execute(
+                        "SELECT host_id, target_id FROM peer_outbox WHERE target_kind='bridge' AND target_id IS NOT NULL"
+                    ).fetchall():
+                        session_hosts[r["target_id"]] = r["host_id"]
+                if self._has_table(db, "remote_group_members"):
+                    for r in db.execute(
+                        "SELECT host_id, target_id FROM remote_group_members WHERE target_kind='bridge' AND target_id IS NOT NULL"
+                    ).fetchall():
+                        session_hosts[r["target_id"]] = r["host_id"]
 
                 session_names_map: dict[str, str] = {}
 
@@ -332,6 +370,7 @@ class MonitorCollector:
                             {
                                 "id": sid,
                                 "name": s_name,
+                                "host_id": session_hosts.get(sid, "local"),
                                 "profile": profile_name,
                                 "model": model_name,
                                 "runtime": runtime,
@@ -361,6 +400,8 @@ class MonitorCollector:
                         gid = row["id"]
                         b_members = 0
                         n_members = 0
+                        r_members = 0
+                        remote_hosts: list[str] = []
                         if self._has_table(db, "session_group_members"):
                             b_members = db.execute(
                                 "SELECT count(*) FROM session_group_members WHERE group_id=?", (gid,)
@@ -369,6 +410,14 @@ class MonitorCollector:
                             n_members = db.execute(
                                 "SELECT count(*) FROM native_group_members WHERE group_id=?", (gid,)
                             ).fetchone()[0]
+                        if self._has_table(db, "remote_group_members"):
+                            cur_r = db.execute(
+                                "SELECT host_id, count(*) FROM remote_group_members WHERE group_id=? GROUP BY host_id",
+                                (gid,),
+                            )
+                            for r_host, r_cnt in cur_r.fetchall():
+                                r_members += r_cnt
+                                remote_hosts.append(f"{r_host}:{r_cnt}")
                         groups.append(
                             {
                                 "id": gid,
@@ -377,7 +426,9 @@ class MonitorCollector:
                                 "created_rel": _format_relative_time(row["created"]),
                                 "bridge_members": b_members,
                                 "native_members": n_members,
-                                "total_members": b_members + n_members,
+                                "remote_members": r_members,
+                                "remote_hosts": remote_hosts,
+                                "total_members": b_members + n_members + r_members,
                             }
                         )
 
@@ -414,9 +465,12 @@ class MonitorCollector:
                 if self._has_table(db, "peer_inbox"):
                     cur = db.execute("SELECT status, count(*) FROM peer_inbox GROUP BY status")
                     peer_queues["inbox"] = {r[0]: r[1] for r in cur.fetchall()}
+                if self._has_table(db, "peer_outbox"):
+                    cur = db.execute("SELECT status, count(*) FROM peer_outbox GROUP BY status")
+                    peer_queues["outbox"] = {r[0]: r[1] for r in cur.fetchall()}
                 if self._has_table(db, "node_outbox"):
                     cur = db.execute("SELECT status, count(*) FROM node_outbox GROUP BY status")
-                    peer_queues["outbox"] = {r[0]: r[1] for r in cur.fetchall()}
+                    peer_queues["member_outbox"] = {r[0]: r[1] for r in cur.fetchall()}
                 if self._has_table(db, "peer_operations"):
                     cur = db.execute("SELECT status, count(*) FROM peer_operations GROUP BY status")
                     peer_queues["operations"] = {r[0]: r[1] for r in cur.fetchall()}
@@ -552,28 +606,36 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
 
     # 3. Cluster Nodes Section
     hosts = snapshot.get("hosts", [])
-    lines.append(f"\n{BOLD}{CYAN}▶ Cluster Nodes ({len(hosts)}){RESET}")
-    lines.append(f"{DIM}  {'Host ID':<18} {'State':<12} {'Target':<22} {'Node ID':<18} {'Last Contact'}{RESET}")
-    lines.append(f"  {DIM}{'─' * 18} {'─' * 12} {'─' * 22} {'─' * 18} {'─' * 15}{RESET}")
-    if not hosts:
-        lines.append(f"  {DIM}(Only local coordinator configured; add hosts in config.json to monitor remote servers){RESET}")
-    else:
-        for h in hosts:
-            state = h.get("state", "offline")
-            st_color = GREEN if state == "online" else (YELLOW if state == "offline" else RED)
-            lines.append(
-                f"  {BOLD}{h.get('host_id', '-'):<18}{RESET} "
-                f"{st_color}{state:<12}{RESET} "
-                f"{h.get('ssh_target', '-'):<22} "
-                f"{DIM}{h.get('node_id', '-')[:16]:<18}{RESET} "
-                f"{_format_relative_time(h.get('last_contact'))}"
-            )
+    total_nodes = len(hosts) + 1
+    lines.append(f"\n{BOLD}{CYAN}▶ Cluster Nodes ({total_nodes}){RESET}")
+    lines.append(f"{DIM}  {'Host ID':<18} {'Role':<13} {'State':<12} {'Target':<20} {'Node ID':<18} {'Last Contact'}{RESET}")
+    lines.append(f"  {DIM}{'─' * 18} {'─' * 13} {'─' * 12} {'─' * 20} {'─' * 18} {'─' * 15}{RESET}")
+    lines.append(
+        f"  {BOLD}{coord.get('host_id', 'coordinator')[:18]:<18}{RESET} "
+        f"{BLUE}{'coordinator':<13}{RESET} "
+        f"{GREEN}{'online':<12}{RESET} "
+        f"{'local':<20} "
+        f"{DIM}{str(coord.get('node_id', '-'))[:16]:<18}{RESET} "
+        f"active"
+    )
+    for h in hosts:
+        state = h.get("state", "offline")
+        st_color = GREEN if state == "online" else (YELLOW if state == "offline" else RED)
+        node_id_str = str(h.get("node_id") or "-")
+        lines.append(
+            f"  {BOLD}{h.get('host_id', '-'):<18}{RESET} "
+            f"{CYAN}{'worker':<13}{RESET} "
+            f"{st_color}{state:<12}{RESET} "
+            f"{h.get('ssh_target', '-'):<20} "
+            f"{DIM}{node_id_str[:16]:<18}{RESET} "
+            f"{h.get('last_contact_rel') or _format_relative_time(h.get('last_contact'))}"
+        )
 
     # 4. Active Agents & Sessions Section
     sessions = snapshot.get("sessions", [])
     lines.append(f"\n{BOLD}{CYAN}▶ Agents & Sessions ({len(sessions)}){RESET}")
-    lines.append(f"{DIM}  {'Agent / Session Name':<30} {'Runtime':<9} {'Model/Profile':<16} {'Status':<14} {'PID':<8} {'Cost':<7} {'ID':<10}{RESET}")
-    lines.append(f"  {DIM}{'─' * 30} {'─' * 9} {'─' * 16} {'─' * 14} {'─' * 8} {'─' * 7} {'─' * 10}{RESET}")
+    lines.append(f"{DIM}  {'Agent / Session Name':<28} {'Host':<10} {'Runtime':<9} {'Model/Profile':<15} {'Status':<14} {'PID':<8} {'Cost':<7} {'ID':<10}{RESET}")
+    lines.append(f"  {DIM}{'─' * 28} {'─' * 10} {'─' * 9} {'─' * 15} {'─' * 14} {'─' * 8} {'─' * 7} {'─' * 10}{RESET}")
     if not sessions:
         lines.append(f"  {DIM}(No sessions created yet){RESET}")
     else:
@@ -596,15 +658,17 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
 
             cost = f"${s['attempt']['cost_usd']:.3f}" if s.get("attempt") and s["attempt"].get("cost_usd") is not None else "-"
             s_name = s.get("name") or s["id"][:8]
+            host_tag = s.get("host_id", "local")[:9]
 
             lines.append(
-                f"  {BOLD}{s_name[:28]:<30}{RESET} "
-                f"{CYAN}{s['runtime']:<9}{RESET} "
-                f"{s['profile'][:14]:<16} "
-                f"{status_str:<22} "
-                f"{pid_str:<16} "
+                f"  {BOLD}{s_name[:28]:<28}{RESET} "
+                f"{DIM}{host_tag:<10}{RESET} "
+                f"{s.get('runtime', '-')[:9]:<9} "
+                f"{s.get('profile', '-')[:15]:<15} "
+                f"{status_str:<14} "
+                f"{pid_str:<8} "
                 f"{cost:<7} "
-                f"{DIM}{s['id'][:8]}{RESET}"
+                f"{DIM}{s.get('id', '-')[:8]:<10}{RESET}"
             )
 
     # 5. Communications & Broadcasts Section

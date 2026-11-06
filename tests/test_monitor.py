@@ -735,6 +735,67 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("createTextNode", HTML_PAGE)
         self.assertIn("addEventListener", HTML_PAGE)
         self.assertNotIn(TOKEN, LOGIN_PAGE)
+        self.assertIn("hostTable", HTML_PAGE)
+        self.assertIn("statNodes", HTML_PAGE)
+        self.assertIn("Cluster Nodes (Execution Hosts)", HTML_PAGE)
+
+    def test_collector_cluster_hosts(self) -> None:
+        (self.state / "config.json").write_text(
+            json.dumps({
+                "hosts": {
+                    "gpu-1": {
+                        "ssh_target": "gpu-1.internal",
+                        "remote_executable": "/usr/local/bin/agent-bridge",
+                        "projects": {"bridge": "/srv/bridge"},
+                    }
+                }
+            })
+        )
+        (self.state / "host_pins.json").write_text(
+            json.dumps({
+                "version": 1,
+                "hosts": {
+                    "gpu-1": {
+                        "host_id": "gpu-1",
+                        "node_id": "node-gpu-12345",
+                        "state_generation": "gen-gpu-67890",
+                    }
+                }
+            })
+        )
+        collector = MonitorCollector(self.state)
+        snapshot = collector.collect(limit=5)
+        self.assertEqual(2, snapshot["metrics"]["total_hosts"])
+        self.assertEqual(1, len(snapshot["hosts"]))
+        host = snapshot["hosts"][0]
+        self.assertEqual("gpu-1", host["host_id"])
+        self.assertEqual("gpu-1.internal", host["ssh_target"])
+        self.assertEqual("node-gpu-12345", host["node_id"])
+        self.assertEqual({"bridge": "/srv/bridge"}, host["projects"])
+
+        tui = render_tui(snapshot, width=120)
+        self.assertIn("Cluster Nodes (2)", tui)
+        self.assertIn("coordinator", tui)
+        self.assertIn("gpu-1", tui)
+
+    def test_host_ping_endpoint_forwards_to_broker(self) -> None:
+        broker = FakeBroker(self.state, {"result": {"entries": [], "stale": False}})
+        try:
+            response = self.send(
+                "POST",
+                "/api/host/ping",
+                token=TOKEN,
+                origin="http://localhost:8080",
+                body={"host_id": "gpu-1"},
+            )
+            self.assertEqual(1, len(broker.requests))
+            req = broker.requests[0]
+            self.assertEqual("agent_catalog", req.get("method"))
+            self.assertEqual("gpu-1", req.get("params", {}).get("host_id"))
+            self.assertEqual(200, response.status)
+            self.assertTrue(response.json()["ok"])
+        finally:
+            broker.close()
 
 
 if __name__ == "__main__":
