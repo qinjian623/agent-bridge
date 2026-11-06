@@ -1042,7 +1042,7 @@ class DirectPeerService:
                 workspace_id, "preparing", params["expected_revision"],
             )
             try:
-                ready_path = self._build_workspace(transfer, manifest)
+                ready_path = str(Path(self._build_workspace(transfer, manifest)).resolve())
                 actual_digest = self._workspace_digest(Path(ready_path))
                 if actual_digest != manifest["input_digest"]:
                     raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "input digest mismatch")
@@ -1499,9 +1499,16 @@ class DirectPeerService:
                             "A bridge delivery without a session_id requires open parameters (ADR-13)",
                         )
                     profile = self._profile_from_open(open_spec)
-                    cwd = open_spec.get("cwd")
-                    if not isinstance(cwd, str) or not cwd:
-                        cwd = "."
+                    project_id = open_spec.get("project_id")
+                    projects = getattr(self._config, "projects", {}) if self._config else {}
+                    if project_id and projects:
+                        if project_id not in projects:
+                            raise peer_error(PeerErrorCode.INVALID_PARAMS, f"Project {project_id!r} is not configured on this host")
+                        cwd = projects[project_id]
+                    else:
+                        cwd = open_spec.get("cwd")
+                        if not isinstance(cwd, str) or not cwd:
+                            cwd = "."
                     access = open_spec.get("access") or "read-only"
                     workspace = open_spec.get("workspace")
                     workspace_ref = open_spec.get("workspace_ref")

@@ -109,7 +109,7 @@ def main():
                         "quota_group": "deepseek-account",
                     },
                 },
-                "worker_launcher": "systemd",
+                "worker_launcher": "detached" if sys.platform == "darwin" else "systemd",
                 "parallel_limit": 3,
                 "quota_limit": 2,
                 "default_strategy": "balanced",
