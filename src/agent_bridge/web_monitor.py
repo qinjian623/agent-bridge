@@ -260,6 +260,9 @@ _HTML_HEAD = """<!DOCTYPE html>
     .badge-stopped { background: rgba(139, 148, 158, 0.15); color: var(--text-muted); }
     .badge-online { background: var(--green-bg); color: var(--green); }
     .badge-offline { background: var(--red-bg); color: var(--red); }
+    .badge-node { background: rgba(56, 139, 253, 0.15); color: var(--accent); border: 1px solid rgba(88, 166, 255, 0.3); font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
+    .badge-coord { background: rgba(188, 140, 255, 0.15); color: var(--purple); border: 1px solid rgba(188, 140, 255, 0.3); }
+    .btn-sm { padding: 3px 8px; font-size: 11px; }
 
     @keyframes pulse {
       0% { opacity: 1; }
@@ -310,6 +313,10 @@ _HTML_BODY = """  <header>
     </div>
     <div class="nav-stats">
       <div class="stat-pill">
+        <span class="val" id="statNodes">1/1</span>
+        <span class="lbl">Cluster Nodes</span>
+      </div>
+      <div class="stat-pill">
         <span class="val" id="statActive">0</span>
         <span class="lbl">Active Agents</span>
       </div>
@@ -349,6 +356,33 @@ _HTML_BODY = """  <header>
       </div>
     </div>
 
+    <!-- Cluster Nodes Card -->
+    <div class="card">
+      <div class="card-header">
+        <div>Cluster Nodes (Execution Hosts)</div>
+        <div id="hostStats" style="font-size: 12px; color: var(--text-muted);">1 node</div>
+      </div>
+      <div class="card-body" style="max-height: 280px; overflow-y: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Host ID</th>
+              <th>Role</th>
+              <th>Status</th>
+              <th>SSH Target</th>
+              <th>Node ID &amp; Generation</th>
+              <th>Managed Projects</th>
+              <th>Last Contact</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="hostTable">
+            <tr><td class="empty-cell" colspan="8">Loading cluster nodes...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- 2 Column Section -->
     <div class="grid-2">
       <!-- Active Agents & Sessions -->
@@ -362,6 +396,7 @@ _HTML_BODY = """  <header>
             <thead>
               <tr>
                 <th>Agent / Session</th>
+                <th>Host</th>
                 <th>Runtime</th>
                 <th>Status</th>
                 <th>Goal / Task</th>
@@ -369,7 +404,7 @@ _HTML_BODY = """  <header>
               </tr>
             </thead>
             <tbody id="sessionTable">
-              <tr><td class="empty-cell" colspan="5">Loading agents...</td></tr>
+              <tr><td class="empty-cell" colspan="6">Loading agents...</td></tr>
             </tbody>
           </table>
         </div>
@@ -387,12 +422,13 @@ _HTML_BODY = """  <header>
               <tr>
                 <th>Broadcast / Group</th>
                 <th>Progress</th>
+                <th>Members</th>
                 <th>Message Preview</th>
                 <th>Age</th>
               </tr>
             </thead>
             <tbody id="broadcastTable">
-              <tr><td class="empty-cell" colspan="4">No broadcasts yet</td></tr>
+              <tr><td class="empty-cell" colspan="5">No broadcasts yet</td></tr>
             </tbody>
           </table>
         </div>
@@ -590,13 +626,135 @@ _HTML_SCRIPT = """  <script>
       });
     }
 
+    function renderHosts(hosts, coordinator) {
+      const body = document.getElementById('hostTable');
+      body.replaceChildren();
+      const totalNodes = (hosts ? hosts.length : 0) + 1;
+      document.getElementById('hostStats').textContent = totalNodes + ' nodes';
+
+      // 1. Coordinator Row
+      const cRow = document.createElement('tr');
+      const cNameCell = document.createElement('td');
+      const cNameLine = makeElement('div', '', (coordinator.host_id || 'coordinator') + ' ⚡');
+      cNameLine.style.fontWeight = '700';
+      cNameLine.style.color = '#fff';
+      cNameCell.appendChild(cNameLine);
+      cRow.appendChild(cNameCell);
+
+      const cRoleCell = document.createElement('td');
+      cRoleCell.appendChild(makeElement('span', 'badge badge-coord', 'Coordinator'));
+      cRow.appendChild(cRoleCell);
+
+      const cStatusCell = document.createElement('td');
+      cStatusCell.appendChild(makeElement('span', 'badge badge-online', 'ONLINE'));
+      cRow.appendChild(cStatusCell);
+
+      const cTargetCell = document.createElement('td');
+      cTargetCell.appendChild(makeElement('code', '', 'local (unix sock)'));
+      cRow.appendChild(cTargetCell);
+
+      const cNodeCell = document.createElement('td');
+      cNodeCell.appendChild(makeElement('code', '', coordinator.node_id ? String(coordinator.node_id).substring(0, 16) : '-'));
+      cRow.appendChild(cNodeCell);
+
+      const cProjsCell = makeElement('td', '', 'bridge (local)');
+      cRow.appendChild(cProjsCell);
+
+      const cContactCell = makeElement('td', '', 'active');
+      cContactCell.style.color = 'var(--green)';
+      cRow.appendChild(cContactCell);
+
+      const cActionCell = makeElement('td', '', '-');
+      cActionCell.style.color = 'var(--text-muted)';
+      cRow.appendChild(cActionCell);
+      body.appendChild(cRow);
+
+      // 2. Remote Worker Hosts
+      if (hosts && hosts.length) {
+        hosts.forEach((host) => {
+          const row = document.createElement('tr');
+          const nameCell = document.createElement('td');
+          const nameLine = makeElement('div', '', host.host_id || '-');
+          nameLine.style.fontWeight = '600';
+          nameLine.style.color = '#fff';
+          nameCell.appendChild(nameLine);
+          row.appendChild(nameCell);
+
+          const roleCell = document.createElement('td');
+          roleCell.appendChild(makeElement('span', 'badge badge-idle', 'Worker Node'));
+          row.appendChild(roleCell);
+
+          const statusCell = document.createElement('td');
+          const isOnline = host.state === 'online';
+          const isOffline = host.state === 'offline';
+          const badgeClass = isOnline ? 'badge-online' : (isOffline ? 'badge-offline' : 'badge-waiting');
+          statusCell.appendChild(makeElement('span', 'badge ' + badgeClass, String(host.state || 'offline').toUpperCase()));
+          row.appendChild(statusCell);
+
+          const targetCell = document.createElement('td');
+          targetCell.appendChild(makeElement('code', '', host.ssh_target || '-'));
+          row.appendChild(targetCell);
+
+          const nodeCell = document.createElement('td');
+          const nodeStr = host.node_id ? String(host.node_id).substring(0, 16) + '…' : '-';
+          nodeCell.appendChild(makeElement('code', '', nodeStr));
+          row.appendChild(nodeCell);
+
+          const projs = host.projects && typeof host.projects === 'object' ? Object.keys(host.projects).join(', ') : '-';
+          const projsCell = makeElement('td', '', projs || '-');
+          row.appendChild(projsCell);
+
+          const contactCell = makeElement('td', '', host.last_contact_rel || '-');
+          contactCell.style.color = 'var(--text-muted)';
+          row.appendChild(contactCell);
+
+          const actionCell = document.createElement('td');
+          const pingButton = makeElement('button', 'btn btn-secondary btn-sm', 'Ping');
+          pingButton.type = 'button';
+          pingButton.addEventListener('click', () => {
+            pingHost(host.host_id, pingButton);
+          });
+          actionCell.appendChild(pingButton);
+          row.appendChild(actionCell);
+
+          body.appendChild(row);
+        });
+      }
+    }
+
+    async function pingHost(hostId, button) {
+      if (!hostId) return;
+      setText(button, 'Pinging...');
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/host/ping', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': csrfToken || ''
+          },
+          body: JSON.stringify({ host_id: hostId })
+        });
+        if (response.ok) {
+          await fetchData();
+        } else {
+          setText(button, 'Failed');
+          setTimeout(() => { setText(button, 'Ping'); button.disabled = false; }, 2000);
+        }
+      } catch (error) {
+        setText(button, 'Error');
+        setTimeout(() => { setText(button, 'Ping'); button.disabled = false; }, 2000);
+      }
+    }
+
     function renderSessions(sessions, metrics) {
       const body = document.getElementById('sessionTable');
       body.replaceChildren();
       document.getElementById('sessionCount').textContent =
         sessions.length + ' sessions (' + (metrics.active_sessions || 0) + ' active)';
       if (!sessions.length) {
-        body.appendChild(emptyRow(5, 'No sessions'));
+        body.appendChild(emptyRow(6, 'No sessions'));
         return;
       }
       sessions.slice(0, 15).forEach((session) => {
@@ -612,6 +770,11 @@ _HTML_SCRIPT = """  <script>
         metaLine.appendChild(makeElement('code', '', String(session.id || '').substring(0, 8)));
         nameCell.appendChild(nameLine);
         nameCell.appendChild(metaLine);
+
+        const hostCell = document.createElement('td');
+        const hostName = session.host_id || 'local';
+        const hostBadge = makeElement('span', 'badge-node', hostName);
+        hostCell.appendChild(hostBadge);
 
         const runtimeCell = document.createElement('td');
         const runtimeText = makeElement('span', '', session.runtime || '-');
@@ -642,6 +805,7 @@ _HTML_SCRIPT = """  <script>
         costCell.style.color = 'var(--yellow)';
 
         row.appendChild(nameCell);
+        row.appendChild(hostCell);
         row.appendChild(runtimeCell);
         row.appendChild(statusCell);
         row.appendChild(goalCell);
@@ -655,7 +819,7 @@ _HTML_SCRIPT = """  <script>
       body.replaceChildren();
       document.getElementById('groupStats').textContent = broadcasts.length + ' broadcasts';
       if (!broadcasts.length) {
-        body.appendChild(emptyRow(4, 'No broadcast communications recorded'));
+        body.appendChild(emptyRow(5, 'No broadcast communications recorded'));
         return;
       }
       broadcasts.forEach((broadcast) => {
@@ -682,6 +846,10 @@ _HTML_SCRIPT = """  <script>
           progressCell.appendChild(uncertain);
         }
 
+        const membersCell = document.createElement('td');
+        setText(membersCell, (broadcast.total || 0) + ' targets');
+        membersCell.style.color = 'var(--text-muted)';
+
         const messageCell = makeElement('td', '', broadcast.message_preview || '-');
         messageCell.style.maxWidth = '200px';
         messageCell.style.overflow = 'hidden';
@@ -693,6 +861,7 @@ _HTML_SCRIPT = """  <script>
 
         row.appendChild(idCell);
         row.appendChild(progressCell);
+        row.appendChild(membersCell);
         row.appendChild(messageCell);
         row.appendChild(ageCell);
         body.appendChild(row);
@@ -739,56 +908,147 @@ _HTML_SCRIPT = """  <script>
       const svg = document.getElementById('topoGraph');
       const width = svg.clientWidth || 800;
       const height = svg.clientHeight || 240;
-      const centerX = width / 2;
-      const centerY = height / 2;
-      const sessions = (data.sessions || []).slice(0, 6);
+      const hosts = data.hosts || [];
+      const sessions = data.sessions || [];
       const coordinator = data.coordinator || {};
 
       svg.replaceChildren();
-      svg.appendChild(svgNode('circle', {
-        cx: centerX, cy: centerY, r: 28, fill: '#1f2937', stroke: '#58a6ff', 'stroke-width': 2.5
-      }));
-      svg.appendChild(svgText({
-        x: centerX, y: centerY - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 11, 'font-weight': 700
-      }, 'COORD'));
-      svg.appendChild(svgText({
-        x: centerX, y: centerY + 10, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
-      }, String(coordinator.host_id || 'local').substring(0, 10)));
 
-      const totalNodes = Math.max(sessions.length, 1);
-      const radius = Math.min(centerX, centerY) - 45;
-      sessions.forEach((session, index) => {
-        const angle = (index / totalNodes) * 2 * Math.PI - Math.PI / 2;
-        const x = centerX + radius * Math.cos(angle);
-        const y = centerY + radius * Math.sin(angle);
-        const isRunning = session.observed === 'running';
-        const isWaiting = Boolean(session.waiting_question);
-        const strokeColor = isWaiting ? '#d29922' : (isRunning ? '#3fb950' : '#8b949e');
-        const fillColor = isRunning ? '#064e3b' : '#111827';
+      if (hosts.length > 0) {
+        const totalHosts = hosts.length + 1;
+        const hostPositions = [];
+        const hostY = 70;
 
-        const line = svgNode('line', {
-          x1: centerX, y1: centerY, x2: x, y2: y, stroke: strokeColor,
-          'stroke-dasharray': isRunning ? '4 2' : 'none', 'stroke-width': 1.5, opacity: 0.7
+        const cX = width / (totalHosts + 1);
+        hostPositions.push({ host_id: 'local', x: cX, y: hostY, isCoord: true });
+
+        hosts.forEach((host, i) => {
+          const hX = ((i + 2) * width) / (totalHosts + 1);
+          hostPositions.push({ host_id: host.host_id, x: hX, y: hostY, isCoord: false, data: host });
         });
-        if (isRunning) {
-          line.appendChild(svgNode('animate', {
-            attributeName: 'stroke-dashoffset', values: '0;6', dur: '0.8s', repeatCount: 'indefinite'
-          }));
-        }
-        svg.appendChild(line);
+
+        hostPositions.slice(1).forEach((hp) => {
+          const isOnline = hp.data && hp.data.state === 'online';
+          const stroke = isOnline ? '#3fb950' : '#8b949e';
+          const line = svgNode('line', {
+            x1: cX, y1: hostY, x2: hp.x, y2: hostY, stroke: stroke,
+            'stroke-dasharray': '5 3', 'stroke-width': 2, opacity: 0.8
+          });
+          if (isOnline) {
+            line.appendChild(svgNode('animate', {
+              attributeName: 'stroke-dashoffset', values: '0;8', dur: '1s', repeatCount: 'indefinite'
+            }));
+          }
+          svg.appendChild(line);
+
+          const midX = (cX + hp.x) / 2;
+          svg.appendChild(svgText({
+            x: midX, y: hostY - 8, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
+          }, 'SSH Relay'));
+        });
+
+        hostPositions.forEach((hp) => {
+          if (hp.isCoord) {
+            svg.appendChild(svgNode('circle', {
+              cx: hp.x, cy: hp.y, r: 28, fill: '#1f2937', stroke: '#bc8cff', 'stroke-width': 2.5
+            }));
+            svg.appendChild(svgText({
+              x: hp.x, y: hp.y - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 11, 'font-weight': 700
+            }, 'COORD'));
+            svg.appendChild(svgText({
+              x: hp.x, y: hp.y + 10, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
+            }, String(coordinator.host_id || 'local').substring(0, 10)));
+          } else {
+            const isOnline = hp.data && hp.data.state === 'online';
+            const stroke = isOnline ? '#3fb950' : '#f85149';
+            svg.appendChild(svgNode('circle', {
+              cx: hp.x, cy: hp.y, r: 26, fill: '#161b22', stroke: stroke, 'stroke-width': 2.2
+            }));
+            svg.appendChild(svgText({
+              x: hp.x, y: hp.y - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 10, 'font-weight': 600
+            }, String(hp.host_id).substring(0, 9)));
+            svg.appendChild(svgText({
+              x: hp.x, y: hp.y + 10, 'text-anchor': 'middle', fill: stroke, 'font-size': 8
+            }, isOnline ? 'ONLINE' : 'OFFLINE'));
+          }
+
+          const hostSessions = sessions.filter((s) => (hp.isCoord ? (s.host_id === 'local' || !s.host_id) : s.host_id === hp.host_id)).slice(0, 4);
+          const sessCount = hostSessions.length;
+          hostSessions.forEach((session, sIdx) => {
+            const spread = (sessCount - 1) * 36;
+            const sX = hp.x - (spread / 2) + (sIdx * 36);
+            const sY = hp.y + 90;
+            const isRunning = session.observed === 'running';
+            const isWaiting = Boolean(session.waiting_question);
+            const strokeColor = isWaiting ? '#d29922' : (isRunning ? '#3fb950' : '#8b949e');
+            const fillColor = isRunning ? '#064e3b' : '#111827';
+
+            const sessLine = svgNode('line', {
+              x1: hp.x, y1: hp.y + 26, x2: sX, y2: sY - 18, stroke: strokeColor,
+              'stroke-dasharray': isRunning ? '3 2' : 'none', 'stroke-width': 1.2, opacity: 0.6
+            });
+            svg.appendChild(sessLine);
+
+            svg.appendChild(svgNode('circle', {
+              cx: sX, cy: sY, r: 18, fill: fillColor, stroke: strokeColor, 'stroke-width': 1.8
+            }));
+            const name = session.name ? String(session.name) : String(session.runtime || '');
+            const displayName = name.length > 7 ? name.substring(0, 6) + '…' : name;
+            svg.appendChild(svgText({
+              x: sX, y: sY + 3, 'text-anchor': 'middle', fill: '#fff', 'font-size': 8, 'font-weight': 600
+            }, displayName));
+          });
+        });
+      } else {
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const sessionsSlice = sessions.slice(0, 6);
 
         svg.appendChild(svgNode('circle', {
-          cx: x, cy: y, r: 24, fill: fillColor, stroke: strokeColor, 'stroke-width': 2
+          cx: centerX, cy: centerY, r: 28, fill: '#1f2937', stroke: '#58a6ff', 'stroke-width': 2.5
         }));
-        const name = session.name ? String(session.name) : String(session.runtime || '');
-        const displayName = name.length > 9 ? name.substring(0, 8) + '…' : name;
         svg.appendChild(svgText({
-          x: x, y: y - 3, 'text-anchor': 'middle', fill: '#fff', 'font-size': 9, 'font-weight': 600
-        }, displayName));
+          x: centerX, y: centerY - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 11, 'font-weight': 700
+        }, 'COORD'));
         svg.appendChild(svgText({
-          x: x, y: y + 9, 'text-anchor': 'middle', fill: strokeColor, 'font-size': 8
-        }, String(session.id || '').substring(0, 6)));
-      });
+          x: centerX, y: centerY + 10, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
+        }, String(coordinator.host_id || 'local').substring(0, 10)));
+
+        const totalNodes = Math.max(sessionsSlice.length, 1);
+        const radius = Math.min(centerX, centerY) - 45;
+        sessionsSlice.forEach((session, index) => {
+          const angle = (index / totalNodes) * 2 * Math.PI - Math.PI / 2;
+          const x = centerX + radius * Math.cos(angle);
+          const y = centerY + radius * Math.sin(angle);
+          const isRunning = session.observed === 'running';
+          const isWaiting = Boolean(session.waiting_question);
+          const strokeColor = isWaiting ? '#d29922' : (isRunning ? '#3fb950' : '#8b949e');
+          const fillColor = isRunning ? '#064e3b' : '#111827';
+
+          const line = svgNode('line', {
+            x1: centerX, y1: centerY, x2: x, y2: y, stroke: strokeColor,
+            'stroke-dasharray': isRunning ? '4 2' : 'none', 'stroke-width': 1.5, opacity: 0.7
+          });
+          if (isRunning) {
+            line.appendChild(svgNode('animate', {
+              attributeName: 'stroke-dashoffset', values: '0;6', dur: '0.8s', repeatCount: 'indefinite'
+            }));
+          }
+          svg.appendChild(line);
+
+          svg.appendChild(svgNode('circle', {
+            cx: x, cy: y, r: 24, fill: fillColor, stroke: strokeColor, 'stroke-width': 2
+          }));
+          const name = session.name ? String(session.name) : String(session.runtime || '');
+          const displayName = name.length > 9 ? name.substring(0, 8) + '…' : name;
+          svg.appendChild(svgText({
+            x: x, y: y - 3, 'text-anchor': 'middle', fill: '#fff', 'font-size': 9, 'font-weight': 600
+          }, displayName));
+          svg.appendChild(svgText({
+            x: x, y: y + 9, 'text-anchor': 'middle', fill: strokeColor, 'font-size': 8
+          }, String(session.id || '').substring(0, 6)));
+        });
+      }
     }
 
     function renderDashboard(data) {
@@ -798,6 +1058,8 @@ _HTML_SCRIPT = """  <script>
       document.getElementById('coordBadge').textContent =
         (coordinator.host_id || 'localhost') + ' • Node ' +
         (coordinator.node_id ? String(coordinator.node_id).substring(0, 8) : '?');
+      document.getElementById('statNodes').textContent =
+        (metrics.online_hosts || 1) + '/' + (metrics.total_hosts || 1);
       document.getElementById('statActive').textContent = metrics.active_sessions || 0;
       document.getElementById('statTasks').textContent = metrics.running_tasks || 0;
       document.getElementById('statBroadcasts').textContent = metrics.total_broadcasts || 0;
@@ -805,6 +1067,7 @@ _HTML_SCRIPT = """  <script>
         '$' + Number(metrics.total_cost_usd || 0).toFixed(4);
 
       renderApprovals(data.pending_questions || []);
+      renderHosts(data.hosts || [], coordinator);
       renderSessions(data.sessions || [], metrics);
       renderBroadcasts(data.broadcasts || []);
       renderEvents(data.events || []);
@@ -1282,6 +1545,10 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                 if token is None:
                     raise _HTTPError(401, "Unauthorized")
                 self._handle_respond(token)
+            elif path == "/api/host/ping":
+                if token is None:
+                    raise _HTTPError(401, "Unauthorized")
+                self._handle_host_ping(token)
             elif path in ("/", "/index.html", "/auth/session", "/api/snapshot"):
                 raise _HTTPError(405, "Method Not Allowed")
             else:
@@ -1382,18 +1649,55 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
         result = reply.get("result", reply)
         self._send_json(200, {"ok": True, "result": result})
 
+    def _handle_host_ping(self, token: str) -> None:
+        identity = self._identity(token)
+        if identity is None:
+            raise _HTTPError(401, "Unauthorized")
+        kind, _, record = identity
+        if kind == "cookie":
+            self._check_cookie_origin()
+            csrf = self.headers.get("X-CSRF-Token")
+            if not csrf or record is None or not _secure_equal(csrf, record["csrf_token"]):
+                raise _HTTPError(403, "Invalid CSRF token")
+        else:
+            self._check_optional_origin()
+
+        payload = self._read_json_body()
+        host_id = payload.get("host_id")
+        if not isinstance(host_id, str) or not host_id.strip():
+            raise _HTTPError(400, "host_id is required")
+
+        try:
+            reply = self._broker_call(token, "agent_catalog", {"host_id": host_id, "refresh": True})
+            self._send_json(200, {"ok": True, "result": reply})
+        except _BrokerUnavailable:
+            self._send_json(200, {"ok": False, "error": "Broker unavailable"})
+        except Exception as error:
+            self._send_json(200, {"ok": False, "error": safe_error(error)})
+
     # ------------------------------------------------------------------ broker transport
 
-    def _broker_call(self, token: str, args: dict[str, Any]) -> dict[str, Any]:
+    def _broker_call(
+        self,
+        token: str,
+        method_or_args: str | dict[str, Any],
+        args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self.state is None:
             raise _BrokerUnavailable
+        if args is None and isinstance(method_or_args, dict):
+            method = "agent_control"
+            params = method_or_args
+        else:
+            method = str(method_or_args)
+            params = args or {}
         socket_path = Path(self.state) / "broker.sock"
         message = {
             "version": 1,
             "token": token,
-            "method": "agent_control",
-            "params": args,
-            "args": args,
+            "method": method,
+            "params": params,
+            "args": params,
         }
         payload = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
         try:
