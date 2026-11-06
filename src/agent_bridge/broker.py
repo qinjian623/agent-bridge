@@ -865,6 +865,16 @@ class EventMirror:
         self._stopping.set()
 
 
+def _socket_peer_uid(sock: socket.socket) -> int:
+    """Return peer UID on a Unix domain socket across Linux and macOS/BSD."""
+    if hasattr(socket, "SO_PEERCRED"):
+        return struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+    if hasattr(socket, "LOCAL_PEERCRED"):
+        data = sock.getsockopt(0, socket.LOCAL_PEERCRED, 76)
+        return struct.unpack("II", data[:8])[1]
+    raise OSError("Peer credentials unsupported on this platform")
+
+
 class Broker:
     def __init__(self, state: Path, peer_factory=None):
         self.state = state
@@ -2246,9 +2256,7 @@ class Broker:
 
     async def connection(self, reader, writer):
         try:
-            _, uid, _ = struct.unpack(
-                "3i", writer.get_extra_info("socket").getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-            )
+            uid = _socket_peer_uid(writer.get_extra_info("socket"))
             if uid != os.getuid():
                 raise BridgeError("forbidden", "Connection UID differs from service UID")
             request = json.loads(await asyncio.wait_for(reader.readline(), 5))

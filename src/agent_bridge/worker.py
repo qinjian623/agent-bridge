@@ -25,7 +25,18 @@ def process_identity(pid):
             return None
         return Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":" + stat[19]
     except (OSError, IndexError):
-        return None
+        try:
+            os.kill(pid, 0)
+            output = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            if not output:
+                return None
+            return f"darwin:{pid}:{output}"
+        except (OSError, subprocess.SubprocessError):
+            return None
 
 
 def alive(session):
