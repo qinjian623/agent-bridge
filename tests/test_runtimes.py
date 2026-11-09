@@ -132,7 +132,7 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_codex_service_tier_is_confirmed_before_inference_and_retained(self):
         for native_id in (None, "native"):
             runtime = CodexRuntime(
-                Profile("test", "codex", "fixed", service_tier="fast"),
+                Profile("test", "codex", "fixed", service_tier="fast", executable=sys.executable),
                 {"cwd": "/tmp", "access": "read-only", "native_id": native_id}, Path("/tmp"), self.no_op,
             )
             method = "thread/resume" if native_id else "thread/start"
@@ -213,7 +213,7 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_codex_wrong_turn_cannot_finish_current_task(self):
         runtime = CodexRuntime(
-            Profile("test", "codex", "fixed"),
+            Profile("test", "codex", "fixed", executable=sys.executable),
             {"cwd": "/tmp", "access": "read-only", "native_id": "native"},
             Path("/tmp"),
             self.no_op,
@@ -252,7 +252,7 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_pi_prompt_ack_and_message_end_are_not_completion(self):
         with tempfile.TemporaryDirectory() as path:
             runtime = PiRuntime(
-                Profile("test", "pi", "fixed", provider="provider"),
+                Profile("test", "pi", "fixed", provider="provider", executable=sys.executable),
                 {"id": "session", "cwd": path, "access": "read-only"},
                 Path(path),
                 self.no_op,

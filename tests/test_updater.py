@@ -130,6 +130,57 @@ class BusySnapshotTests(UpdateFixture):
         self.assertIn("api_inflight", updater.busy_snapshot(self.state)["reasons"])
 
 
+class ChildProcessTests(unittest.TestCase):
+    def test_linux_ignores_zombies_and_disappeared_processes_but_keeps_live_descendants(self):
+        files = {
+            "/proc/10/task/10/children": "11 12 13 16",
+            "/proc/11/stat": "11 (defunct helper) Z 10 0",
+            "/proc/12/stat": "12 (ssh client) S 10 0",
+            "/proc/12/comm": "ssh\n",
+            "/proc/12/task/12/children": "14",
+            "/proc/13/stat": "13 (antigravity) R 10 0",
+            "/proc/13/comm": "antigravity\n",
+            "/proc/13/task/13/children": "",
+            "/proc/14/stat": "14 (python) S 12 0",
+            "/proc/14/comm": "python\n",
+            "/proc/14/task/14/children": "",
+        }
+
+        def read(path, *args, **kwargs):
+            try:
+                return files[str(path)]
+            except KeyError as error:
+                raise FileNotFoundError(str(path)) from error
+
+        with (
+            patch.object(updater.sys, "platform", "linux"),
+            patch.object(updater.Path, "read_text", autospec=True, side_effect=read) as reader,
+        ):
+            names = updater._children(10)
+        self.assertEqual(["ssh", "antigravity", "python"], names)
+        self.assertNotIn("/proc/11/comm", [str(call.args[0]) for call in reader.call_args_list])
+
+    def test_macos_ignores_zombie_status_suffixes_and_reads_full_executable_without_arguments(self):
+        processes = "\n".join(
+            (
+                "10 1 Ss /Users/user/managed/bin/python",
+                "11 10 Z+ /opt/homebrew/bin/python3",
+                "12 10 S /usr/bin/ssh",
+                "13 10 S+ /opt/homebrew/bin/antigravity-real",
+                "14 12 Z /opt/homebrew/bin/python3",
+                "15 12 S /opt/homebrew/bin/python3",
+                "16 999 S /opt/homebrew/bin/unrelated",
+            )
+        )
+        with (
+            patch.object(updater.sys, "platform", "darwin"),
+            patch.object(updater, "_run", return_value=processes) as run,
+        ):
+            names = updater._children(10)
+        self.assertEqual(["ssh", "antigravity-real", "python3"], names)
+        run.assert_called_once_with(["ps", "-ww", "-axo", "pid=,ppid=,stat=,comm="], timeout=5)
+
+
 class ReleaseValidationTests(UpdateFixture):
     def release(self):
         return {

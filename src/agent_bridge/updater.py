@@ -80,14 +80,18 @@ def _children(pid):
             for value in values:
                 child = int(value)
                 try:
+                    if Path(f"/proc/{child}/stat").read_text().rsplit(") ", 1)[1].split()[0] == "Z":
+                        continue
                     rows.append(Path(f"/proc/{child}/comm").read_text().strip())
                 except FileNotFoundError:
                     continue
                 pending.append(child)
         return rows
     rows = {}
-    for line in _run(["ps", "-ww", "-axo", "pid=,ppid=,comm="], timeout=5).splitlines():
-        child, parent, command = line.strip().split(None, 2)
+    for line in _run(["ps", "-ww", "-axo", "pid=,ppid=,stat=,comm="], timeout=5).splitlines():
+        child, parent, status, command = line.strip().split(None, 3)
+        if status.startswith("Z"):
+            continue
         rows.setdefault(int(parent), []).append((int(child), Path(command).name))
     pending, names = [pid], []
     while pending:
