@@ -72,7 +72,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             await session.initialize()
             tools = await session.list_tools()
             self.assertEqual({"agent_catalog", "agent_open", "agent_dispatch", "agent_control", "agent_cancel",
-                              "agent_inspect", "agent_wait", "agent_result", "agent_review", "agent_hosts",
+                                      "agent_inspect", "agent_wait", "agent_result", "agent_review", "agent_hosts", "agent_hosts_reload",
                               "agent_monitor", "agent_operation",
                               "agent_groups", "agent_group", "agent_group_prune", "agent_broadcast", "agent_broadcast_status",
                               "agent_group_inbox", "agent_delivery_resolve"}, {t.name for t in tools.tools})

@@ -139,7 +139,9 @@ CREATE TABLE IF NOT EXISTS quota_cooldowns (
 );
 CREATE TABLE IF NOT EXISTS deliveries (
  event_seq INTEGER PRIMARY KEY REFERENCES events(seq), parent_id TEXT NOT NULL REFERENCES parents(id),
- status TEXT NOT NULL DEFAULT 'pending', receipt TEXT, error TEXT
+ status TEXT NOT NULL DEFAULT 'pending', receipt TEXT, error TEXT,
+ native_status TEXT NOT NULL DEFAULT 'unknown', native_turn_id TEXT, queue_cleanup TEXT,
+ cleanup_last_attempt REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS session_groups (
  id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0,
@@ -367,6 +369,19 @@ class Store:
                 db.execute("UPDATE attempts SET reservation=(SELECT reservation FROM tasks WHERE id=attempts.task_id)")
             if "last_attempt" not in {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}:
                 db.execute("ALTER TABLE deliveries ADD COLUMN last_attempt REAL NOT NULL DEFAULT 0")
+            delivery_columns = {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}
+            for column, ddl in (
+                ("native_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("native_turn_id", "TEXT"),
+                ("queue_cleanup", "TEXT"),
+                ("cleanup_last_attempt", "REAL NOT NULL DEFAULT 0"),
+            ):
+                if column not in delivery_columns:
+                    db.execute(f"ALTER TABLE deliveries ADD COLUMN {column} {ddl}")
+            # An older Broker may ACK after a newer worker has already added these columns.
+            db.execute(
+                "UPDATE deliveries SET queue_cleanup='pending' WHERE status='processed' AND queue_cleanup IS NULL"
+            )
             group_columns = {row[1] for row in db.execute("PRAGMA table_info(session_groups)")}
             for column, ddl in (
                 ("updated_at", "REAL"),
@@ -1595,19 +1610,14 @@ class Store:
                 desired = row["desired"]
             elif action == "parent_ack":
                 changed = db.execute(
-                    "UPDATE deliveries SET status='processed' WHERE event_seq=? AND parent_id=? AND status IN ('sending','uncertain','accepted','wake_pending')",
+                    "UPDATE deliveries SET status='processed',queue_cleanup='pending' WHERE event_seq=? AND parent_id=? AND status IN ('sending','uncertain','accepted','wake_pending')",
                     (event_seq, parent_id),
                 ).rowcount
                 if not changed:
                     raise BridgeError(
                         "invalid_delivery", "Only a delivery sent to this parent can be acknowledged"
                     )
-                # The acknowledgement also proves the native write happened, releasing the ordered queue.
-                db.execute(
-                    "UPDATE native_send_queue SET status='received',error=NULL,revision=revision+1 "
-                    "WHERE delivery_source=? AND delivery_id=? AND status IN ('pending','sending','uncertain')",
-                    (DeliverySource.PARENT_NOTIFICATION, str(event_seq)),
-                )
+                # A parent can handle an event through agent_result before its queued notice is read.
                 desired = row["desired"]
             else:
                 desired = {

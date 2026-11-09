@@ -17,6 +17,10 @@
 
 ## 2. 线路协议
 
+管理员主机清单支持运行中更新：Broker 定期读取 `config.json.hosts` 与 `host_pins.json`，或通过无参数管理工具 `agent_hosts_reload` 立即更新。返回 `{added,updated,removed}`；`agent_hosts` 保留 `hosts`，新增 `config_error`。不会为刷新调用新增 `peer.*` 方法或放宽成员权限。
+
+`HostRegistry.read_configured_hosts()` 只验证候选配置；`replace_hosts()` 原地应用。`PeerClientFactory.retire(host_ids)` 禁止旧句柄新发请求并等待已发请求完成；替换清单后调用 `release_retired(host_ids)`。完整 API 与轮询 ACK 先结束，未变化连接不关闭。无效输入或尚有未完成引用时整批不应用；历史路由须实际核实。详见 [动态节点检查](dynamic-hosts-20261109.md)。
+
 - 传输：`ssh <target> <remote_executable> relay`，每行一个 UTF-8 JSON，单帧不超过 `MAX_FRAME_BYTES`（1 MiB）。
 - 请求 `{"v":1,"id":"<frame id>","method":"peer.x","params":{…}}`；响应 `{"v":1,"id":…,"ok":true,"result":{…}}` 或 `"ok":false,"error":{code,message}`。
 - `id` 只用于帧对应，**不是幂等键**；幂等键是 `OperationKey = (node_id, state_generation, operation_id)`。

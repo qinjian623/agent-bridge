@@ -256,7 +256,7 @@ class NotificationOrderingTests(unittest.IsolatedAsyncioTestCase):
 
         async def sender(config, parent, message, event_seq, receipt=None):
             calls.append(event_seq)
-            return {"receipt": "submission", "ready": True}
+            return {"receipt": "submission", "ready": True, "native_status": "received", "native_turn_id": "turn-1"}
 
         await deliver(self.store, self.config, sender)
         delivery = self.store.get_parent("parent")["deliveries"][0]

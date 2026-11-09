@@ -216,6 +216,11 @@ _HTML_HEAD = """<!DOCTYPE html>
       background: #090d13;
       border-radius: 6px;
       position: relative;
+      overflow-x: auto;
+    }
+    .topo-container:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
     svg.topo-svg {
       width: 100%;
@@ -346,13 +351,17 @@ _HTML_BODY = """  <header>
     <!-- Cluster Topology Card -->
     <div class="card">
       <div class="card-header">
-        <div><span class="pulse-dot"></span>Cluster &amp; Communications Topology</div>
+        <div><span class="pulse-dot"></span>Host Connections &amp; Live Bridge Sessions</div>
         <div id="topoStats" style="font-size: 12px; color: var(--text-muted);"></div>
       </div>
       <div class="card-body" style="padding: 10px;">
-        <div class="topo-container">
-          <svg class="topo-svg" id="topoGraph" aria-label="Cluster topology"></svg>
+        <div class="topo-container" tabindex="0" aria-label="Host connections; scroll horizontally if needed">
+          <svg class="topo-svg" id="topoGraph" aria-label="Host connections and live local Bridge sessions"></svg>
         </div>
+        <p id="topoScope" style="margin: 8px 4px 0; color: var(--text-muted); font-size: 12px;">
+          Host links show SSH connection status. Sessions shown: local Bridge workers with live processes.
+          Remote/native sessions and message traffic are not collected.
+        </p>
       </div>
     </div>
 
@@ -899,156 +908,112 @@ _HTML_SCRIPT = """  <script>
     }
 
     function svgText(attributes, text) {
-      const element = svgNode('text', attributes);
+      const element = svgNode('text', { 'pointer-events': 'none', ...attributes });
       setText(element, text);
       return element;
     }
 
+    function buildTopology(data, viewportWidth) {
+      const local = (data.sessions || []).filter((session) => !session.host_id || session.host_id === 'local');
+      const live = local.filter((session) => session.alive === true && session.desired !== 'closed' && session.observed !== 'stopped');
+      const rank = (session) => session.waiting_question || session.observed === 'waiting_input' ? 0 : (session.observed === 'running' ? 1 : 2);
+      live.sort((a, b) => rank(a) - rank(b));
+      const hostNodes = [{ host_id: 'local', isCoord: true, data: data.coordinator || {}, sessions: live }];
+      (data.hosts || []).filter((host) => host.host_id !== 'local').forEach((host) => {
+        hostNodes.push({ host_id: host.host_id, isCoord: false, data: host, sessions: [] });
+      });
+      const columns = hostNodes.map((host) => Math.max(180, host.sessions.length * 44 + 28));
+      const minimumWidth = columns.reduce((sum, width) => sum + width, 40);
+      const width = Math.max(viewportWidth || 800, minimumWidth);
+      const extra = (width - minimumWidth) / hostNodes.length;
+      let left = 20;
+      hostNodes.forEach((host, index) => {
+        const columnWidth = columns[index] + extra;
+        host.x = left + columnWidth / 2;
+        host.y = 80;
+        host.sessions = host.sessions.map((session, sessionIndex) => ({
+          session: session, x: host.x + (sessionIndex - (host.sessions.length - 1) / 2) * 44, y: 170
+        }));
+        left += columnWidth;
+      });
+      return {
+        width: width, height: 240, hostNodes: hostNodes, liveCount: live.length,
+        recoveryCount: local.filter((session) => session.observed === 'recovery_needed').length
+      };
+    }
+
     function renderTopology(data) {
       const svg = document.getElementById('topoGraph');
-      const width = svg.clientWidth || 800;
-      const height = svg.clientHeight || 240;
-      const hosts = data.hosts || [];
-      const sessions = data.sessions || [];
-      const coordinator = data.coordinator || {};
-
+      const layout = buildTopology(data, svg.parentElement.clientWidth || 800);
+      const root = layout.hostNodes[0];
       svg.replaceChildren();
+      svg.setAttribute('viewBox', '0 0 ' + layout.width + ' ' + layout.height);
+      svg.style.width = layout.width + 'px';
+      document.getElementById('topoStats').textContent = layout.liveCount + ' live local' +
+        (layout.recoveryCount ? ' · ' + layout.recoveryCount + ' need recovery' : '');
 
-      if (hosts.length > 0) {
-        const totalHosts = hosts.length + 1;
-        const hostPositions = [];
-        const hostY = 70;
-
-        const cX = width / (totalHosts + 1);
-        hostPositions.push({ host_id: 'local', x: cX, y: hostY, isCoord: true });
-
-        hosts.forEach((host, i) => {
-          const hX = ((i + 2) * width) / (totalHosts + 1);
-          hostPositions.push({ host_id: host.host_id, x: hX, y: hostY, isCoord: false, data: host });
-        });
-
-        hostPositions.slice(1).forEach((hp) => {
-          const isOnline = hp.data && hp.data.state === 'online';
-          const stroke = isOnline ? '#3fb950' : '#8b949e';
-          const line = svgNode('line', {
-            x1: cX, y1: hostY, x2: hp.x, y2: hostY, stroke: stroke,
-            'stroke-dasharray': '5 3', 'stroke-width': 2, opacity: 0.8
-          });
-          if (isOnline) {
-            line.appendChild(svgNode('animate', {
-              attributeName: 'stroke-dashoffset', values: '0;8', dur: '1s', repeatCount: 'indefinite'
-            }));
-          }
-          svg.appendChild(line);
-
-          const midX = (cX + hp.x) / 2;
-          svg.appendChild(svgText({
-            x: midX, y: hostY - 8, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
-          }, 'SSH Relay'));
-        });
-
-        hostPositions.forEach((hp) => {
-          if (hp.isCoord) {
-            svg.appendChild(svgNode('circle', {
-              cx: hp.x, cy: hp.y, r: 28, fill: '#1f2937', stroke: '#bc8cff', 'stroke-width': 2.5
-            }));
-            svg.appendChild(svgText({
-              x: hp.x, y: hp.y - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 11, 'font-weight': 700
-            }, 'COORD'));
-            svg.appendChild(svgText({
-              x: hp.x, y: hp.y + 10, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
-            }, String(coordinator.host_id || 'local').substring(0, 10)));
-          } else {
-            const isOnline = hp.data && hp.data.state === 'online';
-            const stroke = isOnline ? '#3fb950' : '#f85149';
-            svg.appendChild(svgNode('circle', {
-              cx: hp.x, cy: hp.y, r: 26, fill: '#161b22', stroke: stroke, 'stroke-width': 2.2
-            }));
-            svg.appendChild(svgText({
-              x: hp.x, y: hp.y - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 10, 'font-weight': 600
-            }, String(hp.host_id).substring(0, 9)));
-            svg.appendChild(svgText({
-              x: hp.x, y: hp.y + 10, 'text-anchor': 'middle', fill: stroke, 'font-size': 8
-            }, isOnline ? 'ONLINE' : 'OFFLINE'));
-          }
-
-          const hostSessions = sessions.filter((s) => (hp.isCoord ? (s.host_id === 'local' || !s.host_id) : s.host_id === hp.host_id)).slice(0, 4);
-          const sessCount = hostSessions.length;
-          hostSessions.forEach((session, sIdx) => {
-            const spread = (sessCount - 1) * 36;
-            const sX = hp.x - (spread / 2) + (sIdx * 36);
-            const sY = hp.y + 90;
-            const isRunning = session.observed === 'running';
-            const isWaiting = Boolean(session.waiting_question);
-            const strokeColor = isWaiting ? '#d29922' : (isRunning ? '#3fb950' : '#8b949e');
-            const fillColor = isRunning ? '#064e3b' : '#111827';
-
-            const sessLine = svgNode('line', {
-              x1: hp.x, y1: hp.y + 26, x2: sX, y2: sY - 18, stroke: strokeColor,
-              'stroke-dasharray': isRunning ? '3 2' : 'none', 'stroke-width': 1.2, opacity: 0.6
-            });
-            svg.appendChild(sessLine);
-
-            svg.appendChild(svgNode('circle', {
-              cx: sX, cy: sY, r: 18, fill: fillColor, stroke: strokeColor, 'stroke-width': 1.8
-            }));
-            const name = session.name ? String(session.name) : String(session.runtime || '');
-            const displayName = name.length > 7 ? name.substring(0, 6) + '…' : name;
-            svg.appendChild(svgText({
-              x: sX, y: sY + 3, 'text-anchor': 'middle', fill: '#fff', 'font-size': 8, 'font-weight': 600
-            }, displayName));
-          });
-        });
-      } else {
-        const centerX = width / 2;
-        const centerY = height / 2;
-        const sessionsSlice = sessions.slice(0, 6);
-
-        svg.appendChild(svgNode('circle', {
-          cx: centerX, cy: centerY, r: 28, fill: '#1f2937', stroke: '#58a6ff', 'stroke-width': 2.5
+      layout.hostNodes.slice(1).forEach((host) => {
+        const online = host.data.state === 'online';
+        svg.appendChild(svgNode('path', {
+          d: 'M ' + root.x + ' 52 V 20 H ' + host.x + ' V 54',
+          fill: 'none', stroke: online ? '#3fb950' : '#8b949e',
+          'stroke-dasharray': '5 3', 'stroke-width': 2, opacity: 0.8,
+          'data-link-host': host.host_id
         }));
         svg.appendChild(svgText({
-          x: centerX, y: centerY - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 11, 'font-weight': 700
-        }, 'COORD'));
-        svg.appendChild(svgText({
-          x: centerX, y: centerY + 10, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
-        }, String(coordinator.host_id || 'local').substring(0, 10)));
+          x: host.x, y: 12, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 9
+        }, 'SSH'));
+      });
 
-        const totalNodes = Math.max(sessionsSlice.length, 1);
-        const radius = Math.min(centerX, centerY) - 45;
-        sessionsSlice.forEach((session, index) => {
-          const angle = (index / totalNodes) * 2 * Math.PI - Math.PI / 2;
-          const x = centerX + radius * Math.cos(angle);
-          const y = centerY + radius * Math.sin(angle);
-          const isRunning = session.observed === 'running';
-          const isWaiting = Boolean(session.waiting_question);
-          const strokeColor = isWaiting ? '#d29922' : (isRunning ? '#3fb950' : '#8b949e');
-          const fillColor = isRunning ? '#064e3b' : '#111827';
-
-          const line = svgNode('line', {
-            x1: centerX, y1: centerY, x2: x, y2: y, stroke: strokeColor,
-            'stroke-dasharray': isRunning ? '4 2' : 'none', 'stroke-width': 1.5, opacity: 0.7
-          });
-          if (isRunning) {
-            line.appendChild(svgNode('animate', {
-              attributeName: 'stroke-dashoffset', values: '0;6', dur: '0.8s', repeatCount: 'indefinite'
-            }));
-          }
-          svg.appendChild(line);
-
-          svg.appendChild(svgNode('circle', {
-            cx: x, cy: y, r: 24, fill: fillColor, stroke: strokeColor, 'stroke-width': 2
-          }));
-          const name = session.name ? String(session.name) : String(session.runtime || '');
-          const displayName = name.length > 9 ? name.substring(0, 8) + '…' : name;
-          svg.appendChild(svgText({
-            x: x, y: y - 3, 'text-anchor': 'middle', fill: '#fff', 'font-size': 9, 'font-weight': 600
-          }, displayName));
-          svg.appendChild(svgText({
-            x: x, y: y + 9, 'text-anchor': 'middle', fill: strokeColor, 'font-size': 8
-          }, String(session.id || '').substring(0, 6)));
+      layout.hostNodes.forEach((host) => {
+        const state = host.isCoord ? 'local' : (host.data.state || 'unknown');
+        const stateLabel = { online: 'ONLINE', offline: 'OFFLINE', identity_changed: 'ID CHANGED', state_corrupted: 'CORRUPT' }[state] || 'UNKNOWN';
+        const color = host.isCoord ? '#bc8cff' : (state === 'online' ? '#3fb950' : (state === 'offline' ? '#f85149' : '#d29922'));
+        const circle = svgNode('circle', {
+          cx: host.x, cy: host.y, r: host.isCoord ? 28 : 26,
+          fill: '#161b22', stroke: color, 'stroke-width': 2.2,
+          'data-host-id': host.host_id
         });
-      }
+        const hostName = String(host.isCoord ? (host.data.host_id || 'local') : host.host_id);
+        const title = svgNode('title');
+        setText(title, hostName + ' · ' + state);
+        circle.appendChild(title);
+        svg.appendChild(circle);
+        svg.appendChild(svgText({
+          x: host.x, y: host.y - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 10, 'font-weight': 600
+        }, host.isCoord ? 'COORD' : hostName.substring(0, 9)));
+        svg.appendChild(svgText({
+          x: host.x, y: host.y + 10, 'text-anchor': 'middle', fill: color, 'font-size': 8
+        }, host.isCoord ? hostName.substring(0, 10) : stateLabel));
+
+        if (!host.sessions.length) {
+          svg.appendChild(svgText({
+            x: host.x, y: 170, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 10
+          }, host.isCoord ? 'No live Bridge workers' : 'Sessions not collected'));
+        }
+        host.sessions.forEach((node) => {
+          const session = node.session;
+          const running = session.observed === 'running';
+          const waiting = session.waiting_question || ['waiting_input', 'recovery_needed'].includes(session.observed);
+          const color = waiting ? '#d29922' : (running ? '#3fb950' : '#8b949e');
+          svg.appendChild(svgNode('line', {
+            x1: host.x, y1: host.y + 28, x2: node.x, y2: node.y - 18,
+            stroke: color, 'stroke-width': 1.2, opacity: 0.6
+          }));
+          const circle = svgNode('circle', {
+            cx: node.x, cy: node.y, r: 18, fill: running ? '#064e3b' : '#111827',
+            stroke: color, 'stroke-width': 1.8, 'data-session-id': session.id
+          });
+          const name = String(session.name || session.runtime || session.id || 'session');
+          const title = svgNode('title');
+          setText(title, name + ' · ' + String(session.runtime || '') + ' · ' + String(session.observed || 'unknown') + ' · ' + String(session.id || ''));
+          circle.appendChild(title);
+          svg.appendChild(circle);
+          svg.appendChild(svgText({
+            x: node.x, y: node.y + 3, 'text-anchor': 'middle', fill: '#fff', 'font-size': 8, 'font-weight': 600
+          }, name.length > 7 ? name.substring(0, 6) + '…' : name));
+        });
+      });
     }
 
     function renderDashboard(data) {

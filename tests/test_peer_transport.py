@@ -183,6 +183,18 @@ class FixedTransport(RecordingTransport):
         super().__init__(result=result)
 
 
+class HandshakeTransport(RecordingTransport):
+    def __init__(self, hello=None):
+        super().__init__()
+        self.hello = hello if hello is not None else hello_result()
+
+    async def call(self, request, timeout):
+        self.calls.append((request, timeout))
+        await asyncio.sleep(0)
+        result = self.hello if request["method"] == "peer.hello" else {"profiles": []}
+        return {"v": PROTOCOL_VERSION, "id": request["id"], "ok": True, "result": result}
+
+
 class SshPeerTransportTests(unittest.IsolatedAsyncioTestCase):
     def spawn(self, process):
         patcher = patch(
@@ -531,14 +543,343 @@ class DefaultPeerClientFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, PeerErrorCode.STATE_CORRUPTED)
         self.assertEqual(registry.status("gpu-a")[0].state, HostState.STATE_CORRUPTED)
 
-    async def test_non_hello_calls_do_not_run_the_handshake_check(self):
+    async def test_non_hello_calls_verify_identity_before_sending(self):
         pinned = NodeRef("gpu-a", "node-a", "gen-a")
-        registry, factory, _, _ = self.factory(pinned, {"profiles": []})
+        registry = ConfigHostRegistry({"gpu-a": make_host(pinned=pinned)})
+        transport = HandshakeTransport()
+        factory = DefaultPeerClientFactory(registry, lambda config: transport)
 
         result = await factory.client("gpu-a").catalog({})
 
         self.assertEqual(result, {"profiles": []})
+        self.assertEqual([r[0]["method"] for r in transport.calls], ["peer.hello", "peer.catalog"])
+        status = registry.status("gpu-a")[0]
+        self.assertEqual(status.state, HostState.ONLINE)
+        self.assertEqual(status.protocol_version, PROTOCOL_VERSION)
+        self.assertIsNotNone(status.last_contact)
+
+    async def test_reuses_one_client_and_transport_for_a_host(self):
+        _, factory, transport, created = self.factory(None, hello_result())
+
+        first = factory.client("gpu-a")
+        second = factory.client("gpu-a")
+
+        self.assertIs(first, second)
+        self.assertIs(first._transport, transport)
+        self.assertEqual(len(created), 1)
+
+    async def test_retire_closes_only_changed_hosts_and_blocks_old_client_references(self):
+        registry = ConfigHostRegistry({name: make_host(name) for name in ("gpu-a", "gpu-b")})
+        created = []
+
+        def make_transport(config):
+            transport = HandshakeTransport()
+            created.append((config, transport))
+            return transport
+
+        factory = DefaultPeerClientFactory(registry, make_transport)
+        old = factory.client("gpu-a")
+        unaffected = factory.client("gpu-b")
+        await factory.retire(["gpu-a"])
+        with self.assertRaises(BridgeError) as caught:
+            factory.client("gpu-a")
+        self.assertEqual(caught.exception.code, "host_busy")
+        with self.assertRaises(BridgeError) as caught:
+            await old.catalog({})
+        self.assertEqual(caught.exception.code, "host_busy")
+        self.assertTrue(created[0][1].closed)
+        self.assertEqual(created[0][1].calls, [])
+        self.assertFalse(created[1][1].closed)
+        self.assertIs(factory.client("gpu-b"), unaffected)
+
+        changed = make_host("gpu-a", ssh_target="replacement-target")
+        registry.replace_hosts({"gpu-a": changed, "gpu-b": registry.get("gpu-b")})
+        factory.release_retired(["gpu-a"])
+        replacement = factory.client("gpu-a")
+        self.assertIsNot(replacement, old)
+        self.assertEqual(created[-1][0].ssh_target, "replacement-target")
+        await replacement.catalog({})
+        with self.assertRaises(BridgeError):
+            await old.catalog({})
+        self.assertEqual(created[0][1].calls, [])
+        await factory.close()
+
+    async def test_retire_drains_current_write_and_rejects_queued_or_new_requests(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class InflightTransport(HandshakeTransport):
+            async def call(self, request, timeout):
+                if request["method"] == "peer.deliver":
+                    self.calls.append((request, timeout))
+                    entered.set()
+                    await release.wait()
+                    return {"v": PROTOCOL_VERSION, "id": request["id"], "ok": True,
+                            "result": {"accepted": True}}
+                return await super().call(request, timeout)
+
+        registry = ConfigHostRegistry({"gpu-a": make_host()})
+        transport = InflightTransport()
+        factory = DefaultPeerClientFactory(registry, lambda config: transport)
+        client = factory.client("gpu-a")
+        write = asyncio.create_task(client.deliver({"operation": OPERATION}))
+        await asyncio.wait_for(entered.wait(), 1)
+        queued = asyncio.create_task(client.catalog({}))
+        await asyncio.sleep(0)
+        retiring = asyncio.create_task(factory.retire(["gpu-a"]))
+        await asyncio.sleep(0)
+        self.assertFalse(retiring.done())
+        self.assertFalse(transport.closed)
+        self.assertFalse(write.done())
+        with self.assertRaises(BridgeError) as caught:
+            await asyncio.wait_for(client.catalog({}), .2)
+        self.assertEqual(caught.exception.code, "host_busy")
+        with self.assertRaises(BridgeError):
+            factory.client("gpu-a")
+
+        release.set()
+        self.assertEqual(await write, {"accepted": True})
+        with self.assertRaises(BridgeError) as caught:
+            await queued
+        self.assertEqual(caught.exception.code, "host_busy")
+        await retiring
+        self.assertTrue(transport.closed)
+        self.assertEqual([item[0]["method"] for item in transport.calls], ["peer.hello", "peer.deliver"])
+
+    async def test_removed_hosts_cannot_reconnect_after_release(self):
+        registry = ConfigHostRegistry({"gpu-a": make_host()})
+        transport = HandshakeTransport()
+        factory = DefaultPeerClientFactory(registry, lambda config: transport)
+        old = factory.client("gpu-a")
+        await factory.retire(["gpu-a"])
+        registry.replace_hosts({})
+        factory.release_retired(["gpu-a"])
+
+        with self.assertRaises(BridgeError) as caught:
+            factory.client("gpu-a")
+        self.assertEqual(caught.exception.code, PeerErrorCode.HOST_UNKNOWN)
+        with self.assertRaises(BridgeError):
+            await old.hello(HELLO_PARAMS)
+        self.assertEqual(transport.calls, [])
+
+    async def test_cancelled_retirement_keeps_the_write_running_and_host_frozen(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class InflightTransport(HandshakeTransport):
+            async def call(self, request, timeout):
+                if request["method"] == "peer.deliver":
+                    self.calls.append((request, timeout))
+                    entered.set()
+                    await release.wait()
+                    return {"v": PROTOCOL_VERSION, "id": request["id"], "ok": True,
+                            "result": {"accepted": True}}
+                return await super().call(request, timeout)
+
+        registry = ConfigHostRegistry({"gpu-a": make_host()})
+        transport = InflightTransport()
+        factory = DefaultPeerClientFactory(registry, lambda config: transport)
+        write = asyncio.create_task(factory.client("gpu-a").deliver({"operation": OPERATION}))
+        await asyncio.wait_for(entered.wait(), 1)
+        retiring = asyncio.create_task(factory.retire(["gpu-a"]))
+        await asyncio.sleep(0)
+        retiring.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await retiring
+        self.assertFalse(write.done())
+        self.assertFalse(transport.closed)
+        with self.assertRaises(BridgeError) as caught:
+            factory.client("gpu-a")
+        self.assertEqual(caught.exception.code, "host_busy")
+        release.set()
+        self.assertEqual(await write, {"accepted": True})
+        await factory.retire(["gpu-a"])
+        self.assertTrue(transport.closed)
+
+    async def test_hosts_keep_separate_connections_and_close_is_repeatable(self):
+        registry = ConfigHostRegistry({name: make_host(name) for name in ("gpu-a", "gpu-b")})
+        created = []
+
+        def make_transport(config):
+            transport = HandshakeTransport()
+            created.append((config.host_id, transport))
+            return transport
+
+        factory = DefaultPeerClientFactory(registry, make_transport)
+        first = factory.client("gpu-a")
+        second = factory.client("gpu-b")
+        self.assertIsNot(first, second)
+        self.assertEqual([name for name, _ in created], ["gpu-a", "gpu-b"])
+
+        await factory.close()
+        await factory.close()
+
+        self.assertTrue(all(transport.closed for _, transport in created))
+        self.assertIsNot(factory.client("gpu-a"), first)
+        self.assertEqual(len(created), 3)
+        await factory.close()
+
+    async def test_identity_mismatch_prevents_reads_and_writes(self):
+        for name, params in (("catalog", {}), ("deliver", {"operation": OPERATION})):
+            with self.subTest(method=name):
+                registry = ConfigHostRegistry({"gpu-a": make_host(pinned=NodeRef("gpu-a", "node-a", "gen-a"))})
+                transport = HandshakeTransport(hello_result(node_id="other"))
+                factory = DefaultPeerClientFactory(registry, lambda config, transport=transport: transport)
+
+                with self.assertRaises(BridgeError) as caught:
+                    await getattr(factory.client("gpu-a"), name)(params)
+
+                self.assertEqual(caught.exception.code, PeerErrorCode.IDENTITY_MISMATCH)
+                self.assertEqual([r[0]["method"] for r in transport.calls], ["peer.hello"])
+                self.assertEqual(registry.status("gpu-a")[0].state, HostState.IDENTITY_CHANGED)
+                self.assertTrue(transport.closed)
+
+    async def test_sticky_identity_failure_blocks_requests_until_re_registration(self):
+        registry, factory, transport, _ = self.factory(NodeRef("gpu-a", "node-a", "gen-a"), hello_result(node_id="other"))
+        client = factory.client("gpu-a")
+        with self.assertRaises(BridgeError):
+            await client.catalog({})
+
+        transport.result = hello_result()
+        with self.assertRaises(BridgeError) as caught:
+            await client.catalog({})
+
+        self.assertEqual(caught.exception.code, PeerErrorCode.IDENTITY_MISMATCH)
+        self.assertEqual(registry.status("gpu-a")[0].state, HostState.IDENTITY_CHANGED)
+        self.assertEqual([r[0]["method"] for r in transport.calls], ["peer.hello", "peer.hello"])
+
+    async def test_concurrent_calls_keep_handshake_and_request_together(self):
+        registry = ConfigHostRegistry({"gpu-a": make_host()})
+        transport = HandshakeTransport()
+        factory = DefaultPeerClientFactory(registry, lambda config: transport)
+
+        await asyncio.gather(factory.client("gpu-a").catalog({}), factory.client("gpu-a").inspect({"kind": "node"}))
+
+        self.assertEqual(
+            [r[0]["method"] for r in transport.calls],
+            ["peer.hello", "peer.catalog", "peer.hello", "peer.inspect"],
+        )
+
+    async def test_connection_loss_is_offline_and_does_not_replay_uncertain_write(self):
+        def respond(request):
+            result = hello_result() if request["method"] == "peer.hello" else {"profiles": []}
+            return {"v": PROTOCOL_VERSION, "id": request["id"], "ok": True, "result": result}
+
+        def lose_write(request):
+            return respond(request) if request["method"] == "peer.hello" else b""
+
+        first, second = FakeProcess(lose_write), FakeProcess(respond)
+        registry = ConfigHostRegistry({"gpu-a": make_host(pinned=NodeRef("gpu-a", "node-a", "gen-a"))})
+        factory = DefaultPeerClientFactory(registry)
+        with patch("agent_bridge.peer_transport.asyncio.create_subprocess_exec", new=AsyncMock(side_effect=[first, second])) as spawn:
+            client = factory.client("gpu-a")
+            with self.assertRaises(BridgeError) as caught:
+                await client.deliver({"operation": OPERATION})
+            self.assertEqual(caught.exception.code, PeerErrorCode.HOST_OFFLINE)
+            self.assertEqual(registry.status("gpu-a")[0].state, HostState.OFFLINE)
+            self.assertTrue(first.killed)
+
+            await factory.client("gpu-a").catalog({})
+            self.assertEqual(spawn.await_count, 2)
+            self.assertEqual([json.loads(line)["method"] for line in first.sent_lines], ["peer.hello", "peer.deliver"])
+            self.assertEqual([json.loads(line)["method"] for line in second.sent_lines], ["peer.hello", "peer.catalog"])
+            self.assertEqual(registry.status("gpu-a")[0].state, HostState.ONLINE)
+            await factory.close()
+
+    async def test_reconnected_host_must_match_pin_before_another_write(self):
+        def lost(request):
+            return b""
+
+        def changed(request):
+            return {"v": PROTOCOL_VERSION, "id": request["id"], "ok": True, "result": hello_result(node_id="changed")}
+
+        first, second = FakeProcess(lost), FakeProcess(changed)
+        registry = ConfigHostRegistry({"gpu-a": make_host(pinned=NodeRef("gpu-a", "node-a", "gen-a"))})
+        factory = DefaultPeerClientFactory(registry)
+        with patch("agent_bridge.peer_transport.asyncio.create_subprocess_exec", new=AsyncMock(side_effect=[first, second])):
+            with self.assertRaises(BridgeError):
+                await factory.client("gpu-a").catalog({})
+            with self.assertRaises(BridgeError) as caught:
+                await factory.client("gpu-a").deliver({"operation": OPERATION})
+
+            self.assertEqual(caught.exception.code, PeerErrorCode.IDENTITY_MISMATCH)
+            self.assertEqual([json.loads(line)["method"] for line in second.sent_lines], ["peer.hello"])
+            self.assertEqual(registry.status("gpu-a")[0].state, HostState.IDENTITY_CHANGED)
+            await factory.close()
+
+    async def test_ssh_exit_after_hello_does_not_send_business_frame_on_new_connection(self):
+        def exit_after_hello(request):
+            first.returncode = 255
+            return {"v": PROTOCOL_VERSION, "id": request["id"], "ok": True, "result": hello_result()}
+
+        first = FakeProcess(exit_after_hello)
+        registry = ConfigHostRegistry({"gpu-a": make_host(pinned=NodeRef("gpu-a", "node-a", "gen-a"))})
+        factory = DefaultPeerClientFactory(registry)
+        with patch("agent_bridge.peer_transport.asyncio.create_subprocess_exec", new=AsyncMock(return_value=first)) as spawn:
+            with self.assertRaises(BridgeError) as caught:
+                await factory.client("gpu-a").deliver({"operation": OPERATION})
+
+            self.assertEqual(caught.exception.code, PeerErrorCode.HOST_OFFLINE)
+            self.assertIn("not sent", str(caught.exception))
+            self.assertEqual([json.loads(line)["method"] for line in first.sent_lines], ["peer.hello"])
+            spawn.assert_awaited_once()
+            self.assertEqual(registry.status("gpu-a")[0].state, HostState.OFFLINE)
+            await factory.close()
+
+    async def test_protocol_failure_marks_offline_and_closes_connection(self):
+        for response in ({"protocol_version": PROTOCOL_VERSION}, {**hello_result(), "protocol_version": 999}):
+            with self.subTest(response=response):
+                registry = ConfigHostRegistry({"gpu-a": make_host()})
+                transport = HandshakeTransport(response)
+                factory = DefaultPeerClientFactory(registry, lambda config, transport=transport: transport)
+                with self.assertRaises(BridgeError):
+                    await factory.client("gpu-a").catalog({})
+                self.assertEqual(registry.status("gpu-a")[0].state, HostState.OFFLINE)
+                self.assertTrue(transport.closed)
+
+    async def test_business_error_keeps_verified_connection_online(self):
+        class RejectedBusinessTransport(HandshakeTransport):
+            async def call(self, request, timeout):
+                if request["method"] != "peer.hello":
+                    return {
+                        "v": PROTOCOL_VERSION, "id": request["id"], "ok": False,
+                        "error": {"code": PeerErrorCode.REVISION_CONFLICT, "message": "stale revision"},
+                    }
+                return await super().call(request, timeout)
+
+        registry = ConfigHostRegistry({"gpu-a": make_host()})
+        transport = RejectedBusinessTransport()
+        factory = DefaultPeerClientFactory(registry, lambda config: transport)
+        with self.assertRaises(BridgeError) as caught:
+            await factory.client("gpu-a").control({})
+        self.assertEqual(caught.exception.code, PeerErrorCode.REVISION_CONFLICT)
+        self.assertEqual(registry.status("gpu-a")[0].state, HostState.ONLINE)
+        self.assertFalse(transport.closed)
+
+    async def test_malformed_business_reply_marks_offline(self):
+        def respond(request):
+            if request["method"] != "peer.hello":
+                return b"not-json\n"
+            return {"v": PROTOCOL_VERSION, "id": request["id"], "ok": True, "result": hello_result()}
+
+        registry = ConfigHostRegistry({"gpu-a": make_host()})
+        process = FakeProcess(respond)
+        factory = DefaultPeerClientFactory(registry)
+        with patch("agent_bridge.peer_transport.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+            with self.assertRaises(BridgeError) as caught:
+                await factory.client("gpu-a").catalog({})
+            self.assertEqual(caught.exception.code, PeerErrorCode.INVALID_PARAMS)
+            self.assertEqual(registry.status("gpu-a")[0].state, HostState.OFFLINE)
+            self.assertTrue(process.killed)
+            await factory.close()
+
+    async def test_start_failure_marks_offline(self):
+        registry = ConfigHostRegistry({"gpu-a": make_host()})
+        registry.mark("gpu-a", HostState.ONLINE)
+        factory = DefaultPeerClientFactory(registry)
+        with patch("agent_bridge.peer_transport.asyncio.create_subprocess_exec", new=AsyncMock(side_effect=OSError("SSH unavailable"))):
+            with self.assertRaises(BridgeError):
+                await factory.client("gpu-a").catalog({})
         self.assertEqual(registry.status("gpu-a")[0].state, HostState.OFFLINE)
+        await factory.close()
 
     async def test_unknown_hosts_are_rejected_before_creating_a_transport(self):
         registry = ConfigHostRegistry({})

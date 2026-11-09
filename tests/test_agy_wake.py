@@ -247,7 +247,7 @@ class AgyWakeTests(unittest.TestCase):
             try:
                 state = Path("/proc", str(descendant), "stat").read_text().split(") ", 1)[1].split()[0]
                 return state != "Z"
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return False
 
         if child_is_live():

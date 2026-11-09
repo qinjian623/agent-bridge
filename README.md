@@ -4,7 +4,11 @@
 
 当前为可运行的开发版本。三个程序的真实执行、中断、重开，以及 Astra 父进程退出后继续处理 Sol、Pi、Claude 结果均已通过检查。包含主会话开销的小型比较见 [报告](docs/benchmark.md)。真实 Telegram 消息测试仍待授权，详见 [检查记录](docs/verification.md)。
 
-多机器接入方案见 [多机器架构规范](docs/multi-machine-design.md)（已整合 [AGY / DeepSeek 审查结论](docs/multi-machine-review.md)）。阶段 A3 已提供 `agent-bridge relay`、SSH JSONL 传输、`peer.hello` / `peer.inspect` 握手与只读 `agent_hosts` 查询；协调端路由与派单接线仍未完成，日常使用仍按单机运行。
+多机器接入方案见 [多机器架构规范](docs/multi-machine-design.md)（已整合 [AGY / DeepSeek 审查结论](docs/multi-machine-review.md)）。代码已提供 `agent-bridge relay`、SSH JSONL 传输、节点握手、主机查询、远端任务与分组接口。远端机器需要独立运行 Broker；连接按主机复用，每次请求前核对节点身份，断线不自动重发原请求。本机与 Captain 的服务启动和只读通信检查见 [部署记录](docs/macos-node-service-verification-20261108.md)，该检查未执行远端模型任务或广播。
+
+本版 Broker 会自动检查 `config.json` 中的 `hosts` 和 `host_pins.json`，运行中增删节点无需重启服务。也可调用 `agent-bridge call agent_hosts_reload --json '{}'` 立即应用配置；`agent_hosts.config_error` 显示配置错误或拒绝变更的原因。未变化节点保留原 SSH，正在处理的请求和 ACK 先完成，再替换相关连接。配置无效时保留上一份有效清单，不重发任务。
+
+仍在分组中、存在待处理消息或结果不明的节点拒绝删除/改址；历史父通知路由需只读核实会话关闭、任务结束且完成审查后才允许。节点移除不停止远端程序，也不清除历史。使用方式、限制及首次部署说明见 [动态节点检查记录](docs/dynamic-hosts-20261109.md)。
 
 Antigravity 是新增运行时：离线 CLI 协议与 broker/worker 测试覆盖连续追问、取消、恢复、权限拒绝和 token 统计；真实 `agy 1.4.3` 已验证模型目录与零推理启动握手。真实模型推理、工具执行及取消尚未联调。
 
@@ -46,7 +50,27 @@ agent-bridge call agent_open --json '{"profile":"agy-sonnet","cwd":"/absolute/pr
 
 账号限制：Google [官方 FAQ](https://www.antigravity.google/docs/faq#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) 当前说明，消费套餐不支持把 `agy` 封装到第三方编码代理或应用。实现这些接口不表示消费订阅支持该用途；请按具体账号授权使用。本项目不会自动加入 Antigravity 配置或切换账号。协议参考 [Headless mode](https://www.antigravity.google/docs/cli/headless)。
 
-## 安装与调用
+## GitHub 发布与定时更新
+
+GitHub 在 push/PR 后运行离线测试、Ruff 和 Linux/macOS 打包安装检查。稳定 `vX.Y.Z` tag 全部通过后自动发布 wheel、源码包与 `SHA256SUMS`；见 [CI 与发布](docs/ci-release.md)。
+
+已安装版本可使用：
+
+```bash
+agent-bridge update install
+agent-bridge update check
+agent-bridge update run
+```
+
+更新配置为 `~/.local/state/cli-agent-bridge/update.json`（0600），可配置 GitHub 仓库、独立版本目录、systemd/launchd 服务名和检查间隔。私有仓库使用该用户已有的 `gh` 登录，先用 `gh auth login` 完成授权；不在代码、包或定时器中保存 token。安装时默认不启动定时器，也不修改已有 Broker 服务；完成首次服务迁移后再使用 `agent-bridge update install --enable`。Linux 每小时检查并随机延迟最多 5 分钟，macOS 使用 LaunchAgent 定时检查。
+
+更新下载经过 SHA256 检查的 wheel，在新版本专用虚拟环境中安装，先运行配置与隔离服务检查。还有任务、worker、通知/helper 或未返回请求时延期；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录禁止新派单和发送，其他节点也不能在此时投递新工作。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。
+
+`~/.local/share/cli-agent-bridge/bin/agent-bridge` 是固定入口，Broker、CLI、MCP、远端 relay 和 skill 应使用该入口或 `current/skill`，不能只改 Broker 而让其它入口仍指向旧 checkout。版本目录保留，源仓库及其未提交修改不被更新程序覆盖。正在运行的原生终端不被重启，MCP 配置修改在下次加载时生效。定时器只更新 Bridge，不更新 Codex、Claude、Pi 或 AGY 本身。
+
+最近结果保存在状态目录的 `update-status.json`；下载/授权失败会记录失败类型。首版迁移及各节点验证记录另列，不能将定时器已安装当作升级已成功。
+
+## 本机安装与调用
 
 需要 Linux 用户级 systemd、Python 3.11+、uv，以及已登录的本机 CLI。项目固定使用 MCP Python SDK 1.30.0、Claude Agent SDK 0.2.172。实际检查的 CLI 为 Codex 0.163.0、Claude Code 2.1.307、Pi 1.3.0。
 
@@ -183,6 +207,7 @@ worker 启动或连接失败也会通知已登记父会话。尚未执行的任�
 | Pi / 已配置供应商 | RPC `get_available_models`，按配置中的供应商筛选 |
 | Claude Code / Anthropic | SDK `get_server_info().models` 的 `resolvedModel`，不用界面别名 |
 | Claude Code / DeepSeek | DeepSeek `GET /models`，只列声明支持 Anthropic 消息接口的模型 |
+| Claude Code / Ollama Cloud | Ollama `GET /api/tags`，保留目录返回的准确模型 ID |
 
 主 agent 查询后，可以用 `profile + model` 明确选模型并分配任务。例如，先在目录中确认下例 ID 仍然存在：
 
@@ -197,7 +222,28 @@ agent-bridge call agent_dispatch --json '{"profile":"codex-sol","model":"gpt-6-l
 
 发现过程不发送推理请求，也不自动逐个测试模型。新发现模型由主 agent 明确选择；省略 `profile/model` 时，服务的均衡打分仍使用已经验证的配置。当前任务只接受文本，即使模型目录列出图片输入，也不会因此启用图片传递。目录缺失价格时保留未知，不能按零计算。
 
-接口依据：[Codex App Server](https://learn.chatgpt.com/docs/app-server)、[Pi RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)、[Claude Python SDK](https://code.claude.com/docs/en/agent-sdk/python)、[DeepSeek 模型目录](https://api-docs.deepseek.com/api/list-models/)。
+接口依据：[Codex App Server](https://learn.chatgpt.com/docs/app-server)、[Pi RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)、[Claude Python SDK](https://code.claude.com/docs/en/agent-sdk/python)、[DeepSeek 模型目录](https://api-docs.deepseek.com/api/list-models/)、[Ollama Cloud](https://github.com/ollama/ollama/blob/main/docs/cloud.mdx)。
+
+### Claude Code 使用 Ollama Cloud
+
+在 `config.json` 的 `profiles` 中加入独立配置，保留原有官方 DeepSeek 配置：
+
+```json
+"claude-ollama": {
+  "runtime": "claude",
+  "provider": "ollama-anthropic",
+  "endpoint_host": "ollama.com",
+  "model": "deepseek-v4.1-flash",
+  "env_file": "/absolute/private/ollama-env.json",
+  "quota_group": "ollama-account",
+  "billing_mode": "api",
+  "verified": false
+}
+```
+
+`env_file` 是权限为 `0600` 的 JSON 字符串表，至少设置 `ANTHROPIC_BASE_URL=https://ollama.com`；可在其中单独设置代理。认证使用 `OLLAMA_API_KEY`，未设置时读取当前用户已有的 `~/.config/claude-ollama/api-key`（属主必须为当前用户，普通文件、权限 `0600`），不借用官方 DeepSeek 的凭据。默认代理沿用本机 wrapper 的 `http://127.0.0.1:1080`，其他机器需明确设置自己的代理。
+
+新配置和供应商代码需要 broker 重新启动后读取。目录查询成功仍保持 `verified: false`，真实调用核对返回模型后再标为已验证。Flash 低峰优先规则由 [分工 skill](skills/cli-agent-bridge/resources/router-prompt.md#flash-按供应商低峰时间分配) 执行，时间脚本不修改 broker 的均衡打分，也不迁移已有会话。
 
 ## 均衡选择与费用
 
@@ -239,11 +285,15 @@ Codex 恢复时缺少本轮执行前的累计值，会将本轮用量标为不�
 
 总统计合计所有子任务 attempt 和已登记父会话；未登记的主会话、已登记但未启用统计的父记录、丢失的原生计数都会保留统计限制。不能用不完整总量声称节省费用。外部 CLI 上报有延迟，共享预算仍只能尽力控制。
 
-完成事件持久保存后入原生队列。原客户端仍占用会话时等待；退出后向原生接口发送 `thread/resume`，不覆盖父会话的模型、推理强度和批准策略。需要批准或输入时返回原生等待标记。只恢复已登记的父会话，不重启共享 Codex 服务。`parent_pause` 和 `parent_close` 不等待正在发送的整批通知，会停止后续通知和唤醒；已经开始发送的单条通知仍可能完成，已经交给原客户端的消息不能撤回。`parent_reopen` 必须由主 agent 明确调用。
+完成事件持久保存后入原生队列。原客户端仍占用会话时等待；退出后向原生接口发送 `thread/resume`，不覆盖父会话的模型、推理强度和批准策略。需要批准或输入时返回原生等待标记。只恢复已登记的父会话，不重启共享 Codex 服务。`parent_pause` 和 `parent_close` 不等待正在发送的整批通知，会停止后续通知和唤醒；已经开始发送的单条通知仍可能完成。`parent_reopen` 必须由主 agent 明确调用。
 
 Codex 0.163.0 的恢复接口不会保留启动时临时传入的 MCP 配置。若父会话使用独立服务或临时工具配置，登记时用 `resume_config_file` 引用一份由当前用户拥有、权限 600 的 JSON 文件，内容与原会话启动时一致。仅允许 `mcp_servers`、`plugins`、`apps` 和 `features.multi_agent`，不能借此更改模型或沙箱权限；服务只保存文件位置。普通全局配置无需此参数。MCP 只读查询已标记为只读，写操作仍遵循父会话自身的批准设置；[Codex 工具批准配置说明](https://learn.chatgpt.com/docs/extend/mcp)。
 
-通知区分队列已接收与主 agent 已处理，后者通过 `parent_ack(event_seq=...)` 确认。通知辅助进程未能启动、或入队前初始化失败时保留等待状态，可以重试；队列响应丢失时标记 `uncertain`，不自动重发。发送结果不会覆盖同时到达的 `parent_ack`。
+通知区分原生入队、已进入原生轮次与父 agent 已处理。`native_status=enqueued` 只表示入队；匹配到原生 `userMessage.clientId` 才记为 `received` 并保存 `native_turn_id`，这仍不证明模型已读。`parent_ack(event_seq=...)` 把处理状态记为 `processed`，可以来自父 agent 对 `agent_result` 的独立处理，不推断通知已进入原生轮次。旧版 `accepted` 不作为已读证明，会重新只读核查。
+
+ACK 后仍在原生队列的同一事件会被精确撤回，结果记录在 `queue_cleanup=removed/already_started/uncertain`。同时核对目标、事件 clientId 与已有回执；发送期间到达 ACK 也保留迟到回执。清理不受父记录暂停或关闭影响，只操作这一条队列记录，不恢复或中断会话。已经进入原生轮次的通知不能撤回；找不到消息、回执冲突或删除失败都不当作已读，不重新发送。删除结果未知后，后续自动检查仅查询队列和原生轮次，不再次删除；尚未尝试删除就连接失败时允许安全重试。
+
+通知辅助进程未能启动、或入队前初始化失败时保留等待状态，可以重试；队列响应丢失时标记 `uncertain`，不自动重发。发送结果不会覆盖同时到达的 `parent_ack`。通知正文包含事件时间，并明确不授权恢复已暂停的开发或重跑任务。
 
 主会话确实收到并处理通知后，`sending`、`uncertain`、`wake_pending`、`accepted` 均可确认；尚未发送的 `pending` 不能确认。等待中的通知按上次尝试时间轮换，某个父会话持续忙碌或 Telegram 暂停不会让其他会话一直等不到。恢复前会分页查完原生队列，直到找到通知或确认队列中已经没有它。
 

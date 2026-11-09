@@ -13,22 +13,33 @@ def client_id(delivery_id):
     return "cli-agent-bridge:group:" + delivery_id
 
 
-def inspect_receipt(client, job):
-    wanted = client_id(job["id"])
+def inspect_receipt(client, job, *, message_id=None):
+    wanted = message_id if message_id is not None else client_id(job["id"])
     params = {"threadId": job["native_id"], "limit": 100}
     cursors = set()
+    matches = []
+    conflicting_receipt = False
     while True:
         page = client.request("thread/queue/list", params)
         for item in page["data"]:
             if item.get("clientUserMessageId") == wanted:
-                return {"status": "enqueued", "receipt": item["id"]}
+                matches.append(item)
+            elif job.get("receipt") and item.get("id") == job["receipt"]:
+                conflicting_receipt = True
         cursor = page.get("nextCursor")
         if not cursor:
             break
         if cursor in cursors:
             raise ValueError("Native queue repeated a pagination cursor")
         cursors.add(cursor)
-        params["cursor"] = cursor
+        params = {**params, "cursor": cursor}
+    if conflicting_receipt or len(matches) > 1:
+        return {"status": "unconfirmed", "error": "Native queue identifiers conflict; no submission was selected"}
+    if matches:
+        receipt = matches[0]["id"]
+        if job.get("receipt") and job["receipt"] != receipt:
+            return {"status": "unconfirmed", "error": "Native queue receipt does not match the client message identifier"}
+        return {"status": "enqueued", "receipt": receipt}
     # Absence from the queue is not acknowledgement: it could have been deleted.
     params = {"threadId": job["native_id"], "limit": 20, "sortDirection": "desc", "itemsView": "full"}
     cursors = set()
@@ -42,7 +53,7 @@ def inspect_receipt(client, job):
         if not cursor or cursor in cursors:
             break
         cursors.add(cursor)
-        params["cursor"] = cursor
+        params = {**params, "cursor": cursor}
     # shortcut: scan only the latest 100 turns; older messages stay unconfirmed, never resent.
     return {"status": "unconfirmed", "error": "Not in the queue; no matching native user message in the latest 100 turns"}
 

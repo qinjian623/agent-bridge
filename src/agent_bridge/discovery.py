@@ -91,8 +91,11 @@ async def native_models(profile: Profile, cwd):
     if profile.runtime == "claude":
         environment = claude_environment(profile)
         host = urlsplit(environment.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).hostname
-        if host != {"anthropic": "api.anthropic.com", "deepseek-anthropic": "api.deepseek.com"}.get(profile.provider):
+        if host != {"anthropic": "api.anthropic.com", "deepseek-anthropic": "api.deepseek.com",
+                    "ollama-anthropic": "ollama.com"}.get(profile.provider):
             raise BridgeError("discovery_unsupported", "No model directory is configured for this Claude endpoint")
+        if profile.provider == "ollama-anthropic":
+            return await asyncio.to_thread(ollama_models, environment), "Ollama GET /api/tags"
         if profile.provider == "deepseek-anthropic":
             return await asyncio.to_thread(deepseek_models, environment), "DeepSeek GET /models"
         if profile.provider != "anthropic":
@@ -183,6 +186,38 @@ async def native_models(profile: Profile, cwd):
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
+
+
+def ollama_models(environment):
+    key = environment.get("OLLAMA_API_KEY")
+    if not key:
+        raise BridgeError("discovery_auth_missing", "Ollama model discovery needs its own API credential")
+    proxies = {
+        scheme: environment.get(scheme.upper() + "_PROXY") or environment.get(scheme + "_proxy")
+        for scheme in ("http", "https")
+    }
+    opener = build_opener(ProxyHandler({k: v for k, v in proxies.items() if v}), NoRedirect())
+    try:
+        with opener.open(
+            Request("https://ollama.com/api/tags", headers={"Authorization": "Bearer " + key}), timeout=10,
+        ) as response:
+            body = response.read(2 * 1024 * 1024 + 1)
+    except HTTPError as error:
+        raise BridgeError("discovery_http_error", f"Ollama model directory returned HTTP {error.code}") from None
+    if len(body) > 2 * 1024 * 1024:
+        raise BridgeError("invalid_catalog", "Ollama model directory response is too large")
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise BridgeError("invalid_catalog", "Ollama model directory returned malformed JSON") from None
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        raise BridgeError("invalid_catalog", "Ollama model directory must contain a models list")
+    rows = []
+    for item in data["models"]:
+        if not isinstance(item, dict):
+            raise BridgeError("invalid_catalog", "Ollama model directory contains an invalid model")
+        rows.append(model_record(item.get("name") or item.get("model")))
+    return rows
 
 
 def deepseek_models(environment):
