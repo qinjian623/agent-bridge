@@ -1,6 +1,7 @@
 """Monitor collector and terminal dashboard for cli-agent-bridge."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import state_directory
+from .errors import BridgeError
 from .hosts import ConfigHostRegistry
 from .node_identity import FileNodeIdentityStore
 from .store import Store
@@ -119,9 +121,10 @@ def derive_session_name(
 class MonitorCollector:
     """Collects multi-agent status, communications, and cluster health directly from local store."""
 
-    def __init__(self, state: Path | str | None = None) -> None:
+    def __init__(self, state: Path | str | None = None, *, host_registry=None) -> None:
         self.state = state_directory(state)
         self.db_path = self.state / "bridge.sqlite"
+        self.host_registry = host_registry
 
     def _open_db(self) -> sqlite3.Connection | None:
         if not self.db_path.exists():
@@ -143,6 +146,21 @@ class MonitorCollector:
         return cur.fetchone() is not None
 
     def collect(self, limit: int = 15, include_events: bool = True) -> dict[str, Any]:
+        if self.host_registry is None and (self.state / "broker.sock").exists():
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                from .broker import request
+
+                async def live_snapshot():
+                    return await asyncio.wait_for(request(self.state, "agent_monitor", {
+                        "limit": limit, "include_events": include_events,
+                    }), 2)
+
+                try:
+                    return asyncio.run(live_snapshot())
+                except (BridgeError, OSError, ValueError, TimeoutError):
+                    pass
         now = time.time()
         hostname = socket.gethostname()
 
@@ -168,7 +186,7 @@ class MonitorCollector:
         # Hosts from registry
         hosts: list[dict[str, Any]] = []
         try:
-            registry = ConfigHostRegistry(self.state)
+            registry = self.host_registry if self.host_registry is not None else ConfigHostRegistry(self.state)
             for st in registry.status():
                 host_id = st.host_id
                 cfg = None

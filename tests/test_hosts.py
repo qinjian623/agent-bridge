@@ -2,6 +2,7 @@ import json
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from agent_bridge.config import Config
@@ -12,7 +13,7 @@ from agent_bridge.hosts import (
     ConfigHostRegistry,
     HostConfig,
 )
-from agent_bridge.peer_protocol import HostState, NodeRef, PeerErrorCode
+from agent_bridge.peer_protocol import PROTOCOL_VERSION, HostState, NodeRef, PeerErrorCode
 
 
 def make_host(host_id="gpu-a", **changes):
@@ -161,6 +162,7 @@ class ConfigHostRegistryTests(unittest.TestCase):
         status = self.registry.status("gpu-a")[0]
         self.assertEqual(status.state, HostState.ONLINE)
         self.assertIsNotNone(status.last_contact)
+        self.assertEqual(status.protocol_version, PROTOCOL_VERSION)
         self.assertIsNone(status.detail)
 
     def test_mark_accepts_a_state_value_and_rejects_unknown_states(self):
@@ -247,6 +249,92 @@ class ConfigHostRegistryTests(unittest.TestCase):
 
         self.assertEqual([host.host_id for host in registry.list()], ["gpu-a"])
         self.assertEqual(registry.get("gpu-a").ssh_target, "gpu-a.internal")
+
+    def test_replace_hosts_adds_removes_and_preserves_unchanged_live_status(self):
+        self.registry.mark("gpu-a", HostState.ONLINE)
+        original_status = self.registry.status("gpu-a")[0]
+        new_host = make_host("gpu-c")
+
+        self.registry.replace_hosts({"gpu-a": self.hosts["gpu-a"], "gpu-c": new_host})
+
+        self.assertEqual([host.host_id for host in self.registry.list()], ["gpu-a", "gpu-c"])
+        self.assertIs(self.registry.status("gpu-a")[0], original_status)
+        self.assertEqual(self.registry.status("gpu-c")[0].state, HostState.OFFLINE)
+        with self.assertRaises(BridgeError):
+            self.registry.get("gpu-b")
+        self.registry.replace_hosts({})
+        self.assertEqual(self.registry.status(), [])
+
+    def test_replace_hosts_resets_changed_connections_to_offline(self):
+        self.registry.mark("gpu-b", HostState.ONLINE)
+        changed = replace(self.hosts["gpu-b"], ssh_target="new-target")
+
+        self.registry.replace_hosts({"gpu-b": changed})
+
+        status = self.registry.status("gpu-b")[0]
+        self.assertEqual(status.state, HostState.OFFLINE)
+        self.assertEqual(status.node, changed.pinned)
+        self.assertIsNone(status.last_contact)
+        self.assertIsNone(status.protocol_version)
+
+    def test_replace_hosts_clears_sticky_failure_only_for_a_new_nonempty_pin(self):
+        for state in (HostState.IDENTITY_CHANGED, HostState.STATE_CORRUPTED):
+            with self.subTest(state=state):
+                original = self.hosts["gpu-b"]
+                registry = ConfigHostRegistry({"gpu-b": original})
+                registry.mark("gpu-b", state, "requires re-registration")
+                status = registry.status("gpu-b")[0]
+                changed = replace(original, ssh_options=("ConnectTimeout=5",))
+                registry.replace_hosts({"gpu-b": changed})
+                self.assertIs(registry.status("gpu-b")[0], status)
+                registry.replace_hosts({"gpu-b": replace(changed, pinned=None)})
+                self.assertIs(registry.status("gpu-b")[0], status)
+                registry.replace_hosts({"gpu-b": changed})
+                self.assertIs(registry.status("gpu-b")[0], status)
+                repinned = replace(changed, pinned=NodeRef("gpu-b", "new-node", "new-generation"))
+                registry.replace_hosts({"gpu-b": repinned})
+                self.assertEqual(registry.status("gpu-b")[0].state, HostState.OFFLINE)
+                self.assertEqual(registry.status("gpu-b")[0].node, repinned.pinned)
+
+    def test_read_configured_hosts_applies_disk_pins_without_changing_live_registry(self):
+        registry = ConfigHostRegistry(self.hosts, self.state)
+        registry.mark("gpu-a", HostState.ONLINE)
+        status = registry.status("gpu-a")[0]
+        (self.state / "config.json").write_text(json.dumps({"hosts": {
+            "gpu-c": {"ssh_target": "gpu-c", "remote_executable": "/bin/agent-bridge"},
+        }}))
+        (self.state / HOST_PINS_FILENAME).write_text(json.dumps({"hosts": {
+            "gpu-c": {"node_id": "node-c", "state_generation": "generation-c"},
+        }}))
+
+        configured = registry.read_configured_hosts()
+
+        self.assertEqual(list(configured), ["gpu-c"])
+        self.assertEqual(configured["gpu-c"].pinned, NodeRef("gpu-c", "node-c", "generation-c"))
+        self.assertEqual(registry.list(), list(self.hosts.values()))
+        self.assertIs(registry.status("gpu-a")[0], status)
+
+    def test_missing_or_invalid_configured_hosts_leave_live_state_unchanged(self):
+        registry = ConfigHostRegistry(self.hosts, self.state)
+        registry.mark("gpu-a", HostState.ONLINE)
+        status = registry.status("gpu-a")[0]
+        path = self.state / "config.json"
+        for contents in (None, "{", json.dumps({"hosts": {"bad": {}}})):
+            with self.subTest(contents=contents):
+                if contents is not None:
+                    path.write_text(contents)
+                with self.assertRaises(BridgeError):
+                    registry.read_configured_hosts()
+                self.assertEqual(registry.list(), list(self.hosts.values()))
+                self.assertIs(registry.status("gpu-a")[0], status)
+        path.write_text(json.dumps({"hosts": {"gpu-a": {
+            "ssh_target": "gpu-a", "remote_executable": "/bin/agent-bridge",
+        }}}))
+        (self.state / HOST_PINS_FILENAME).write_text("{")
+        with self.assertRaises(BridgeError) as caught:
+            registry.read_configured_hosts()
+        self.assertEqual(caught.exception.code, "invalid_host_pins")
+        self.assertIs(registry.status("gpu-a")[0], status)
 
 
 if __name__ == "__main__":

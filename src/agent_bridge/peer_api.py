@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
-from . import __version__, groups
+from . import __version__, groups, update_guard
 from .config import Profile
 from .errors import BridgeError
 from .node_identity import NodeIdentityStore
@@ -219,6 +220,18 @@ class DirectPeerService:
         self._workspace_locks_guard = threading.Lock()
 
     async def handle(self, request: PeerRequest) -> PeerResponse:
+        readonly = isinstance(request, dict) and request.get("method") in {"peer.hello", "peer.inspect"}
+        guard = update_guard.operation(self._store.state, readonly=readonly) if self._store else contextlib.nullcontext()
+        try:
+            with guard:
+                return await self._handle(request)
+        except BridgeError as error:
+            request_id = request.get("id", "") if isinstance(request, dict) else ""
+            if error.code == "update_busy":
+                error = peer_error(PeerErrorCode.HOST_OFFLINE, "Execution node is updating; no request was executed")
+            return fail(request_id, error)
+
+    async def _handle(self, request: PeerRequest) -> PeerResponse:
         if not isinstance(request, dict):
             return fail("", peer_error(PeerErrorCode.INVALID_PARAMS, "Peer request must be a JSON object"))
         raw_id = request.get("id")

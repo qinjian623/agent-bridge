@@ -18,7 +18,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from . import groups, native_broadcast, peer_api
+from . import __version__, groups, native_broadcast, peer_api, update_guard
 from .config import Config, Profile, read_admin_token, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
@@ -60,6 +60,7 @@ _TERMINAL_PEER_STATUSES = (
 _HOST_BLOCKING_CODES = {
     str(PeerErrorCode.HOST_OFFLINE), str(PeerErrorCode.HOST_UNKNOWN),
     str(PeerErrorCode.IDENTITY_MISMATCH), str(PeerErrorCode.STATE_CORRUPTED),
+    "host_busy",
 }
 
 
@@ -309,7 +310,8 @@ class DeliveryScheduler:
     async def run(self):
         while not self._stopping.is_set():
             try:
-                await self.step()
+                with update_guard.operation(self.store.state):
+                    await self.step()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -337,6 +339,7 @@ class OutboxPuller:
         self._temp_after: dict[str, int] = {}
         self._scan_upper: dict[str, int] = {}
         self._nodes: dict[str, NodeRef] = {}
+        self._poll_locks: dict[str, asyncio.Lock] = {}
         self._stopping = asyncio.Event()
 
     def _client(self, host_id):
@@ -525,6 +528,10 @@ class OutboxPuller:
         self.store.update_pulled_request_receipt_acked(host_id, node.node_id, node.state_generation, operation_id)
 
     async def run_once(self, host_id: str) -> int:
+        async with self._poll_locks.setdefault(host_id, asyncio.Lock()):
+            return await self._run_once(host_id)
+
+    async def _run_once(self, host_id: str) -> int:
         client = self._client(host_id)
         after = self._temp_after.get(host_id, 0)
         response = await client.pull_requests({"after": after, "limit": 100})
@@ -564,17 +571,23 @@ class OutboxPuller:
         return processed
 
     async def _host_loop(self, config):
-        while not self._stopping.is_set():
+        while not self._stopping.is_set() and self._host_config(config.host_id) == config:
             try:
-                await self.run_once(config.host_id)
+                with update_guard.operation(self.store.state):
+                    await self.run_once(config.host_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass
-            try:
-                await asyncio.wait_for(self._stopping.wait(), config.pull_interval)
-            except TimeoutError:
-                pass
+            deadline = asyncio.get_running_loop().time() + config.pull_interval
+            while not self._stopping.is_set() and self._host_config(config.host_id) == config:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), min(0.5, remaining))
+                except TimeoutError:
+                    pass
 
     async def run(self):
         tasks = {}
@@ -613,6 +626,7 @@ class EventMirror:
         self.host_id = host_id
         self.interval = interval
         self._nodes: dict[str, NodeRef] = {}
+        self._poll_locks: dict[str, asyncio.Lock] = {}
         self._paused: set[str] = set()
         self._stopping = asyncio.Event()
 
@@ -773,6 +787,10 @@ class EventMirror:
             )
 
     async def run_once(self, host_id: str) -> int:
+        async with self._poll_locks.setdefault(host_id, asyncio.Lock()):
+            return await self._run_once(host_id)
+
+    async def _run_once(self, host_id: str) -> int:
         if host_id in self._paused:
             return 0
         client = self._client(host_id)
@@ -832,17 +850,23 @@ class EventMirror:
         return processed
 
     async def _host_loop(self, config):
-        while not self._stopping.is_set():
+        while not self._stopping.is_set() and self._host_config(config.host_id) == config:
             try:
-                await self.run_once(config.host_id)
+                with update_guard.operation(self.store.state):
+                    await self.run_once(config.host_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass
-            try:
-                await asyncio.wait_for(self._stopping.wait(), config.pull_interval or self.interval)
-            except TimeoutError:
-                pass
+            deadline = asyncio.get_running_loop().time() + (config.pull_interval or self.interval)
+            while not self._stopping.is_set() and self._host_config(config.host_id) == config:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(self._stopping.wait(), min(0.5, remaining))
+                except TimeoutError:
+                    pass
 
     async def run(self):
         tasks = {}
@@ -881,6 +905,10 @@ class Broker:
         self.config = Config.load(state / "config.json")
         self.store = Store(state)
         self.host_registry = ConfigHostRegistry(self.config.hosts, state)
+        self.host_reload_error = None
+        self._host_reload_lock = asyncio.Lock()
+        self._hosts_changing: set[str] = set()
+        self._host_call_locks: dict[str, asyncio.Lock] = {}
         # Phase B routing: one identity-checking client factory over the registered hosts. Injecting one keeps
         # tests (and future transports) independent of SSH while production uses the default SSH transport.
         self.peer_factory = peer_factory if peer_factory is not None else DefaultPeerClientFactory(self.host_registry)
@@ -930,8 +958,13 @@ class Broker:
         from .notifications import deliver
 
         while not self.stopping.is_set():
-            await asyncio.to_thread(self.store.refresh_parent_usage)
-            await deliver(self.store, self.config)
+            try:
+                with update_guard.operation(self.state):
+                    await asyncio.to_thread(self.store.refresh_parent_usage)
+                    await deliver(self.store, self.config)
+            except BridgeError as error:
+                if error.code != "update_busy":
+                    raise
             try:
                 await asyncio.wait_for(self.stopping.wait(), 2)
             except TimeoutError:
@@ -941,7 +974,12 @@ class Broker:
         running = set()
         try:
             while not self.stopping.is_set():
-                await native_broadcast.deliver(self.store, self.config, tasks=running)
+                try:
+                    with update_guard.operation(self.state):
+                        await native_broadcast.deliver(self.store, self.config, tasks=running)
+                except BridgeError as error:
+                    if error.code != "update_busy":
+                        raise
                 try:
                     await asyncio.wait_for(self.stopping.wait(), 2)
                 except TimeoutError:
@@ -1012,7 +1050,11 @@ class Broker:
 
     async def ensure_worker(self, session_id):
         try:
-            await self.launch(session_id)
+            with update_guard.operation(self.state):
+                await self.launch(session_id)
+        except BridgeError as error:
+            if error.code != "update_busy":
+                self.store.worker_start_failed(session_id, safe_error(error))
         except Exception as error:
             self.store.worker_start_failed(session_id, safe_error(error) or type(error).__name__)
         finally:
@@ -1022,34 +1064,162 @@ class Broker:
         pending = set()
         try:
             while not self.stopping.is_set():
-                for session in self.store.sessions():
-                    if session["worker_pid"] and not alive(session):
-                        self.store.worker_stopped(session["id"], session["generation"], "Worker process disappeared")
-                    elif (
-                        session["desired"] == "open"
-                        and session["observed"] == "stopped"
-                        and session["id"] not in self.launching
-                    ):
-                        self.launching.add(session["id"])
-                        task = asyncio.create_task(self.ensure_worker(session["id"]))
-                        pending.add(task)
-                        task.add_done_callback(pending.discard)
-                while self.store.claim(self.config):
-                    pass
+                try:
+                    with update_guard.operation(self.state):
+                        for session in self.store.sessions():
+                            if session["worker_pid"] and not alive(session):
+                                self.store.worker_stopped(session["id"], session["generation"], "Worker process disappeared")
+                            elif (
+                                session["desired"] == "open"
+                                and session["observed"] == "stopped"
+                                and session["id"] not in self.launching
+                            ):
+                                self.launching.add(session["id"])
+                                task = asyncio.create_task(self.ensure_worker(session["id"]))
+                                pending.add(task)
+                                task.add_done_callback(pending.discard)
+                        while self.store.claim(self.config):
+                            pass
+                except BridgeError as error:
+                    if error.code != "update_busy":
+                        raise
                 await asyncio.sleep(0.15)
         finally:
             await asyncio.gather(*pending, return_exceptions=True)
 
     # ---------------------------------------------------------------- phase B remote routing
 
-    @staticmethod
-    def _remote_host(args):
+    def _remote_host(self, args):
         host_id = args.get("host_id")
         if host_id is None or host_id == "local":
             return None
         if not isinstance(host_id, str) or not host_id:
             raise BridgeError("invalid_request", "host_id must be a non-empty string")
         return host_id
+
+    def _check_host_changing(self, host_id):
+        if host_id in self._hosts_changing:
+            raise BridgeError(PeerErrorCode.HOST_OFFLINE, f"Host {host_id!r} configuration is changing; retry after refresh")
+
+    def _check_host_references(self, host_ids):
+        with self.store.connection() as db:
+            for host_id in sorted(host_ids):
+                pinned = self.host_registry.get(host_id).pinned
+                checks = (
+                    ("group members", "SELECT 1 FROM remote_group_members m JOIN session_groups g ON g.id=m.group_id "
+                     "WHERE m.host_id=? AND NOT g.deleted LIMIT 1", (host_id,)),
+                    ("pending deliveries", "SELECT 1 FROM peer_outbox WHERE host_id=? "
+                     "AND status NOT IN ('released','cancelled','failed') LIMIT 1", (host_id,)),
+                    ("unsettled operations", "SELECT 1 FROM peer_operations WHERE "
+                     "status NOT IN ('completed','failed','cancelled') AND (json_extract(params,'$.host_id')=? "
+                     "OR (json_extract(params,'$.host_id') IS NULL AND node_id=? AND state_generation=?)) LIMIT 1",
+                     (host_id, pinned.node_id if pinned else None, pinned.state_generation if pinned else None)),
+                )
+                for reason, query, values in checks:
+                    if db.execute(query, values).fetchone() is not None:
+                        raise BridgeError("host_in_use", f"Cannot remove or change {host_id!r}: existing {reason}; registration preserved")
+
+    async def _check_host_parent_routes(self, host_ids):
+        for host_id in sorted(host_ids):
+            with self.store.connection() as db:
+                routes = [dict(row) for row in db.execute("SELECT * FROM peer_parent_routes WHERE host_id=?", (host_id,))]
+            if not routes:
+                continue
+            try:
+                client = self.peer_factory.client(host_id)
+                node = (await client.hello({"protocol_versions": [PROTOCOL_VERSION],
+                                           "coordinator_id": socket.gethostname(), "coordinator_generation": "local"}))["node"]
+                sessions = (await client.inspect({"kind": "session"}))["items"]
+                by_id = {session["id"]: session for session in sessions}
+                for route in routes:
+                    if any(route[field] != node[field] for field in ("node_id", "state_generation")):
+                        # shortcut: use a new host_id until old-identity route retirement proofs are persisted.
+                        raise BridgeError("host_in_use", "Parent route belongs to a different node identity")
+                    child = by_id.get(route["child_id"])
+                    if child is not None:
+                        if child.get("desired") != "closed" or child.get("observed") != "stopped":
+                            raise BridgeError("host_in_use", "Remote parent route still has an open session")
+                        continue
+                    items = (await client.inspect({"kind": "task", "id": route["child_id"]}))["items"]
+                    task = next((item for item in items if item.get("id") == route["child_id"]), None)
+                    if task is None or not (
+                        task.get("status") in {"failed", "cancelled", "interrupted"}
+                        or task.get("status") == "completed" and task.get("validation") in {"accepted", "rejected"}
+                    ):
+                        raise BridgeError("host_in_use", "Remote parent route has unfinished or unreviewed work")
+            except Exception as error:
+                raise BridgeError("host_in_use", f"Cannot remove or change {host_id!r}: parent routes not settled ({safe_error(error)})") from error
+
+    async def reload_hosts(self):
+        """Apply validated host/pin configuration without restarting or replaying any work."""
+        async with self._host_reload_lock:
+            retiring = False
+            try:
+                if self._hosts_changing:
+                    # Finish a failed close before inspecting routes through a fresh, pinned client.
+                    retiring = True
+                    await self.peer_factory.retire(self._hosts_changing)
+                    self.peer_factory.release_retired(self._hosts_changing)
+                    self._hosts_changing.clear()
+                    retiring = False
+                candidates = self.host_registry.read_configured_hosts()
+                current = {host.host_id: host for host in self.host_registry.list()}
+                added = set(candidates) - set(current)
+                removed = set(current) - set(candidates)
+                updated = {host_id for host_id in set(current) & set(candidates) if current[host_id] != candidates[host_id]}
+                affected = removed | updated | self._hosts_changing
+                if not affected and not added:
+                    self.host_reload_error = None
+                    return {"added": [], "updated": [], "removed": []}
+                self._check_host_references(affected)
+                self._hosts_changing.update(affected)
+                async with contextlib.AsyncExitStack() as stack:
+                    for host_id in sorted(affected):
+                        await stack.enter_async_context(self._host_call_locks.setdefault(host_id, asyncio.Lock()))
+                    # Let complete polling passes finish, including their final ACK and cursor writes.
+                    for component in (self.outbox_puller, self.event_mirror):
+                        for host_id in sorted(affected):
+                            await stack.enter_async_context(component._poll_locks.setdefault(host_id, asyncio.Lock()))
+                    self._check_host_references(affected)
+                    await self._check_host_parent_routes(affected)
+                    if self.host_registry.read_configured_hosts() != candidates:
+                        raise BridgeError("config_changed", "Host configuration changed during refresh; retry")
+                    if affected:
+                        retiring = True
+                        await self.peer_factory.retire(affected)
+                    self.host_registry.replace_hosts(candidates)
+                    self.config.hosts.clear()
+                    self.config.hosts.update(candidates)
+                    for host_id in affected:
+                        self.outbox_puller._nodes.pop(host_id, None)
+                        self.outbox_puller._temp_after.pop(host_id, None)
+                        self.outbox_puller._scan_upper.pop(host_id, None)
+                        self.event_mirror._nodes.pop(host_id, None)
+                        replacement = candidates.get(host_id)
+                        if replacement is None or replacement.pinned is not None and replacement.pinned != current[host_id].pinned:
+                            self.event_mirror._paused.discard(host_id)
+                    if affected:
+                        self.peer_factory.release_retired(affected)
+                    self._hosts_changing.clear()
+                self.host_reload_error = None
+                return {"added": sorted(added), "updated": sorted(updated), "removed": sorted(removed)}
+            except BaseException as error:
+                if not retiring:
+                    self._hosts_changing.clear()
+                self.host_reload_error = safe_error(error)
+                raise
+
+    async def watch_hosts(self):
+        while not self.stopping.is_set():
+            try:
+                with update_guard.operation(self.state):
+                    await self.reload_hosts()
+            except Exception:
+                pass  # Keep the last valid registry; agent_hosts exposes the refresh error.
+            try:
+                await asyncio.wait_for(self.stopping.wait(), 0.5)
+            except TimeoutError:
+                pass
 
     async def _peer_node(self, host_id, client=None):
         """Resolve the pinned execution-node identity, handshaking once when no pin exists yet."""
@@ -1843,10 +2013,30 @@ class Broker:
             await asyncio.sleep(0.15)
 
     async def call(self, method, args):
+        if method == "agent_hosts_reload":
+            if args:
+                raise BridgeError("invalid_request", "agent_hosts_reload accepts no parameters and requires administrator access")
+            return await self.reload_hosts()
+        host_ids = set()
+        host_id = args.get("host_id")
+        if method not in {"agent_hosts", "agent_hosts_reload"} and isinstance(host_id, str) and host_id != "local":
+            host_ids.add(host_id)
+        members = args.get("remote_members")
+        if isinstance(members, list):
+            host_ids.update(member["host_id"] for member in members
+                            if isinstance(member, dict) and isinstance(member.get("host_id"), str))
+        async with contextlib.AsyncExitStack() as stack:
+            for host_id in sorted(host_ids):
+                self._check_host_changing(host_id)
+                await stack.enter_async_context(self._host_call_locks.setdefault(host_id, asyncio.Lock()))
+                self._check_host_changing(host_id)
+            return await self._call(method, args)
+
+    async def _call(self, method, args):
         if method == "agent_monitor":
             from .monitor import MonitorCollector
 
-            collector = MonitorCollector(self.state)
+            collector = MonitorCollector(self.state, host_registry=self.host_registry)
             limit = args.get("limit", 15)
             include_events = args.get("include_events", True)
             return collector.collect(limit=limit, include_events=include_events)
@@ -1855,6 +2045,7 @@ class Broker:
             if host_id is not None and not isinstance(host_id, str):
                 raise BridgeError("invalid_request", "host_id must be a string")
             return {
+                "config_error": self.host_reload_error,
                 "hosts": [
                     {
                         "host_id": status.host_id,
@@ -2204,6 +2395,27 @@ class Broker:
         raise BridgeError("unknown_method", method)
 
     async def api_call(self, method, args):
+        if method == "agent_update_status":
+            if args:
+                raise BridgeError("invalid_request", "agent_update_status accepts no parameters")
+            return {"result": {"version": __version__, "pid": os.getpid(),
+                               "maintenance": update_guard.maintenance(self.state) is not None}}
+        if method == "agent_update_prepare":
+            if args:
+                raise BridgeError("invalid_request", "agent_update_prepare accepts no parameters")
+            from .updater import busy_snapshot
+
+            lease = update_guard.prepare(self.state, lambda state: busy_snapshot(state, broker_pid=os.getpid()))
+            return {"result": {**lease, "broker_pid": os.getpid()}}
+        if method == "agent_update_finish":
+            if set(args) != {"token"}:
+                raise BridgeError("invalid_request", "agent_update_finish requires only token")
+            return {"result": update_guard.finish(self.state, args["token"])}
+        readonly = method in {"agent_hosts", "agent_monitor"} or method == "agent_inspect" and not args.get("parent_id")
+        with update_guard.operation(self.state, readonly=readonly):
+            return await self._api_call(method, args)
+
+    async def _api_call(self, method, args):
         if method not in {"agent_open", "agent_dispatch", "agent_control", "agent_cancel", "agent_review", "agent_group", "agent_broadcast", "agent_delivery_resolve"}:
             return {"result": await self.call(method, args)}
         if method in {"agent_open", "agent_dispatch"} and "name" in args:
@@ -2295,6 +2507,7 @@ class Broker:
         delivery_scheduler = asyncio.create_task(self.delivery_scheduler.run())
         outbox_puller = asyncio.create_task(self.outbox_puller.run())
         event_mirror = asyncio.create_task(self.event_mirror.run())
+        host_watcher = asyncio.create_task(self.watch_hosts())
         try:
             async with server:
                 await self.stopping.wait()
@@ -2302,11 +2515,16 @@ class Broker:
             await scheduler
             await notifications
             await native_notifications
-            for task in (delivery_scheduler, outbox_puller, event_mirror):
+            for task in (delivery_scheduler, outbox_puller, event_mirror, host_watcher):
                 task.cancel()
-            await asyncio.gather(delivery_scheduler, outbox_puller, event_mirror, return_exceptions=True)
-            path.unlink(missing_ok=True)
-            lock.close()
+            await asyncio.gather(delivery_scheduler, outbox_puller, event_mirror, host_watcher, return_exceptions=True)
+            close_peers = getattr(self.peer_factory, "close", None)
+            try:
+                if close_peers is not None:
+                    await close_peers()
+            finally:
+                path.unlink(missing_ok=True)
+                lock.close()
 
 
 async def request(state: Path, method, params):

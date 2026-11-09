@@ -32,6 +32,33 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def no_op(self, *args):
         pass
 
+    async def test_rpc_timeout_bounds_write_and_never_retries(self):
+        client = JsonProcess([], "/tmp", {}, lambda _: False, self.no_op)
+        written = []
+
+        async def blocked_write(value):
+            written.append(value)
+            await asyncio.Event().wait()
+
+        client.write = blocked_write
+        with self.assertRaisesRegex(TimeoutError, "turn/start.*during write"):
+            await asyncio.wait_for(client.request({"method": "turn/start"}, timeout=.02), 1)
+        self.assertEqual(1, len(written))
+        self.assertEqual({}, client.pending)
+
+    async def test_rpc_response_timeout_preserves_method_and_clears_pending(self):
+        client = JsonProcess([], "/tmp", {}, lambda _: False, self.no_op)
+        written = []
+
+        async def write(value):
+            written.append(value)
+
+        client.write = write
+        with self.assertRaisesRegex(TimeoutError, "prompt.*during response.*outcome is unknown"):
+            await client.request({"type": "prompt"}, timeout=.02)
+        self.assertEqual(1, len(written))
+        self.assertEqual({}, client.pending)
+
     async def test_close_is_bounded_when_detached_child_keeps_output_pipes_open(self):
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / "native.py"

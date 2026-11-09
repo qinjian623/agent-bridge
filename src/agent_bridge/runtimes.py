@@ -5,11 +5,12 @@ import contextlib
 import json
 import os
 import signal
+import stat
 from collections import deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .config import Profile, safe_error
+from .config import MAX_TOKEN_BYTES, Profile, safe_error
 from .errors import BridgeError
 from .quota import provider_limit
 from .usage import claude_counters, claude_usage
@@ -50,11 +51,23 @@ class JsonProcess:
         key = str(self.sequence)
         future = asyncio.get_running_loop().create_future()
         self.pending[key] = future
+        stage = "write"
+        deadline = asyncio.timeout(timeout)
         try:
-            await self.write({**value, "id": key})
-            response = await asyncio.wait_for(future, timeout)
+            async with deadline:
+                await self.write({**value, "id": key})
+                stage = "response"
+                response = await future
+        except TimeoutError as error:
+            if not deadline.expired():
+                raise
+            method = value.get("method", value.get("type", "request"))
+            raise TimeoutError(
+                f"Native RPC {method} timed out during {stage} after {timeout:g}s; execution outcome is unknown"
+            ) from error
         finally:
             self.pending.pop(key, None)
+            future.cancel()
         if "error" in response or response.get("success") is False:
             error = response.get("error", "Native request failed")
             raise BridgeError("native_error", safe_error(error), provider_limit(error))
@@ -459,8 +472,61 @@ class PiRuntime:
         await self.client.close()
 
 
+def _ollama_credential(environment):
+    key = environment.get("OLLAMA_API_KEY")
+    if not key:
+        path = Path.home() / ".config/claude-ollama/api-key"
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+        except OSError:
+            raise BridgeError("credential_missing", "Ollama requires OLLAMA_API_KEY or its existing private key file") from None
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or not 0 < info.st_size <= MAX_TOKEN_BYTES
+            ):
+                raise BridgeError("private_config_required", "Ollama key must be a private, owned, regular 0600 file")
+            data = os.read(descriptor, MAX_TOKEN_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        if len(data) > MAX_TOKEN_BYTES:
+            raise BridgeError("invalid_credential", "Ollama key is oversized")
+        try:
+            lines = data.decode("utf-8").splitlines()
+        except UnicodeError:
+            raise BridgeError("invalid_credential", "Ollama key must contain one nonempty UTF-8 line") from None
+        if len(lines) != 1:
+            raise BridgeError("invalid_credential", "Ollama key must contain one nonempty line")
+        key = lines[0]
+    if not key or len(key.encode("utf-8")) > MAX_TOKEN_BYTES or any(c.isspace() or ord(c) < 33 or ord(c) == 127 for c in key):
+        raise BridgeError("invalid_credential", "Ollama key is empty, oversized or malformed")
+    return key
+
+
 def claude_environment(profile):
     environment = profile.environment()
+    if profile.provider == "ollama-anthropic":
+        base = environment.get("ANTHROPIC_BASE_URL", "https://ollama.com")
+        try:
+            endpoint = urlsplit(base)
+            valid = (
+                endpoint.scheme == "https" and endpoint.hostname == "ollama.com"
+                and endpoint.port in (None, 443) and endpoint.username is None and endpoint.password is None
+                and profile.endpoint_host in (None, "ollama.com")
+            )
+        except ValueError:
+            valid = False
+        if not valid:
+            raise BridgeError("provider_mismatch", "Ollama credentials require the HTTPS ollama.com endpoint")
+        key = _ollama_credential(environment)
+        environment["OLLAMA_API_KEY"] = key
+        environment["ANTHROPIC_BASE_URL"] = base
+        environment["ANTHROPIC_AUTH_TOKEN"] = key
+        environment["ANTHROPIC_API_KEY"] = ""
+        environment["HTTPS_PROXY"] = environment.get("HTTPS_PROXY") or "http://127.0.0.1:1080"
+        environment["HTTP_PROXY"] = environment.get("HTTP_PROXY") or environment["HTTPS_PROXY"]
+        return environment
     endpoint = urlsplit(environment.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).hostname
     expected = profile.endpoint_host or {
         "anthropic": "api.anthropic.com",

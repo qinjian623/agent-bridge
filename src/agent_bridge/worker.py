@@ -150,24 +150,42 @@ class Worker:
             if attempt != interrupted_attempt:
                 interrupted_at = None
             reason = None
+            cause = None
             if self.shutdown or session["desired"] in {"paused", "closed"}:
                 reason = "cancelled" if session["desired"] == "closed" else "interrupted"
+                cause = "session_control"
             if task and task["cancel_requested"]:
                 reason = "cancelled"
+                cause = "task_cancel"
             if task and not reason and time.monotonic() - self.started > self.config.task_timeout:
                 reason = "interrupted"
+                cause = "task_timeout"
             if task and not reason and self.config.token_budget is not None:
                 usage = self.store.budget()
                 if usage["charged_tokens"] + usage["inflight_tokens"] >= self.config.token_budget:
                     reason = "interrupted"
-            if task and reason and not self.stop_reason and self.native_accepted.is_set():
+                    cause = "token_budget"
+            if task and reason and not self.stop_reason:
+                stage = "turn" if self.native_accepted.is_set() else "native_acceptance"
+                self.store.record("native_wait_ended", {
+                    "stage": stage, "cause": cause,
+                    "elapsed_seconds": time.monotonic() - self.started,
+                    "task_timeout_seconds": self.config.task_timeout,
+                }, self.session_id, task["id"], attempt)
+                if not self.native_accepted.is_set():
+                    self.stop_reason, self.shutdown = reason, True
+                    self.last_error = (
+                        f"Native task wait ended during {stage} ({cause}); execution outcome is unknown"
+                    )
+                    owner.cancel()
+                    return
                 self.stop_reason, interrupted_at = reason, time.monotonic()
                 interrupted_attempt = attempt
                 self.interrupt_done.clear()
                 try:
                     await asyncio.wait_for(self.agent.interrupt(), self.config.interrupt_timeout)
                 except Exception as error:
-                    self.last_error = safe_error(error) or type(error).__name__
+                    self.last_error = "Native wait failed during interrupt: " + (safe_error(error) or type(error).__name__)
                     self.store.record("interrupt_failed", {"error": self.last_error}, self.session_id, task["id"], attempt)
                     self.shutdown = True
                     if self.task and self.task["active_attempt"] == attempt:
@@ -216,7 +234,22 @@ class Worker:
             monitor = None
             try:
                 # The SDK's connect, receive and disconnect share one AnyIO task.
-                await self.agent.connect()
+                startup_deadline = asyncio.timeout(self.config.task_timeout)
+                try:
+                    async with startup_deadline:
+                        await self.agent.connect()
+                except TimeoutError as error:
+                    if not startup_deadline.expired():
+                        raise TimeoutError(
+                            "Native startup failed during connect: " + (safe_error(error) or type(error).__name__)
+                        ) from error
+                    self.store.record("native_wait_ended", {
+                        "stage": "connect", "cause": "task_timeout",
+                        "task_timeout_seconds": self.config.task_timeout,
+                    }, self.session_id)
+                    raise TimeoutError(
+                        f"Native startup timed out during connect after {self.config.task_timeout:g}s; no task was dispatched"
+                    ) from error
                 register_child(self.config.telegram_database, profile.runtime, self.agent.native_id)
                 self.store.worker_ready(self.session_id, self.generation, pid, start, self.agent.native_id)
                 monitor = asyncio.create_task(self.watch_control(asyncio.current_task()))
@@ -264,6 +297,9 @@ class Worker:
                     except (BridgeError, OSError, TimeoutError) as error:
                         # A transport failure after send cannot establish whether work ran.
                         self.last_error = safe_error(error) or type(error).__name__
+                        if isinstance(error, TimeoutError):
+                            stage = "turn" if self.native_accepted.is_set() else "native_acceptance"
+                            self.last_error = f"Native wait timed out during {stage}: " + self.last_error
                         self.store.finish(
                             self.session_id,
                             self.generation,

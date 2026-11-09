@@ -124,6 +124,91 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_timeout_error_still_stops_relaunch_and_notifies_parent(self):
         await self.check_connect_failure(TimeoutError())
 
+    async def test_startup_timeout_keeps_unstarted_task_queued_and_stops_relaunch(self):
+        sid = self.session()
+        tid = self.store.dispatch(sid, "task", "dispatch")["task_id"]
+        self.config.task_timeout = .02
+        worker = Worker(self.root, self.config, sid)
+        async def stalled_connect():
+            await asyncio.Event().wait()
+
+        agent = SimpleNamespace(connect=stalled_connect, close=AsyncMock())
+        with patch("agent_bridge.worker.runtime", return_value=agent):
+            await asyncio.wait_for(worker.run(), 1)
+        task = self.store.get_task(tid)
+        self.assertEqual("queued", task["status"])
+        self.assertEqual([], task["attempts"])
+        session = self.store.get_session(sid)
+        self.assertEqual("recovery_needed", session["observed"])
+        self.assertIn("during connect", session["error"])
+        self.assertIsNone(self.store.claim(self.config))
+        ended = [e for e in self.store.events(session_id=sid) if e["kind"] == "native_wait_ended"]
+        self.assertEqual("connect", ended[0]["data"]["stage"])
+
+    async def test_startup_preserves_an_inner_rpc_timeout_stage(self):
+        sid = self.session()
+        self.store.dispatch(sid, "task", "dispatch")
+        worker = Worker(self.root, self.config, sid)
+        error = "Native RPC initialize timed out during response after 30s; execution outcome is unknown"
+        agent = SimpleNamespace(connect=AsyncMock(side_effect=TimeoutError(error)), close=AsyncMock())
+        with patch("agent_bridge.worker.runtime", return_value=agent):
+            await worker.run()
+        self.assertEqual("Native startup failed during connect: " + error, self.store.get_session(sid)["error"])
+
+    async def check_stalled_task(self, *, accepted, control=None):
+        sid = self.session()
+        first = self.store.dispatch(sid, "first", "first")["task_id"]
+        second = self.store.dispatch(sid, "second", "second")["task_id"]
+        self.config.task_timeout = .02 if control is None else 3600
+        worker = Worker(self.root, self.config, sid)
+        begin = worker.store.begin_attempt
+        invocations = []
+
+        def assign(*args):
+            worker.store.claim(self.config)
+            return begin(*args)
+
+        async def stalled_run(instruction, on_started, on_event):
+            invocations.append(instruction)
+            if control == "cancel":
+                self.store.cancel(first, "cancel-first")
+            elif control == "pause":
+                self.store.control(sid, "pause", self.store.get_session(sid)["revision"], "pause")
+            if accepted:
+                await on_started("turn")
+            await asyncio.Event().wait()
+
+        agent = SimpleNamespace(
+            native_id="native", connect=AsyncMock(), run=stalled_run,
+            interrupt=AsyncMock(), close=AsyncMock(),
+        )
+        with patch("agent_bridge.worker.runtime", return_value=agent), patch.object(worker.store, "begin_attempt", assign):
+            await asyncio.wait_for(worker.run(), 1)
+        self.assertEqual(["first"], invocations)
+        self.assertEqual("recovery_needed", self.store.get_task(first)["status"])
+        self.assertEqual("queued", self.store.get_task(second)["status"])
+        self.assertIsNone(self.store.claim(self.config))
+        if accepted:
+            agent.interrupt.assert_awaited_once()
+        else:
+            agent.interrupt.assert_not_awaited()
+        ended = [e for e in self.store.events(task_id=first) if e["kind"] == "native_wait_ended"]
+        self.assertEqual(1, len(ended))
+        self.assertEqual("turn" if accepted else "native_acceptance", ended[0]["data"]["stage"])
+        self.assertEqual({None: "task_timeout", "cancel": "task_cancel", "pause": "session_control"}[control], ended[0]["data"]["cause"])
+
+    async def test_unconfirmed_task_acceptance_cannot_wait_past_total_deadline(self):
+        await self.check_stalled_task(accepted=False)
+
+    async def test_cancel_before_native_acceptance_stops_wait_without_claiming_cancelled(self):
+        await self.check_stalled_task(accepted=False, control="cancel")
+
+    async def test_pause_before_native_acceptance_stops_wait_without_starting_next_task(self):
+        await self.check_stalled_task(accepted=False, control="pause")
+
+    async def test_accepted_task_without_terminal_result_becomes_unknown_after_interrupt_deadline(self):
+        await self.check_stalled_task(accepted=True)
+
     async def test_pi_final_statistics_failure_preserves_confirmed_answer_usage_and_files(self):
         source = self.root / "source"
         source.mkdir()

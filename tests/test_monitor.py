@@ -11,11 +11,13 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from agent_bridge.cli import build_parser
 from agent_bridge.errors import BridgeError
+from agent_bridge.hosts import ConfigHostRegistry, HostConfig
 from agent_bridge.monitor import MonitorCollector, render_tui
+from agent_bridge.peer_protocol import HostState, NodeRef
 from agent_bridge.store import Store
 from agent_bridge.web_monitor import (
     DEFAULT_ALLOWED_HOSTS,
@@ -777,6 +779,31 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("Cluster Nodes (2)", tui)
         self.assertIn("coordinator", tui)
         self.assertIn("gpu-1", tui)
+
+    def test_collector_uses_live_registry_without_resetting_host_status(self) -> None:
+        registry = ConfigHostRegistry({
+            "macos-node": HostConfig("macos-node", "macos-node", "/opt/agent-bridge", pinned=NodeRef("macos-node", "node-c", "gen-c")),
+        })
+        registry.mark("macos-node", HostState.ONLINE)
+        snapshot = MonitorCollector(self.state, host_registry=registry).collect()
+        self.assertEqual(snapshot["hosts"][0]["state"], "online")
+        self.assertIsNotNone(snapshot["hosts"][0]["last_contact"])
+        self.assertEqual(snapshot["metrics"]["online_hosts"], 2)
+
+    def test_standalone_collector_reads_broker_snapshot(self) -> None:
+        (self.state / "broker.sock").touch()
+        expected = {"hosts": [{"host_id": "macos-node", "state": "online"}]}
+        with patch("agent_bridge.broker.request", new_callable=AsyncMock, return_value=expected) as request:
+            result = MonitorCollector(self.state).collect(limit=3, include_events=False)
+        self.assertEqual(result, expected)
+        request.assert_awaited_once_with(self.state, "agent_monitor", {"limit": 3, "include_events": False})
+
+    def test_standalone_collector_keeps_local_view_if_broker_is_unavailable(self) -> None:
+        (self.state / "broker.sock").touch()
+        with patch("agent_bridge.broker.request", new_callable=AsyncMock, side_effect=ConnectionRefusedError):
+            snapshot = MonitorCollector(self.state).collect()
+        self.assertIn("hosts", snapshot)
+        self.assertIn("sessions", snapshot)
 
     def test_host_ping_endpoint_forwards_to_broker(self) -> None:
         broker = FakeBroker(self.state, {"result": {"entries": [], "stale": False}})

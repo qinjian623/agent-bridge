@@ -9,9 +9,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from agent_bridge.broker import Broker
+from agent_bridge.codex_parent import advance
 from agent_bridge.config import Config, Profile
 from agent_bridge.errors import BridgeError
-from agent_bridge.notifications import deliver
+from agent_bridge.notifications import cleanup_processed, deliver
 from agent_bridge.store import Store
 from agent_bridge.telegram_guard import delivery_status, register_child
 
@@ -34,7 +35,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def sender(self, config, parent, message, event_seq, receipt=None):
         self.calls.append({"event": event_seq, "receipt": receipt})
-        return {"receipt": "submission", "ready": bool(receipt)}
+        return {"receipt": "submission", "ready": bool(receipt),
+                "native_status": "received" if receipt else "enqueued",
+                "native_turn_id": "turn-1" if receipt else None}
 
     async def test_paused_and_closed_parent_never_woken(self):
         self.store.parent_control("parent", "parent_pause", 0, "pause")
@@ -64,6 +67,204 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["sent"], self.calls)
         self.assertEqual("uncertain", self.store.get_parent("parent")["deliveries"][0]["status"])
 
+    async def test_ready_without_native_user_message_never_means_received(self):
+        sender = AsyncMock(return_value={"receipt": "submission", "ready": True, "native_status": "enqueued"})
+        await deliver(self.store, self.config, sender)
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("wake_pending", "enqueued", None),
+                         (item["status"], item["native_status"], item["native_turn_id"]))
+        with self.store.connection() as db:
+            self.assertEqual("enqueued", db.execute("SELECT status FROM native_send_queue").fetchone()[0])
+
+    async def test_ack_before_queue_reply_retains_receipt_and_retracts_once(self):
+        async def sender(config, parent, message, seq, receipt=None):
+            self.store.parent_control("parent", "parent_ack", 0, "early-ack", event_seq=seq)
+            return {"receipt": "late-receipt", "ready": False, "native_status": "enqueued"}
+
+        await deliver(self.store, self.config, sender)
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("processed", "late-receipt", "enqueued", "pending"),
+                         (item["status"], item["receipt"], item["native_status"], item["queue_cleanup"]))
+        # ACK proves that the event was handled, not that the queued prompt was read.
+        with self.store.connection() as db:
+            self.assertEqual("enqueued", db.execute("SELECT status FROM native_send_queue").fetchone()[0])
+        retractor = AsyncMock(return_value={"receipt": "late-receipt", "queue_cleanup": "removed", "native_status": "removed"})
+        self.store.parent_control("parent", "parent_pause", 1, "pause-after-ack")
+        await cleanup_processed(self.store, self.config, retractor)
+        await cleanup_processed(self.store, self.config, retractor)
+        retractor.assert_awaited_once()
+        self.assertEqual((item["event_seq"], "late-receipt"), retractor.call_args.args[2:])
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("processed", "removed", "removed", None),
+                         (item["status"], item["native_status"], item["queue_cleanup"], item["native_turn_id"]))
+        with self.store.connection() as db:
+            self.assertEqual("cancelled", db.execute("SELECT status FROM native_send_queue").fetchone()[0])
+
+    async def test_ack_cleanup_through_native_helper_leaves_other_queue_entries_alone(self):
+        queue = [{"id": "unrelated", "clientUserMessageId": "other-tool:message"}]
+        calls = []
+
+        class Client:
+            def enqueue(self, thread_id, message, client_id):
+                calls.append(("enqueue", thread_id))
+                queue.append({"id": "own-receipt", "clientUserMessageId": client_id})
+                return "own-receipt"
+
+            def request(self, method, params):
+                calls.append((method, params))
+                if method == "thread/queue/list":
+                    return {"data": list(queue)}
+                if method == "thread/queue/delete":
+                    self_id = params["queuedSubmissionId"]
+                    self_entry = next(item for item in queue if item["id"] == self_id)
+                    queue.remove(self_entry)
+                    return {"deleted": True}
+                raise AssertionError("Cleanup must not resume, interrupt, or inspect a different session")
+
+        client = Client()
+
+        async def sender(config, parent, message, seq, receipt=None):
+            return advance(client, {"thread_id": parent["native_id"], "message": message,
+                                    "event_id": str(seq), "receipt": receipt}, RuntimeError)
+
+        async def cleaner(config, parent, seq, receipt=None, *, check_only=False):
+            return advance(client, {"thread_id": parent["native_id"], "event_id": str(seq),
+                                    "receipt": receipt, "retract": True, "cleanup_check_only": check_only}, RuntimeError)
+
+        await deliver(self.store, self.config, sender, cleaner)
+        seq = self.store.get_parent("parent")["deliveries"][0]["event_seq"]
+        self.store.parent_control("parent", "parent_ack", 0, "ack", event_seq=seq)
+        self.store.parent_control("parent", "parent_pause", 1, "pause-after-ack")
+        await deliver(self.store, self.config, sender, cleaner)
+        await deliver(self.store, self.config, sender, cleaner)
+        self.assertEqual([{"id": "unrelated", "clientUserMessageId": "other-tool:message"}], queue)
+        self.assertEqual(1, sum(method == "enqueue" for method, _ in calls))
+        self.assertEqual([(method, params) for method, params in calls if method.endswith("/delete")], [
+            ("thread/queue/delete", {"threadId": "native-parent", "queuedSubmissionId": "own-receipt"}),
+        ])
+
+    async def test_cleanup_failure_keeps_ack_and_does_not_resend(self):
+        await deliver(self.store, self.config, self.sender)
+        seq = self.store.get_parent("parent")["deliveries"][0]["event_seq"]
+        self.store.parent_control("parent", "parent_ack", 0, "ack", event_seq=seq)
+        retractor = AsyncMock(side_effect=ConnectionError("delete reply lost"))
+        await deliver(self.store, self.config, self.sender, retractor)
+        await deliver(self.store, self.config, self.sender, retractor)
+        self.assertEqual(1, retractor.await_count)
+        self.assertEqual(1, len(self.calls))
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("processed", "uncertain", "enqueued"),
+                         (item["status"], item["queue_cleanup"], item["native_status"]))
+        self.assertIn("delete reply lost", item["error"])
+
+    async def test_late_send_reply_cannot_undo_completed_cleanup(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def sender(config, parent, message, seq, receipt=None):
+            entered.set()
+            await release.wait()
+            return {"receipt": "late-receipt", "ready": False, "native_status": "enqueued"}
+
+        running = asyncio.create_task(deliver(self.store, self.config, sender))
+        await entered.wait()
+        seq = self.store.get_parent("parent")["deliveries"][0]["event_seq"]
+        self.store.parent_control("parent", "parent_ack", 0, "ack", event_seq=seq)
+        retractor = AsyncMock(return_value={"receipt": "late-receipt", "queue_cleanup": "removed", "native_status": "removed"})
+        try:
+            await cleanup_processed(self.store, self.config, retractor)
+        finally:
+            release.set()
+            await running
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("processed", "removed", "removed", "late-receipt"),
+                         (item["status"], item["queue_cleanup"], item["native_status"], item["receipt"]))
+        with self.store.connection() as db:
+            self.assertEqual("cancelled", db.execute("SELECT status FROM native_send_queue").fetchone()[0])
+
+    async def test_old_cleanup_reply_cannot_undo_newer_terminal_result(self):
+        await deliver(self.store, self.config, self.sender)
+        seq = self.store.get_parent("parent")["deliveries"][0]["event_seq"]
+        self.store.parent_control("parent", "parent_ack", 0, "ack", event_seq=seq)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_cleaner(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            return {"receipt": "submission", "queue_cleanup": "uncertain", "native_status": "unconfirmed", "error": "old reply"}
+
+        with patch("agent_bridge.notifications.time.time", return_value=100):
+            running = asyncio.create_task(cleanup_processed(self.store, self.config, slow_cleaner))
+            await entered.wait()
+        latest = AsyncMock(return_value={"receipt": "submission", "queue_cleanup": "already_started",
+                                        "native_status": "received", "native_turn_id": "actual-turn"})
+        try:
+            with patch("agent_bridge.notifications.time.time", return_value=131):
+                await cleanup_processed(self.store, self.config, latest)
+        finally:
+            release.set()
+            await running
+        self.assertTrue(latest.call_args.kwargs["check_only"])
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("already_started", "received", None), (item["queue_cleanup"], item["native_status"], item["error"]))
+        with self.store.connection() as db:
+            self.assertEqual("received", db.execute("SELECT status FROM native_send_queue").fetchone()[0])
+
+    async def test_uncertain_cleanup_stays_read_only_even_if_setup_fails(self):
+        await deliver(self.store, self.config, self.sender)
+        seq = self.store.get_parent("parent")["deliveries"][0]["event_seq"]
+        self.store.parent_control("parent", "parent_ack", 0, "ack", event_seq=seq)
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE deliveries SET queue_cleanup='uncertain'")
+        retractor = AsyncMock(return_value={"deferred": "client unavailable", "queue_cleanup": "pending"})
+        await cleanup_processed(self.store, self.config, retractor)
+        self.assertTrue(retractor.call_args.kwargs["check_only"])
+        self.assertEqual("uncertain", self.store.get_parent("parent")["deliveries"][0]["queue_cleanup"])
+
+    async def test_cleanup_can_confirm_started_but_never_fabricates_receipt(self):
+        await deliver(self.store, self.config, self.sender)
+        seq = self.store.get_parent("parent")["deliveries"][0]["event_seq"]
+        self.store.parent_control("parent", "parent_ack", 0, "ack", event_seq=seq)
+        retractor = AsyncMock(return_value={"receipt": "submission", "queue_cleanup": "already_started", "native_status": "received"})
+        await cleanup_processed(self.store, self.config, retractor)
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("uncertain", "enqueued"), (item["queue_cleanup"], item["native_status"]))
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE deliveries SET cleanup_last_attempt=0")
+        retractor.return_value["native_turn_id"] = "actual-turn"
+        await cleanup_processed(self.store, self.config, retractor)
+        item = self.store.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("already_started", "received", "actual-turn"),
+                         (item["queue_cleanup"], item["native_status"], item["native_turn_id"]))
+
+    async def test_legacy_accepted_is_rechecked_without_resubmitting(self):
+        await deliver(self.store, self.config, self.sender)
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE deliveries SET status='accepted',native_status='unknown'")
+        sender = AsyncMock(return_value={"receipt": "submission", "ready": False, "native_status": "enqueued"})
+        await deliver(self.store, self.config, sender)
+        self.assertEqual("submission", sender.call_args.args[4])
+        self.assertEqual("wake_pending", self.store.get_parent("parent")["deliveries"][0]["status"])
+
+    def test_upgrade_does_not_treat_legacy_accepted_or_ack_as_native_receipt(self):
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE deliveries SET status='processed',receipt='legacy'")
+            for column in ("native_status", "native_turn_id", "queue_cleanup", "cleanup_last_attempt"):
+                db.execute("ALTER TABLE deliveries DROP COLUMN " + column)
+        item = Store(self.store.state).get_parent("parent")["deliveries"][0]
+        self.assertEqual(("processed", "unknown", "pending", "legacy"),
+                         (item["status"], item["native_status"], item["queue_cleanup"], item["receipt"]))
+
+    def test_upgrade_schedules_ack_written_by_old_broker_after_columns_exist(self):
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE deliveries SET status='processed',receipt='legacy',queue_cleanup=NULL")
+        upgraded = Store(self.store.state)
+        item = upgraded.get_parent("parent")["deliveries"][0]
+        self.assertEqual(("processed", "unknown", "pending", "legacy"),
+                         (item["status"], item["native_status"], item["queue_cleanup"], item["receipt"]))
+        with upgraded.connection(write=True) as db:
+            db.execute("UPDATE deliveries SET queue_cleanup='uncertain'")
+        self.assertEqual("uncertain", Store(self.store.state).get_parent("parent")["deliveries"][0]["queue_cleanup"])
+
     async def test_helper_spawn_failure_remains_pending_and_can_be_retried(self):
         self.config.codex_async_python = str(self.store.state / "missing-python")
         await deliver(self.store, self.config)
@@ -92,7 +293,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             calls.append(args[3])
             entered.set()
             await release.wait()
-            return {"ready": True, "receipt": "test"}
+            return {"ready": True, "receipt": "test", "native_status": "received", "native_turn_id": "turn-1"}
 
         async def slow_deliver(store, config):
             await deliver(store, config, sender)
@@ -115,7 +316,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         async def acknowledging_sender(config, parent, message, seq, receipt=None):
             self.store.parent_control("parent", "parent_ack", 0, "ack", event_seq=seq)
-            return {"ready": True, "receipt": receipt}
+            return {"ready": True, "receipt": receipt, "native_status": "received", "native_turn_id": "turn-1"}
 
         await deliver(self.store, self.config, acknowledging_sender)
         self.assertEqual("processed", self.store.get_parent("parent")["deliveries"][0]["status"])
@@ -127,7 +328,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ack, self.store.parent_control("parent", "parent_ack", 0, "early-ack", event_seq=seq))
             if fail_reply:
                 raise ConnectionError("reply lost after parent processed event")
-            return {"ready": True, "receipt": "received"}
+            return {"ready": True, "receipt": "received", "native_status": "received", "native_turn_id": "turn-1"}
 
         await deliver(self.store, self.config, sender)
         await deliver(self.store, self.config, sender)
@@ -179,7 +380,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         async def sender(config, parent, message, seq, receipt=None):
             self.calls.append(parent["id"])
-            return {"deferred": "busy"} if parent["id"] == "parent" else {"ready": True, "receipt": "sent"}
+            return {"deferred": "busy"} if parent["id"] == "parent" else {"ready": True, "receipt": "sent", "native_status": "received", "native_turn_id": "turn-1"}
 
         with patch("agent_bridge.notifications.delivery_status", side_effect=lambda db, native: "paused" if mode == "telegram" and native == "native-parent" else "open"):
             await deliver(self.store, self.config, sender)
@@ -214,7 +415,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         async def sender(config, parent, message, seq, receipt=None):
             messages[seq] = message
-            return {"ready": True, "receipt": "sent"}
+            return {"ready": True, "receipt": "sent", "native_status": "received", "native_turn_id": "turn-1"}
 
         await deliver(self.store, self.config, sender)
         for seq, status in statuses.items():
@@ -231,7 +432,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         async def sender(config, parent, message, event_seq, receipt=None):
             messages[event_seq] = message
-            return {"ready": True, "receipt": "sent"}
+            return {"ready": True, "receipt": "sent", "native_status": "received", "native_turn_id": "turn-1"}
 
         await deliver(self.store, self.config, sender)
         self.assertIn("agent_inspect", messages[seq])

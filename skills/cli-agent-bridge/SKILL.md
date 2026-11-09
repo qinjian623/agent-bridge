@@ -3,7 +3,9 @@ name: cli-agent-bridge
 description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别执行子任务，管理独立模型会话、暂停恢复和检查结果。适用于跨程序分工或同程序多模型任务；单纯定时提醒仍使用 codex-async。
 ---
 
-本机源码在 `/home/user/gits/cli-agent-bridge`，命令为 `agent-bridge`。优先使用已注册的 MCP 工具；工具尚未加载时用 `agent-bridge call <工具名>`，JSON 从标准输入传入。服务状态用 `systemctl --user is-active cli-agent-bridge`，配置检查用 `agent-bridge doctor`。
+命令为 `agent-bridge`，实际入口用 `command -v agent-bridge` 核对；源码通常在 `~/gits/cli-agent-bridge`。自动更新安装的固定入口为 `~/.local/share/cli-agent-bridge/bin/agent-bridge`。优先使用已注册的 MCP 工具；工具尚未加载时用 `agent-bridge call <工具名>`，JSON 从标准输入传入。Linux 服务状态用 `systemctl --user is-active cli-agent-bridge`，macOS 用对应 LaunchAgent，配置检查用 `agent-bridge doctor`。
+
+自动更新用 `agent-bridge update check/run`，最近结果在状态目录 `update-status.json`。维护期间的 `update_busy` 表示暂缓，不能换 request_id 重跑；`uncertain` 先核对实际进程与版本。更新不重启原生终端、不升级其他 CLI，也不清除旧版本或还原数据库。MCP/relay 和 skill 必须使用固定入口或 `current/skill`，不要继续引用旧 checkout。私有 GitHub 授权由该机器的 `gh` 管理，不复制其他机器的 token。
 
 - 先读 `agent_catalog`。程序、供应商和模型分别核对；本机 Claude Code 当前连接 DeepSeek 兼容接口。指定的模型不得自动替换。
 - Antigravity 需要 `runtime=antigravity`、`provider=google-antigravity` 和完整 `agy models` ID，即使选 Claude 也不能填 anthropic。仅支持文本与 workspace-write，read-only 明确拒绝。headless 无逐次审批，原生工具被拒绝不能当作执行成功；不要加跳过权限参数。消费套餐目前不支持封装进第三方编码代理，使用前查项目 README 的账号限制。原生累计 token 在进程恢复后缺少可靠基数时只报观察到的步骤量并标不完整；不能当实际账单。新增接口的离线测试和真实 CLI 握手已验证，真实推理/工具/中断仍需单独验证。
@@ -31,6 +33,7 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - `recovery_needed` 表示不能确认外部执行结果。检查原生记录、worktree 和可能仍运行的外部命令后，使用 resolve 写入检查记录，再决定是否恢复；不要换 request_id 盲目重跑。
 - 会话因启动或中断请求失败而需要恢复时，尚未执行的任务仍是 `queued`；检查会话错误后明确 resume，这些排队任务不需要 resolve。
 - 需要输入或批准时从 `agent_inspect` 读取 question_id 和 expires，使用 respond 回答仍有效的请求；不自动扩大用户授权。
+- 普通 Flash 任务先运行本 skill 的 `scripts/provider_windows.py`，按已核对的低峰窗口优先选 `claude-ollama`（Ollama Cloud）；官方 `pi-deepseek` / `claude-deepseek` 使用 DeepSeek 官方低峰窗口。只影响新任务，须先满足模型验证、工具及质量要求；供应商认证与配额分别保留，已有 session 不迁移。详细时段及节假日用法见 [分工表](resources/router-prompt.md#flash-按供应商低峰时间分配)。
 - 默认使用均衡策略。单个任务可传 `requirements.strategy=cost/speed/balanced`；指定模型不被自动替换。遇到配额等待先读 `quota_cooldowns`，确认恢复后再用 `quota_resume`；失败任务不会自动重跑。
 - 子任务统计包含每次 attempt。需要总量时在 parent_register 中传入原生 Codex 的 `usage_path`，从登记时的累计值开始计数；已有任务可用 `usage_since` 指定起点。`notify=false` 只统计、不发通知，`parent_meter_stop` 停止计数。未登记父用量时只报告部分统计；未知价格不能当零，CLI 估算不能当实际账单。
 - 恢复后缺少执行前累计计数时，用量会标为不完整，不把历史总量当本轮新增。换模型重试的质量分别归入对应 attempt，费用仍计算所有执行。

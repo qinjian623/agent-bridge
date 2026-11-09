@@ -167,7 +167,7 @@ class EventMirrorTests(MirrorTestCase):
 
         async def sender(config, parent, message, event_seq, receipt=None):
             calls.append(event_seq)
-            return {"receipt": "submission", "ready": True}
+            return {"receipt": "submission", "ready": True, "native_status": "received", "native_turn_id": "turn-1"}
 
         await deliver(self.store, Config({}, codex_async_python="fixture"), sender)
         self.assertEqual([mirrored["local_seq"]], calls)

@@ -18,6 +18,11 @@ def server(state):
         """List administrator-registered execution hosts with their cached state, pinned identity and last contact. Never opens a network connection; refresh happens through peer traffic."""
         return await request(state, "agent_hosts", {})
 
+    @mcp.tool()
+    async def agent_hosts_reload() -> dict:
+        """Administrator-only immediate refresh of config.json hosts and host_pins.json; the Broker also watches them automatically. Adds unused nodes without restart. Removing or changing a node with group members, parent routes or unsettled work is refused, keeping the previous registry. Does not cancel tasks, restart agents or replay deliveries. Invalid configuration preserves the last working list; agent_hosts.config_error explains the failure."""
+        return await request(state, "agent_hosts_reload", {})
+
     @mcp.tool(annotations=read_only)
     async def agent_monitor(limit: int = 15, include_events: bool = True) -> dict:
         """Overall multi-agent monitor snapshot: cluster hosts, active sessions, running tasks, pending questions/approvals, broadcasts, and recent communications."""

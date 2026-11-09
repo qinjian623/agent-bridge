@@ -42,6 +42,8 @@ def build_parser():
     commands.add_parser("serve", help="Run the persistent Unix socket broker")
     commands.add_parser("mcp", help="Run the MCP tools over stdio")
     commands.add_parser("doctor", help="Check local configuration and installed CLI paths")
+    update = commands.add_parser("update", help="Check or install verified GitHub releases")
+    update.add_argument("update_args", nargs=argparse.REMAINDER)
     relay = commands.add_parser("relay", help="Bridge stdin/stdout peer JSONL to the local node service")
     relay.add_argument("--state", default=argparse.SUPPRESS)
     worker = commands.add_parser("worker", help=argparse.SUPPRESS)
@@ -128,6 +130,10 @@ def main():
             from .broker import Broker
 
             asyncio.run(Broker(state).serve())
+        elif args.command == "update":
+            from .updater import main as update_main
+
+            update_main(["--state", str(state), *args.update_args])
         elif args.command == "worker":
             from .worker import Worker
 

@@ -6,8 +6,9 @@ import contextlib
 import inspect
 import json
 import math
+import socket
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Protocol, cast
 
 from .errors import BridgeError
@@ -65,8 +66,8 @@ TERMINATE_TIMEOUT = 5.0
 class PeerTransport(Protocol):
     """One framed JSONL channel (UTF-8, one JSON object per line, <= MAX_FRAME_BYTES).
 
-    Coordinator implementation spawns `ssh <target> <remote_executable> relay [--state ...]` per call or per
-    short session; it never opens a TCP port. Connection loss raises BridgeError(peer_host_offline) and must
+    Coordinator implementation reuses `ssh <target> <remote_executable> relay [--state ...]` per host;
+    it never opens a TCP port. Connection loss raises BridgeError(peer_host_offline) and must
     never be converted into a failed operation: the outcome is unknown until peer.lookup_delivery says otherwise.
     """
 
@@ -106,6 +107,12 @@ class PeerClient(Protocol):
 class PeerClientFactory(Protocol):
     def client(self, host_id: str) -> PeerClient:
         """Returns a client that enforces pinned identity: hello mismatch -> mark IDENTITY_CHANGED and raise."""
+
+    async def retire(self, host_ids: Iterable[str]) -> None:
+        """Refuse new requests, finish existing requests and close only the selected clients."""
+
+    def release_retired(self, host_ids: Iterable[str]) -> None:
+        """Allow new clients after the active registry has been replaced."""
 
 
 class PeerService(Protocol):
@@ -182,6 +189,7 @@ class SshPeerTransport:
             argv.extend(("--state", remote_state))
         self._argv = tuple(argv)
         self._process: asyncio.subprocess.Process | None = None
+        self.connection_generation = 0
         self._lock = asyncio.Lock()
 
     @property
@@ -189,7 +197,9 @@ class SshPeerTransport:
         """Exact argument vector used to start SSH (no shell, no string interpolation)."""
         return self._argv
 
-    async def call(self, request: PeerRequest, timeout: float) -> PeerResponse:
+    async def call(
+        self, request: PeerRequest, timeout: float, *, expected_generation: int | None = None,
+    ) -> PeerResponse:
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
@@ -208,6 +218,16 @@ class SshPeerTransport:
             )
 
         async with self._lock:
+            if expected_generation is not None and (
+                expected_generation != self.connection_generation
+                or self._process is None
+                or self._process.returncode is not None
+            ):
+                await self._stop(force=True)
+                raise peer_error(
+                    PeerErrorCode.HOST_OFFLINE,
+                    f"SSH transport for {self.host_id} changed after identity verification; request was not sent",
+                )
             process = await self._start()
             try:
                 process.stdin.write(frame)
@@ -276,8 +296,9 @@ class SshPeerTransport:
     # ---------------------------------------------------------------- internals
 
     async def _start(self) -> asyncio.subprocess.Process:
-        if self._process is not None:
+        if self._process is not None and self._process.returncode is None:
             return self._process
+        await self._stop()
         try:
             # Every argument is passed verbatim; shell=False is implicit in create_subprocess_exec.
             process = await asyncio.create_subprocess_exec(
@@ -292,6 +313,7 @@ class SshPeerTransport:
                 PeerErrorCode.HOST_OFFLINE, f"Cannot start SSH transport for {self.host_id}: {error}"
             ) from error
         self._process = process
+        self.connection_generation += 1
         return process
 
     async def _stop(self, *, force: bool = False) -> None:
@@ -324,8 +346,8 @@ class SshPeerTransport:
 class DirectPeerClient:
     """Typed `peer.*` facade over a `PeerTransport`; each call uses a fresh frame id.
 
-    The hello response can additionally be checked against the coordinator's pinned identity when a registry
-    and host_id are supplied (normally by `DefaultPeerClientFactory`).
+    A registry-bound client verifies hello on the same connection before every business request. Calls without
+    a registry remain a direct facade, for in-process services and protocol tests.
     """
 
     def __init__(
@@ -342,21 +364,23 @@ class DirectPeerClient:
         self._timeout = timeout
         self._registry = registry
         self._host_id = host_id
+        self._lock = asyncio.Lock()
+        self._retired = False
+        self._hello_params: HelloParams = {
+            "protocol_versions": [PROTOCOL_VERSION],
+            "coordinator_id": socket.gethostname(),
+            "coordinator_generation": "local",
+        }
 
     async def hello(self, params: HelloParams) -> HelloResult:
-        try:
-            result = await self._call("hello", params)
-        except BridgeError as error:
-            if (
-                self._registry is not None
-                and self._host_id is not None
-                and error.code == PeerErrorCode.STATE_CORRUPTED
-            ):
-                self._registry.mark(self._host_id, HostState.STATE_CORRUPTED, str(error))
-            raise
-        if self._registry is not None and self._host_id is not None:
-            self._verify_hello(result)
-        return cast(HelloResult, result)
+        return cast(HelloResult, await self._call("hello", params))
+
+    async def close(self) -> None:
+        async with self._lock:
+            await self._transport.close()
+
+    def retire(self) -> None:
+        self._retired = True
 
     async def catalog(self, params: CatalogParams) -> CatalogResult:
         return cast(CatalogResult, await self._call("catalog", params))
@@ -406,13 +430,72 @@ class DirectPeerClient:
     # ---------------------------------------------------------------- internals
 
     async def _call(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
+        if self._retired:
+            raise BridgeError("host_busy", "Host connection has been retired; obtain its current client")
+        async with self._lock:
+            if self._retired:
+                raise BridgeError("host_busy", "Host connection has been retired; obtain its current client")
+            if self._registry is None:
+                return await self._request(name, params)
+            verifying = True
+            try:
+                hello = await self._request("hello", params if name == "hello" else self._hello_params)
+                self._verify_hello(hello)
+                if name == "hello":
+                    self._hello_params = cast(HelloParams, dict(params))
+                    return hello
+                verifying = False
+                generation = (
+                    self._transport.connection_generation if isinstance(self._transport, SshPeerTransport) else None
+                )
+                return await self._request(name, params, expected_generation=generation)
+            except asyncio.CancelledError:
+                await self._disconnect("Peer request was cancelled")
+                raise
+            except BridgeError as error:
+                if error.code == PeerErrorCode.IDENTITY_MISMATCH:
+                    await self._disconnect(str(error), HostState.IDENTITY_CHANGED)
+                elif error.code == PeerErrorCode.STATE_CORRUPTED:
+                    await self._disconnect(str(error), HostState.STATE_CORRUPTED)
+                elif verifying or error.code == PeerErrorCode.HOST_OFFLINE:
+                    await self._disconnect(str(error))
+                raise
+
+    async def _disconnect(self, detail: str, state: HostState = HostState.OFFLINE) -> None:
+        if self._registry is not None and self._host_id is not None:
+            self._registry.mark(self._host_id, state, detail)
+        with contextlib.suppress(Exception):
+            await self._transport.close()
+
+    async def _request(
+        self, name: str, params: dict[str, Any], *, expected_generation: int | None = None,
+    ) -> dict[str, Any]:
         request: PeerRequest = {
             "v": PROTOCOL_VERSION,
             "id": uuid.uuid4().hex,
             "method": f"peer.{name}",
             "params": params,
         }
-        response = await self._transport.call(request, self._timeout)
+        try:
+            if expected_generation is not None and isinstance(self._transport, SshPeerTransport):
+                response = await self._transport.call(request, self._timeout, expected_generation=expected_generation)
+            else:
+                response = await self._transport.call(request, self._timeout)
+        except (BridgeError, OSError) as error:
+            await self._disconnect(str(error))
+            raise
+        if self._registry is not None and (
+            not isinstance(response, dict)
+            or isinstance(response.get("v"), bool)
+            or response.get("v") != PROTOCOL_VERSION
+            or response.get("id") != request["id"]
+            or not isinstance(response.get("ok"), bool)
+            or (response["ok"] and not isinstance(response.get("result"), dict))
+            or (not response["ok"] and not isinstance(response.get("error"), dict))
+        ):
+            error = peer_error(PeerErrorCode.INVALID_PARAMS, "Peer returned an invalid response envelope")
+            await self._disconnect(str(error))
+            raise error
         if not response.get("ok"):
             error = response.get("error")
             if isinstance(error, dict):
@@ -428,8 +511,18 @@ class DirectPeerClient:
         registry, host_id = self._registry, self._host_id
         if registry is None or host_id is None:
             return
+        status = registry.status(host_id)[0]
+        if status.state == HostState.IDENTITY_CHANGED:
+            raise peer_error(PeerErrorCode.IDENTITY_MISMATCH, status.detail or "Host identity requires re-registration")
+        if status.state == HostState.STATE_CORRUPTED:
+            raise peer_error(PeerErrorCode.STATE_CORRUPTED, status.detail or "Host state requires re-registration")
+        version = result.get("protocol_version")
+        if isinstance(version, bool) or version != PROTOCOL_VERSION:
+            raise peer_error(PeerErrorCode.VERSION_MISMATCH, "peer.hello returned an unsupported protocol version")
         node = result.get("node")
-        if not isinstance(node, dict):
+        if not isinstance(node, dict) or any(
+            not isinstance(node.get(key), str) or not node[key] for key in ("node_id", "state_generation")
+        ):
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "peer.hello returned no node identity")
         pinned = registry.get(host_id).pinned
         if pinned is not None:
@@ -447,6 +540,8 @@ class DirectPeerClient:
             message = f"Host {host_id} reports a corrupted state; new requests are blocked"
             registry.mark(host_id, HostState.STATE_CORRUPTED, message)
             raise peer_error(PeerErrorCode.STATE_CORRUPTED, message)
+        if result.get("node_state") != NodeState.READY.value:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "peer.hello returned an invalid node state")
         registry.mark(host_id, HostState.ONLINE)
 
 
@@ -463,16 +558,41 @@ class DefaultPeerClientFactory:
         self._registry = registry
         self._transport_factory = transport_factory or SshPeerTransport
         self._timeout = timeout
+        self._clients: dict[str, DirectPeerClient] = {}
+        self._retiring: set[str] = set()
 
     def client(self, host_id: str) -> PeerClient:
+        if host_id in self._retiring:
+            raise BridgeError("host_busy", f"Host {host_id} configuration is being replaced")
         config = self._registry.get(host_id)
-        transport = self._transport_factory(config)
-        return DirectPeerClient(
-            transport,
-            timeout=self._timeout,
-            registry=self._registry,
-            host_id=host_id,
-        )
+        if host_id not in self._clients:
+            self._clients[host_id] = DirectPeerClient(
+                self._transport_factory(config),
+                timeout=self._timeout,
+                registry=self._registry,
+                host_id=host_id,
+            )
+        return self._clients[host_id]
+
+    async def retire(self, host_ids: Iterable[str]) -> None:
+        """Stop new calls, then drain existing calls before closing only these connections."""
+        host_ids = set(host_ids)
+        self._retiring.update(host_ids)
+        clients = {host_id: self._clients[host_id] for host_id in host_ids if host_id in self._clients}
+        for client in clients.values():
+            client.retire()
+        await asyncio.gather(*(client.close() for client in clients.values()))
+        for host_id, client in clients.items():
+            if self._clients.get(host_id) is client:
+                del self._clients[host_id]
+
+    def release_retired(self, host_ids: Iterable[str]) -> None:
+        """Call after the registry has been replaced, before serving its new clients."""
+        self._retiring.difference_update(host_ids)
+
+    async def close(self) -> None:
+        clients, self._clients = self._clients, {}
+        await asyncio.gather(*(client.close() for client in clients.values()))
 
 
 # ---------------------------------------------------------------- relay server

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .errors import BridgeError
-from .peer_protocol import HostState, NodeRef, PeerErrorCode
+from .peer_protocol import PROTOCOL_VERSION, HostState, NodeRef, PeerErrorCode
 
 HOST_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 HOST_PINS_FILENAME = "host_pins.json"  # pinned identity triples, outside the administrator's config.json
@@ -55,6 +55,12 @@ class HostRegistry(Protocol):
 
     def status(self, host_id: str | None = None) -> list[HostStatus]:
         """Backs the `agent_hosts` tool."""
+
+    def read_configured_hosts(self) -> dict[str, HostConfig]:
+        """Validate administrator configuration without changing the active registry."""
+
+    def replace_hosts(self, hosts: Mapping[str, HostConfig]) -> None:
+        """Replace registered hosts in place, keeping unchanged live status."""
 
     def pin(self, host_id: str, node: NodeRef) -> None:
         """Persist the node triple after admin confirmation. Replaces the pin only via explicit re-registration."""
@@ -205,6 +211,28 @@ class ConfigHostRegistry:
     def list(self) -> list[HostConfig]:
         return [self._hosts[host_id] for host_id in sorted(self._hosts)]
 
+    def read_configured_hosts(self) -> dict[str, HostConfig]:
+        """Validate a fresh disk snapshot without changing the live registry."""
+        if self._state_dir is None:
+            return dict(self._hosts)
+        return self._apply_persisted_pins(self._load_configured_hosts(required=True))
+
+    def replace_hosts(self, hosts: Mapping[str, HostConfig]) -> None:
+        configured = dict(hosts)
+        statuses = {}
+        for host_id, config in configured.items():
+            previous = self._hosts.get(host_id)
+            current = self._statuses.get(host_id)
+            repinned = current is not None and config.pinned is not None and config.pinned != current.node
+            if previous == config or (current is not None and current.state in STICKY_HOST_STATES and not repinned):
+                statuses[host_id] = current
+            else:
+                statuses[host_id] = HostStatus(host_id, HostState.OFFLINE, config.pinned, None, None)
+        self._hosts.clear()
+        self._hosts.update(configured)
+        self._statuses.clear()
+        self._statuses.update(statuses)
+
     def status(self, host_id: str | None = None) -> list[HostStatus]:
         if host_id is not None:
             self.get(host_id)
@@ -242,17 +270,17 @@ class ConfigHostRegistry:
             state=state,
             node=current.node,
             last_contact=time.time() if state is HostState.ONLINE else current.last_contact,
-            protocol_version=current.protocol_version,
+            protocol_version=PROTOCOL_VERSION if state is HostState.ONLINE else current.protocol_version,
             detail=detail,
         )
 
     # ---------------------------------------------------------------- internals
 
-    def _load_configured_hosts(self) -> dict[str, HostConfig]:
+    def _load_configured_hosts(self, *, required: bool = False) -> dict[str, HostConfig]:
         if self._state_dir is None:
             return {}
         path = self._state_dir / "config.json"
-        if not path.exists():
+        if not required and not path.exists():
             return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
