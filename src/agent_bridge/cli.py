@@ -7,6 +7,7 @@ import os
 import socket
 import sys
 import uuid
+from pathlib import Path
 
 from .config import Config, state_directory
 from .errors import BridgeError
@@ -20,6 +21,26 @@ class _AsyncStdinReader:
 
     async def readline(self):
         return await asyncio.to_thread(self._stream.readline)
+
+
+def _relay_release_changed(state):
+    """Retire a managed relay between frames when its stable launcher changes release."""
+    if not (state / "update.json").exists():
+        return lambda: False
+    from .updater import load_settings
+
+    current = Path(load_settings(state)["root"]) / "current"
+    initial = current.resolve()
+    running = Path(sys.prefix).resolve()
+    expected = running if running.parent == current.parent / "releases" else initial
+
+    def changed():
+        try:
+            return current.resolve(strict=True) != expected
+        except OSError:
+            return True
+
+    return changed
 
 
 class _HostListAction(argparse.Action):
@@ -139,6 +160,7 @@ def main():
 
             asyncio.run(Worker(state, Config.load(state / "config.json"), args.session_id).run())
         elif args.command == "relay":
+            from .discovery import ModelDirectory
             from .node_identity import FileNodeIdentityStore
             from .peer_api import DirectPeerService
             from .peer_transport import DirectRelayServer
@@ -151,8 +173,12 @@ def main():
                 host_id=socket.gethostname(),
                 store=Store(state),
                 config=config,
+                config_path=config_path,
+                model_directory=ModelDirectory(state),
             )
-            asyncio.run(DirectRelayServer(service).serve(_AsyncStdinReader(sys.stdin.buffer), sys.stdout.buffer))
+            asyncio.run(DirectRelayServer(service, retire=_relay_release_changed(state)).serve(
+                _AsyncStdinReader(sys.stdin.buffer), sys.stdout.buffer,
+            ))
         elif args.command == "mcp":
             from .mcp_server import server
 

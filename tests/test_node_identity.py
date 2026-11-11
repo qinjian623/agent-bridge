@@ -2,8 +2,10 @@ import json
 import os
 import stat
 import tempfile
+import threading
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -105,6 +107,46 @@ class FileNodeIdentityStoreTests(unittest.TestCase):
         self.assertEqual(self.store.verify_database(3).state, NodeState.READY)
         self.assertEqual(self.store.verify_database(9).state, NodeState.READY)
         self.assertEqual(self.store.load_or_create().state, NodeState.READY)
+
+    def test_verify_database_compares_coordinator_sequence_as_an_additional_floor(self):
+        self.store.advance(3)
+        self.assertEqual(NodeState.READY, self.store.verify_database(5, last_acked_seq=2).state)
+        with self.assertRaises(BridgeError) as caught:
+            self.store.verify_database(5, last_acked_seq=6)
+        self.assertEqual(PeerErrorCode.STATE_CORRUPTED, caught.exception.code)
+        self.assertEqual(NodeState.STATE_CORRUPTED, self.store.load_or_create().state)
+
+    def test_independent_instances_cannot_overwrite_a_newer_confirmed_sequence(self):
+        self.store.load_or_create()
+        other = FileNodeIdentityStore(self.state)
+        entered = threading.Event()
+        release = threading.Event()
+        newer_done = threading.Event()
+        real_write = self.store._write
+
+        def slow_write(identity):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("Timed out waiting to complete the older write")
+            real_write(identity)
+
+        def newer_write():
+            try:
+                return other.advance(2)
+            finally:
+                newer_done.set()
+
+        with patch.object(self.store, "_write", side_effect=slow_write), ThreadPoolExecutor(max_workers=2) as pool:
+            older = pool.submit(self.store.advance, 1)
+            self.assertTrue(entered.wait(5))
+            newer = pool.submit(newer_write)
+            try:
+                self.assertFalse(newer_done.wait(0.05))
+            finally:
+                release.set()
+            older.result(timeout=5)
+            newer.result(timeout=5)
+        self.assertEqual(2, self.store.load_or_create().max_confirmed_seq)
 
     def test_rotate_generation_requires_the_current_node_id(self):
         self.store.load_or_create()

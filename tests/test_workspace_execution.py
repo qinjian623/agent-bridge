@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_bridge.broker import Broker
 from agent_bridge.config import Config, Profile
@@ -182,6 +183,32 @@ class ManifestBuildTests(unittest.TestCase):
 
 
 class ServiceWorkspaceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ready_workspace_replay_repairs_a_missing_seal_commit_record(self):
+        manifest = self.snapshot_manifest()
+        real_record_commit = self.store.record_commit
+
+        def fail_seal_record(key, method, **kwargs):
+            if key.startswith("peer.workspace:seal:"):
+                raise OSError("synthetic crash after ready status, before commit record")
+            return real_record_commit(key, method, **kwargs)
+
+        with patch.object(self.store, "record_commit", side_effect=fail_seal_record):
+            with self.assertRaises(OSError):
+                await self.prepare_and_seal(manifest)
+        workspace_id = manifest["workspace_id"]
+        ready = self.store.get_workspace_transfer(workspace_id)
+        self.assertEqual("ready", ready["status"])
+        previous_max = self.store.max_peer_commit_seq()
+        params = {
+            "action": "seal", "workspace_id": workspace_id,
+            "manifest_sha256": ready["manifest_sha256"], "expected_revision": ready["revision"],
+        }
+        replay = await self.action(**params)
+        self.assertEqual("ready", replay["status"])
+        self.assertEqual(previous_max + 1, self.store.max_peer_commit_seq())
+        await self.action(**params)
+        self.assertEqual(previous_max + 1, self.store.max_peer_commit_seq())
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

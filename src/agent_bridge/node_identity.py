@@ -1,6 +1,8 @@
 """Node identity file interface (design 4.2). The file lives outside SQLite and its backups."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import secrets
@@ -8,6 +10,7 @@ import stat
 import tempfile
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
@@ -39,7 +42,7 @@ class NodeIdentityStore(Protocol):
         """Atomically (write temp, fsync, rename, fsync dir) raise max_confirmed_seq. Never lowers it.
         Called after the SQLite commit and before the ACK is returned to the peer."""
 
-    def verify_database(self, db_max_seq: int) -> NodeIdentity:
+    def verify_database(self, db_max_seq: int | Callable[[], int], *, last_acked_seq: int = 0) -> NodeIdentity:
         """db_max_seq < max_confirmed_seq means rollback: persist state=state_corrupted and raise
         BridgeError(peer_state_corrupted)."""
 
@@ -64,14 +67,36 @@ class FileNodeIdentityStore:
     def path(self) -> Path:
         return self._state_dir / IDENTITY_FILENAME
 
-    def load_or_create(self) -> NodeIdentity:
+    @contextlib.contextmanager
+    def _locked(self):
         with self._lock:
+            self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = self._state_dir / "node_identity.lock"
+            created = False
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                created = True
+            except FileExistsError:
+                descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                if created:
+                    os.fchmod(descriptor, 0o600)
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise BridgeError("invalid_identity", "Node identity lock must be an owned 0600 file")
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(descriptor)
+
+    def load_or_create(self) -> NodeIdentity:
+        with self._locked():
             return self._load_or_create_locked()
 
     def advance(self, seq: int) -> NodeIdentity:
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "max_confirmed_seq must be a non-negative integer")
-        with self._lock:
+        with self._locked():
             current = self._load_or_create_locked()
             if seq <= current.max_confirmed_seq:
                 return current
@@ -79,16 +104,22 @@ class FileNodeIdentityStore:
             self._write(updated)
             return updated
 
-    def verify_database(self, db_max_seq: int) -> NodeIdentity:
-        if isinstance(db_max_seq, bool) or not isinstance(db_max_seq, int) or db_max_seq < 0:
-            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "db_max_seq must be a non-negative integer")
-        with self._lock:
+    def verify_database(self, db_max_seq: int | Callable[[], int], *, last_acked_seq: int = 0) -> NodeIdentity:
+        if isinstance(last_acked_seq, bool) or not isinstance(last_acked_seq, int) or last_acked_seq < 0:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, "last_acked_seq must be a non-negative integer")
+        with self._locked():
+            # Read the WAL counter while other processes cannot advance the identity file past that snapshot.
+            if callable(db_max_seq):
+                db_max_seq = db_max_seq()
+            if isinstance(db_max_seq, bool) or not isinstance(db_max_seq, int) or db_max_seq < 0:
+                raise BridgeError(PeerErrorCode.INVALID_PARAMS, "db_max_seq must be a non-negative integer")
             current = self._load_or_create_locked()
-            if db_max_seq >= current.max_confirmed_seq:
+            confirmed = max(current.max_confirmed_seq, last_acked_seq)
+            if db_max_seq >= confirmed:
                 return current
             message = (
                 f"Database rollback detected: database max seq {db_max_seq} is below "
-                f"confirmed seq {current.max_confirmed_seq}"
+                f"confirmed seq {confirmed}"
             )
             if current.state is not NodeState.STATE_CORRUPTED:
                 corrupted = replace(current, state=NodeState.STATE_CORRUPTED)
@@ -96,7 +127,7 @@ class FileNodeIdentityStore:
             raise BridgeError(PeerErrorCode.STATE_CORRUPTED, message)
 
     def rotate_generation(self, confirm: str) -> NodeIdentity:
-        with self._lock:
+        with self._locked():
             current = self._load_or_create_locked()
             if confirm != current.node_id:
                 raise BridgeError(
@@ -112,7 +143,7 @@ class FileNodeIdentityStore:
             return rotated
 
     def node_ref(self, host_id: str) -> NodeRef:
-        with self._lock:
+        with self._locked():
             current = self._load_or_create_locked()
             return NodeRef(
                 host_id=host_id,

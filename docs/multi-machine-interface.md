@@ -10,10 +10,11 @@
 | `src/agent_bridge/node_identity.py` | `NodeIdentity`、`NodeIdentityStore`（`node_identity.json`） | A |
 | `src/agent_bridge/hosts.py` | `HostConfig`、`HostStatus`、`HostRegistry` | A |
 | `src/agent_bridge/peer_transport.py` | `PeerTransport`、`RelayServer`、`PeerClient`、`PeerClientFactory`、`PeerService` | A/B |
-| `src/agent_bridge/peer_api.py` | 新增/扩展 MCP 工具参数类型；`DeliveryScheduler`、`OutboxPuller`、`EventMirror`、`OperationTracker` | B/C |
+| `src/agent_bridge/peer_api.py` | MCP 参数类型与 `DirectPeerService`，包含目录、投递、回执、工作区和结果处理 | B/C |
+| `src/agent_bridge/broker.py` | 已接入 `DeliveryScheduler`、`OutboxPuller`、`EventMirror` 与动态主机清单 | B/C |
 | `tests/test_peer_protocol.py` | 契约测试（白名单、方法与客户端一一对应、可变方法带 `operation`） | — |
 
-现有单机代码未改动。接口均为 `Protocol` / `TypedDict`，没有任何运行时接线。
+上述组件已接入运行程序。每台机器有独立的 SQLite WAL 数据库；`relay` 在 SSH 进程中直接调用 `DirectPeerService` 访问本机数据库，本机 Broker 再启动 Worker 执行已入库任务。代码中保留的 `Protocol` 是类型声明，不能据此判断功能未实现。
 
 ## 2. 线路协议
 
@@ -26,6 +27,9 @@
 - `id` 只用于帧对应，**不是幂等键**；幂等键是 `OperationKey = (node_id, state_generation, operation_id)`。
 - Relay 与节点分发器必须先调用 `require_method`，白名单之外的方法一律返回 `peer_method_not_allowed`。
 - 连接中断只能得到 `peer_host_offline`，**不得**转成任务失败；结果以 `peer.lookup_delivery` 查证为准。
+- `relay` 每帧重新检查配置；配置损坏或已加载文件被删除时拒绝执行请求。`peer.catalog` 保留 `entries`，生产入口同时返回 `profiles` 和 `discovery`，`refresh=true` 调用已有模型目录查询，失败通过 `stale/error` 表示。
+- 自动更新切换 managed `current` 后，旧 relay 完整返回在途帧的响应再退出；静默等待输入的旧 relay 在下一帧到达时返回明确未执行错误后退出。后续请求通过固定入口启动新版，不自动重放结果不明的业务请求。
+- `peer.pull_requests` 按条数和完整 UTF-8 响应字节数共同分页。新单条请求大到无法容纳一帧时，在写入 outbox 前拒绝；历史超大记录报出对应 operation_id，不跳过或伪造 ACK。连接旧 relay 时协调端可减小读取页，最小为 1 条。
 
 ## 3. 方法一览
 
@@ -38,12 +42,12 @@
 | `peer.ack_request` | 是 | 否 | 协调端回传出站请求处理结论 |
 | `peer.deliver` | 是 | 否 | 投递任务/广播/取消墓碑；无 session 时携带 `open` 作复合操作（ADR-13） |
 | `peer.lookup_delivery` | 否 | 否 | 丢 ACK 后按 `delivery_id` 或 `operation` 查证 |
-| `peer.control` | 是 | 是 | pause/resume/close |
+| `peer.control` | 是 | 是 | **尚未实现**：pause/resume/close，返回 `peer_not_implemented` |
 | `peer.cancel` | 是 | 否 | `task_id` / `operation_id` / `delivery_id` 三选一 |
-| `peer.review` | 是 | 是 | 提交审查证据 |
+| `peer.review` | 是 | 是 | **尚未实现**：提交审查证据，返回 `peer_not_implemented` |
 | `peer.events` | 否 | 否 | 游标分页事件流 |
 | `peer.result` | 否 | 否 | 结果摘要与 Artifact 分页数据 |
-| `peer.inbox` | 否 | 否 | 原生成员收件箱历史 |
+| `peer.inbox` | 否 | 否 | **尚未实现**：原生成员收件箱历史，返回 `peer_not_implemented` |
 | `peer.notify_parent` | 是 | 否 | 完成事件进入父会话镜像，返回本地 `mirror_seq` |
 | `peer.workspace` | 是 | 是 | 工作区上传：`action` = `prepare` / `chunk` / `seal` / `abort`，均带 `operation` |
 | `peer.resolve_delivery` | 是 | 是 | 以非空 `evidence` 和 `expected_delivery_revision` 解决 `uncertain` 投递（`received` / `not_received`），不重发 |
@@ -55,15 +59,18 @@
 可变方法（`PeerService` 文档）：
 1. 校验 `operation.node_id / state_generation`，不符返回 `peer_identity_mismatch`。
 2. 同 `operation_id` 同参数 → 返回已存结果或 `operation_pending`；参数不同 → `operation_conflict`。
-3. 先提交 SQLite Intent，再 `NodeIdentityStore.advance(seq)`（fsync），最后返回 ACK。
+3. 在事务中提交修改与 `peer_commit_log.ack_seq`，再 `NodeIdentityStore.advance(ack_seq)`（fsync），最后返回 ACK；`target_seq` 只表示目标内顺序，不能用作节点提交序号。
 4. `node_state == state_corrupted` 时拒绝全部可变调用。
 
 投递（`DeliveryScheduler`）：
 - 每个目标 `target_seq` 严格递增；队头 `uncertain` 时后续返回 `delivery_blocked`，只能由 `agent_delivery_resolve`（非空证据 + 正确 revision）解除。
 - 取消未发送消息 = 发送 `seq_kind=tombstone` 的 `peer.deliver`，保留原序号，墓碑确认后后续消息才放行。
 - 重试复用同一 `delivery_id` 与 `target_seq`，绝不自动重发 `uncertain`。
+- 原生目标入队后为 `accepted_remote`；定期查询同一投递，匹配节点、目标、序号、原生回执和 turn 后才释放下一条。`pending/enqueued/sending` 继续等待，缺失或矛盾回执转 `uncertain`；收到与处理完成分开记录。
+- `peer.lookup_delivery` 读取实时 `native_send_queue`；Codex 只检查既有队列与对应用户消息，不重新发送、启动或恢复会话。远端原生成员的非空 `cwd` 随广播保存，AGY 缺少有效原目录时不启动。
+- 远端 AGY 和本机一样，创建会话前拒绝 `read-only`，不先创建无法运行的会话。
 
-身份：`NodeIdentityStore.verify_database(db_max_seq)` 发现回滚即写入 `state_corrupted`；仅 `rotate_generation` 可恢复。
+身份：校验实际数据库提交序号不小于已确认值；握手提供 `last_acked_seq` 时，还检查节点不小于协调端已确认值。发现回滚即写入 `state_corrupted`；仅管理员可恢复。旧版哈希序号只在数据库中存在对应 legacy 投递时保留为迁移起点，不凭身份文件伪造数据库记录。当前 Broker 未发送 `last_acked_seq`，本机数据库/身份文件检查不能替代整机快照一起回滚的协调端检测。
 
 事件：`EventMirror.mirror` 以 `(NodeRef, event.seq)` 去重生成本地 `events.seq`，游标只前进；`peer.notify_parent` 的 `parent_ref` 是协调端对象引用。
 
@@ -91,7 +98,7 @@ Phase C 新增错误码：`workspace_conflict`、`workspace_already_attached`、
 
 `peer_protocol.CAPABILITIES`：`groups_v1`、`ordered_delivery_v1`、`member_outbox_v1`、`event_mirror_v1`、`workspace_v1`、`session_name_v1`、`prune_guard_v1`。
 
-Phase C 契约调整：`RemoteMember` 使用 `target_kind`（`bridge` 带 `session_id`；`native` 带 `runtime` + `native_id`）；`peer.deliver` 增加可选 `ordering_mode`、`stream_id`、`authority_ref`、`parent_ref`；`peer.pull_requests` 结果增加 `scan_upper_seq`；`OutboxItem` 增加 `seq`、`sender_ref`、`authority_ref`、`authorization_revision`、`fingerprint`。`peer.workspace` 与 `peer.resolve_delivery` 为管理员方法，当前节点返回 `peer_not_implemented`。
+Phase C 接口：`RemoteMember` 使用 `target_kind`（`bridge` 带 `session_id`；`native` 带 `runtime` + `native_id`）；`peer.deliver` 支持 `ordering_mode`、`stream_id`、`authority_ref`、`parent_ref`；`peer.pull_requests` 返回 `scan_upper_seq`；`OutboxItem` 带 `seq`、`sender_ref`、`authority_ref`、`authorization_revision`、`fingerprint`。`peer.workspace` 与 `peer.resolve_delivery` 已实现；16 个白名单方法中，13 个有运行处理代码，未实现项已在上表标出。
 
 ## 7. 实现分工建议
 

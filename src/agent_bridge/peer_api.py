@@ -1,6 +1,7 @@
 """Coordinator-side orchestration interfaces and new/extended MCP tool contracts (design 7 and 8)."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import hashlib
@@ -17,12 +18,13 @@ from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 from . import __version__, groups, update_guard
-from .config import Profile
+from .config import Config, Profile
 from .errors import BridgeError
 from .node_identity import NodeIdentityStore
 from .peer_protocol import (
     CAPABILITIES,
     INLINE_RESULT_BYTES,
+    MAX_FRAME_BYTES,
     MAX_PAGE_LIMIT,
     MAX_WORKSPACE_CHUNK_BYTES,
     PROTOCOL_VERSION,
@@ -209,12 +211,17 @@ class DirectPeerService:
         host_id: str | None = None,
         store: Any = None,
         config: Any = None,
+        config_path: Path | None = None,
+        model_directory: Any = None,
         broker_version: str = __version__,
     ) -> None:
         self._identity = identity_store
         self._host_id = host_id if host_id is not None else socket.gethostname()
         self._store = store
         self._config = config
+        self._config_path = config_path
+        self._config_digest = None
+        self._models = model_directory
         self._broker_version = broker_version
         self._workspace_locks: dict[str, threading.Lock] = {}
         self._workspace_locks_guard = threading.Lock()
@@ -224,12 +231,42 @@ class DirectPeerService:
         guard = update_guard.operation(self._store.state, readonly=readonly) if self._store else contextlib.nullcontext()
         try:
             with guard:
+                self._reload_config()
+                if self._config_path is not None and self._config is None and not (
+                    isinstance(request, dict) and request.get("method") in {
+                        "peer.hello", "peer.inspect", "peer.catalog", "peer.lookup_delivery", "peer.result", "peer.events",
+                    }
+                ):
+                    raise peer_error(
+                        PeerErrorCode.HOST_OFFLINE,
+                        "Execution node has no config; no request was executed",
+                    )
                 return await self._handle(request)
         except BridgeError as error:
             request_id = request.get("id", "") if isinstance(request, dict) else ""
             if error.code == "update_busy":
                 error = peer_error(PeerErrorCode.HOST_OFFLINE, "Execution node is updating; no request was executed")
             return fail(request_id, error)
+
+    def _reload_config(self):
+        if self._config_path is None:
+            return
+        if self._config is None and self._config_digest is None and not self._config_path.exists():
+            return
+        try:
+            data = self._config_path.read_bytes()
+            digest = hashlib.sha256(data).digest()
+            if digest != self._config_digest:
+                config = Config.load(self._config_path)
+                if self._config_path.read_bytes() != data:
+                    raise ValueError("Config changed while being loaded")
+                self._config = config
+                self._config_digest = digest
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, BridgeError) as error:
+            raise peer_error(
+                PeerErrorCode.HOST_OFFLINE,
+                "Execution node config could not be loaded; no request was executed",
+            ) from error
 
     async def _handle(self, request: PeerRequest) -> PeerResponse:
         if not isinstance(request, dict):
@@ -247,20 +284,22 @@ class DirectPeerService:
             params = request.get("params", {})
             if not isinstance(params, dict):
                 raise peer_error(PeerErrorCode.INVALID_PARAMS, "Peer params must be a JSON object")
+            if spec.mutating and self._store is not None:
+                self._ready_identity()
             if spec.name == "peer.hello":
                 result = self._hello(params)
             elif spec.name == "peer.inspect":
                 result = self._inspect(params)
             elif spec.name == "peer.catalog":
-                result = self._catalog(params)
+                result = await self._catalog(params)
             elif spec.name == "peer.pull_requests":
-                result = self._pull_requests(params)
+                result = self._pull_requests(params, request_id=request_id)
             elif spec.name == "peer.ack_request":
                 result = self._ack_request(params)
             elif spec.name == "peer.deliver":
                 result = self._deliver(params)
             elif spec.name == "peer.lookup_delivery":
-                result = self._lookup_delivery(params)
+                result = await self._lookup_delivery(params)
             elif spec.name == "peer.cancel":
                 result = self._cancel(params)
             elif spec.name == "peer.result":
@@ -282,6 +321,11 @@ class DirectPeerService:
             return fail(request_id, error)
         except (TypeError, ValueError, KeyError) as error:
             return fail(request_id, peer_error(PeerErrorCode.INVALID_PARAMS, str(error)))
+        if self._store is not None and spec.mutating:
+            try:
+                self._sync_identity()
+            except BridgeError as error:
+                return fail(request_id, error)
         return ok(request_id, result)
 
     # ---------------------------------------------------------------- handlers
@@ -294,14 +338,10 @@ class DirectPeerService:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "protocol_versions must be a list of integers")
         protocol_version = negotiate_version(versions)
 
-        identity = self._identity.load_or_create()
-        last_acked_seq = params.get("last_acked_seq")
-        if last_acked_seq is not None:
-            if isinstance(last_acked_seq, bool) or not isinstance(last_acked_seq, int) or last_acked_seq < 0:
-                raise peer_error(PeerErrorCode.INVALID_PARAMS, "last_acked_seq must be a non-negative integer")
-            # ADR-03: a database/identity sequence below the coordinator's last acknowledged sequence means an
-            # inconsistent rollback; verify_database persists state_corrupted and raises before we answer.
-            identity = self._identity.verify_database(last_acked_seq)
+        last_acked_seq = params.get("last_acked_seq", 0)
+        if last_acked_seq is None:
+            last_acked_seq = 0
+        identity = self._sync_identity(last_acked_seq=last_acked_seq)
 
         node = NodeRef(
             host_id=self._host_id,
@@ -358,8 +398,24 @@ class DirectPeerService:
             raise peer_error(PeerErrorCode.NOT_IMPLEMENTED, "This node has no local store configured")
         return store
 
+    def _sync_identity(self, *, last_acked_seq=0):
+        if self._store is None:
+            current = self._identity.load_or_create()
+            return self._identity.verify_database(current.max_confirmed_seq, last_acked_seq=last_acked_seq)
+        seq = 0
+
+        def read_sequence():
+            nonlocal seq
+            seq = self._store.max_peer_commit_seq()
+            return seq
+
+        identity = self._identity.verify_database(read_sequence, last_acked_seq=last_acked_seq)
+        if identity.state is not NodeState.STATE_CORRUPTED and seq > identity.max_confirmed_seq:
+            identity = self._identity.advance(seq)
+        return identity
+
     def _ready_identity(self):
-        identity = self._identity.load_or_create()
+        identity = self._sync_identity()
         if identity.state is NodeState.STATE_CORRUPTED:
             raise peer_error(
                 PeerErrorCode.STATE_CORRUPTED,
@@ -419,11 +475,14 @@ class DirectPeerService:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, f"{key} must be a non-empty string")
         return value
 
-    def _catalog(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def _catalog(self, params: dict[str, Any]) -> dict[str, Any]:
         fetched_at = time.time()
         name = params.get("profile")
         if name is not None and (not isinstance(name, str) or not name):
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "profile must be a non-empty string")
+        refresh = params.get("refresh", False)
+        if not isinstance(refresh, bool):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "refresh must be a boolean")
         entries: list[dict[str, Any]] = []
         profiles = getattr(self._config, "profiles", None) if self._config is not None else None
         if isinstance(profiles, dict):
@@ -431,9 +490,20 @@ class DirectPeerService:
                 if name is not None and profile.name != name:
                     continue
                 entries.append(profile.public())
+        if self._models is not None:
+            discoveries = await asyncio.gather(*(
+                self._models.get(profiles[p["name"]], refresh) for p in entries
+            ))
+            return {
+                "entries": entries,
+                "profiles": entries,
+                "discovery": discoveries,
+                "stale": any(d["stale"] or d["error"] for d in discoveries),
+                "fetched_at": fetched_at,
+            }
         return {"entries": entries, "stale": False, "fetched_at": fetched_at}
 
-    def _pull_requests(self, params: dict[str, Any]) -> PullRequestsResult:
+    def _pull_requests(self, params: dict[str, Any], *, request_id: str = "") -> PullRequestsResult:
         store = self._require_store(self._store)
         after = params.get("after", 0)
         limit = params.get("limit", MAX_PAGE_LIMIT)
@@ -445,11 +515,29 @@ class DirectPeerService:
         rows = store.pull_outbox(after, limit)
         with store.connection() as db:
             scan_upper_seq = db.execute("SELECT COALESCE(MAX(seq),0) FROM node_outbox").fetchone()[0]
-        items = [normalize_outbox_item(row) for row in rows]
+        # Include the actual response envelope and UTF-8 bytes, not just the number of requests.
+        overhead = len(encode(ok(request_id, {
+            "items": [], "cursor": max(after, scan_upper_seq), "has_more": False,
+            "scan_upper_seq": scan_upper_seq,
+        })).encode("utf-8")) + 1
+        remaining = MAX_FRAME_BYTES - overhead
+        items = []
+        for row in rows:
+            item = normalize_outbox_item(row)
+            size = len(encode(item).encode("utf-8")) + bool(items)
+            if size > remaining:
+                if not items:
+                    raise peer_error(
+                        PeerErrorCode.FRAME_TOO_LARGE,
+                        f"Outbox request {row['operation_id']} cannot fit in one relay frame; inspect this request",
+                    )
+                break
+            items.append(item)
+            remaining -= size
         return {
             "items": items,
             "cursor": items[-1]["seq"] if items else after,
-            "has_more": len(items) == limit,
+            "has_more": len(items) < len(rows) or len(rows) == limit,
             "scan_upper_seq": scan_upper_seq,
         }
 
@@ -850,6 +938,9 @@ class DirectPeerService:
                 received = sum(
                     chunk["size"] for chunk in store.get_workspace_chunks(workspace_id, blob_sha256)
                 )
+                self._advance_workspace_commit(
+                    store, f"peer.workspace:chunk:{workspace_id}:{blob_sha256}:{offset}",
+                )
                 return {
                     "action": "chunk",
                     "workspace_id": workspace_id,
@@ -1037,6 +1128,9 @@ class DirectPeerService:
             if transfer["status"] == "ready":
                 if params["expected_revision"] > transfer["revision"]:
                     raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace revision conflict")
+                self._advance_workspace_commit(
+                    store, f"peer.workspace:seal:{workspace_id}:{transfer['revision']}",
+                )
                 return {
                     "action": "seal",
                     "workspace_id": workspace_id,
@@ -1523,6 +1617,10 @@ class DirectPeerService:
                         if not isinstance(cwd, str) or not cwd:
                             cwd = "."
                     access = open_spec.get("access") or "read-only"
+                    if access not in {"read-only", "workspace-write"}:
+                        raise BridgeError("invalid_access", "access must be read-only or workspace-write")
+                    if profile.runtime == "antigravity" and access != "workspace-write":
+                        raise BridgeError("unsupported_access", "Antigravity requires workspace-write; plan mode is not read-only enforcement")
                     workspace = open_spec.get("workspace")
                     workspace_ref = open_spec.get("workspace_ref")
                     if workspace_ref is not None:
@@ -1607,10 +1705,14 @@ class DirectPeerService:
                 "UPDATE peer_operations SET status=?,result=?,updated=? WHERE operation_id=?",
                 ("cancelled" if status == "cancelled" else "completed", encode(result), time.time(), operation["operation_id"]),
             )
-        self._identity.advance(target_seq)
+            ack_seq = store.record_commit(
+                f"peer.deliver:{operation['operation_id']}", "peer.deliver", db=db
+            )
+            db.execute("UPDATE peer_inbox SET ack_seq=? WHERE delivery_id=?", (ack_seq, delivery_id))
+        self._identity.advance(ack_seq)
         return result
 
-    def _lookup_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def _lookup_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
         store = self._require_store(self._store)
         delivery_id = params.get("delivery_id")
         if delivery_id is not None and (not isinstance(delivery_id, str) or not delivery_id):
@@ -1655,6 +1757,28 @@ class DirectPeerService:
         if delivery is not None and inbox is not None:
             delivery.setdefault("delivery_id", inbox["delivery_id"])
             delivery.setdefault("target_seq", inbox["target_seq"])
+            payload = inbox.get("payload")
+            target = payload.get("target") if isinstance(payload, dict) else None
+            delivery.update({
+                "node_id": inbox["node_id"], "state_generation": inbox["state_generation"],
+                "operation_id": inbox["operation_id"], "target": target,
+            })
+            if isinstance(target, dict) and target.get("kind") == "native":
+                from .native_broadcast import refresh_queue_receipt
+
+                queued = store.get_native_send_by_delivery(DeliverySource.PEER_DELIVER, inbox["delivery_id"])
+                if queued is None or queued["runtime"] != target.get("runtime") or queued["native_id"] != target.get("id"):
+                    delivery.update({
+                        "send_status": "uncertain", "receipt": None, "native_turn_id": None,
+                        "error": "Original native send-queue record is missing or belongs to another target",
+                    })
+                else:
+                    queued = await refresh_queue_receipt(store, self._config, queued)
+                    delivery.update({
+                        "send_status": queued["status"], "processing_status": queued["processing_status"],
+                        "receipt": queued["receipt"], "native_turn_id": queued["native_turn_id"],
+                        "error": queued["error"],
+                    })
         response: dict[str, Any] = {
             "found": True,
             "operation_status": stored["status"] if stored is not None else inbox["status"],
@@ -1686,7 +1810,9 @@ class DirectPeerService:
                     PeerErrorCode.OPERATION_CONFLICT,
                     "operation_id was already used with different cancel parameters",
                 )
-            return self._operation_outcome(existing)
+            result = self._operation_outcome(existing)
+            self._identity.advance(store.record_commit(f"peer.cancel:{operation['operation_id']}", "peer.cancel"))
+            return result
         store.record_operation(
             operation["operation_id"],
             identity.node_id,
@@ -1735,6 +1861,7 @@ class DirectPeerService:
         if tombstone_seq is not None:
             result["tombstone_seq"] = tombstone_seq
         store.update_operation(operation["operation_id"], status="completed", result=result)
+        self._identity.advance(store.record_commit(f"peer.cancel:{operation['operation_id']}", "peer.cancel"))
         return result
 
     def _resolve_delivery(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1863,11 +1990,9 @@ class DirectPeerService:
                     "delivery_revision": revision,
                     "receipt": receipt,
                 }
-            cursor = db.execute(
-                "INSERT INTO peer_commit_log(mutation_key,method,created) VALUES(?,?,?)",
-                (f"peer.resolve_delivery:{operation['operation_id']}", "peer.resolve_delivery", resolved_at),
+            ack_seq = store.record_commit(
+                f"peer.resolve_delivery:{operation['operation_id']}", "peer.resolve_delivery", db=db
             )
-            ack_seq = cursor.lastrowid
             db.execute(
                 "UPDATE peer_operations SET status=?,result=?,updated=? WHERE operation_id=?",
                 ("completed", encode(result), time.time(), operation["operation_id"]),

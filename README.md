@@ -6,6 +6,8 @@
 
 多机器接入方案见 [多机器架构规范](docs/multi-machine-design.md)（已整合 [AGY / DeepSeek 审查结论](docs/multi-machine-review.md)）。代码已提供 `agent-bridge relay`、SSH JSONL 传输、节点握手、主机查询、远端任务与分组接口。远端机器需要独立运行 Broker；连接按主机复用，每次请求前核对节点身份，断线不自动重发原请求。本机与 Captain 的服务启动和只读通信检查见 [部署记录](docs/macos-node-service-verification-20261108.md)，该检查未执行远端模型任务或广播。
 
+当前运行结构、协议格式、远端原生广播接收检查、relay 配置刷新和升级时的连接处理见 [接口说明](docs/multi-machine-interface.md)。`peer.control`、`peer.review`、`peer.inbox` 尚未实现，不能仅凭协议方法已声明就当作可用。
+
 本版 Broker 会自动检查 `config.json` 中的 `hosts` 和 `host_pins.json`，运行中增删节点无需重启服务。也可调用 `agent-bridge call agent_hosts_reload --json '{}'` 立即应用配置；`agent_hosts.config_error` 显示配置错误或拒绝变更的原因。未变化节点保留原 SSH，正在处理的请求和 ACK 先完成，再替换相关连接。配置无效时保留上一份有效清单，不重发任务。
 
 仍在分组中、存在待处理消息或结果不明的节点拒绝删除/改址；历史父通知路由需只读核实会话关闭、任务结束且完成审查后才允许。节点移除不停止远端程序，也不清除历史。使用方式、限制及首次部署说明见 [动态节点检查记录](docs/dynamic-hosts-20261109.md)。

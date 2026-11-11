@@ -7,6 +7,7 @@ from pathlib import Path
 
 from agent_bridge import groups
 from agent_bridge.broker import Broker, OutboxPuller
+from agent_bridge.errors import BridgeError
 from agent_bridge.hosts import HostConfig
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.peer_api import DirectPeerService
@@ -142,6 +143,34 @@ class PullerTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class OutboxPullerTests(PullerTestCase):
+    async def test_older_relay_frame_errors_reduce_only_the_read_page(self):
+        client = FakePeerClient({"node_id": NODE, "state_generation": GENERATION})
+        async def pull(params):
+            client.pull_params.append(params)
+            if params["limit"] > 3:
+                raise BridgeError(PeerErrorCode.FRAME_TOO_LARGE, "old relay frame limit")
+            return {"items": [], "cursor": params["after"], "has_more": False, "scan_upper_seq": 0}
+        client.pull_requests = pull
+        puller = OutboxPuller(self.store, FakePeerFactory({HOST: client}), FakeHostRegistry([host_config()]))
+        self.assertEqual(0, await puller.run_once(HOST))
+        self.assertEqual([100, 50, 25, 12, 6, 3], [call["limit"] for call in client.pull_params])
+        self.assertEqual({0}, {call["after"] for call in client.pull_params})
+        self.assertEqual([], client.acks)
+
+    async def test_oversized_single_request_stops_reducing_and_preserves_cursor(self):
+        client = FakePeerClient({"node_id": NODE, "state_generation": GENERATION})
+        async def pull(params):
+            client.pull_params.append(params)
+            raise BridgeError(PeerErrorCode.FRAME_TOO_LARGE, "one oversized request")
+        client.pull_requests = pull
+        puller = OutboxPuller(self.store, FakePeerFactory({HOST: client}), FakeHostRegistry([host_config()]))
+        puller._temp_after[HOST] = 7
+        with self.assertRaises(BridgeError):
+            await puller.run_once(HOST)
+        self.assertEqual([100, 50, 25, 12, 6, 3, 1], [call["limit"] for call in client.pull_params])
+        self.assertEqual(7, puller._temp_after[HOST])
+        self.assertEqual([], client.acks)
+
     async def test_pull_verifies_membership_and_broadcasts_atomically(self):
         item = outbox_item("op-1", 1)
         self.add_item(item)

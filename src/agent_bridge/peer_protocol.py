@@ -344,7 +344,9 @@ class CatalogParams(TypedDict):
 
 
 class CatalogResult(TypedDict):
-    profiles: list[dict[str, Any]]  # same shape as local agent_catalog, sanitized (no env/secret fields)
+    entries: list[dict[str, Any]]  # configured profiles, sanitized (no env/secret fields)
+    profiles: NotRequired[list[dict[str, Any]]]  # alias supplied by production relays
+    discovery: NotRequired[list[dict[str, Any]]]  # provider/runtime model directory and freshness
     stale: bool
     fetched_at: float
 
@@ -429,6 +431,7 @@ class DeliverParams(TypedDict):
     target_seq: int
     seq_kind: str  # SeqKind
     message: NotRequired[str]  # omitted for tombstones
+    cwd: NotRequired[str]  # existing native member directory on the execution host
     expected_group_revision: int
     # Composite open+dispatch (ADR-13): present when target.kind == "bridge" and no session exists yet.
     open: NotRequired[DeliverOpenSpec]  # never a local cwd
@@ -446,6 +449,14 @@ class DeliverResult(TypedDict):
     task_id: NotRequired[str]
     send_status: NotRequired[str]  # SendQueueStatus
     processing_status: NotRequired[str]
+    node_id: NotRequired[str]
+    state_generation: NotRequired[str]
+    operation_id: NotRequired[str]
+    target_seq: NotRequired[int]
+    target: NotRequired[DeliverTarget]
+    receipt: NotRequired[str | dict[str, Any] | None]
+    native_turn_id: NotRequired[str | None]
+    error: NotRequired[str | None]
 
 
 class LookupDeliveryParams(TypedDict):

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_bridge.cli import build_parser
 from agent_bridge.node_identity import FileNodeIdentityStore
@@ -116,7 +117,7 @@ class DirectPeerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.identity.advance(5)
 
         response = await self.service.handle(
-            request("peer.hello", {"protocol_versions": [1], "last_acked_seq": 2})
+            request("peer.hello", {"protocol_versions": [1], "last_acked_seq": 10})
         )
 
         self.assertFalse(response["ok"])
@@ -132,6 +133,60 @@ class DirectPeerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response["ok"])
         self.assertEqual(response["result"]["max_confirmed_seq"], 5)
+
+    async def test_hello_accepts_an_older_coordinator_sequence(self):
+        self.identity.advance(5)
+        response = await self.service.handle(
+            request("peer.hello", {"protocol_versions": [1], "last_acked_seq": 2})
+        )
+        self.assertTrue(response["ok"], response)
+        self.assertEqual("ready", response["result"]["node_state"])
+
+    async def test_hello_checks_the_database_without_a_coordinator_sequence(self):
+        from agent_bridge.store import Store
+
+        store = Store(self.state)
+        self.service = DirectPeerService(self.identity, store=store)
+        store.record_commit("committed", "peer.deliver")
+        self.identity.advance(2)
+        response = await self.service.handle(request("peer.hello", {"protocol_versions": [1]}))
+        self.assertFalse(response["ok"])
+        self.assertEqual(PeerErrorCode.STATE_CORRUPTED, response["error"]["code"])
+        self.assertEqual("state_corrupted", self.identity.load_or_create().state.value)
+
+    async def test_hello_recovers_identity_file_lag_from_committed_database(self):
+        from agent_bridge.store import Store
+
+        store = Store(self.state)
+        self.service = DirectPeerService(self.identity, store=store)
+        for number in range(3):
+            store.record_commit(str(number), "peer.deliver")
+        response = await self.service.handle(
+            request("peer.hello", {"protocol_versions": [1], "last_acked_seq": 2})
+        )
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(3, response["result"]["max_confirmed_seq"])
+        self.assertEqual(3, FileNodeIdentityStore(self.state).load_or_create().max_confirmed_seq)
+
+    async def test_hello_reads_database_counter_after_acquiring_identity_lock(self):
+        from agent_bridge.store import Store
+
+        store = Store(self.state)
+        self.service = DirectPeerService(self.identity, store=store)
+        store.record_commit("first", "peer.deliver")
+        self.identity.advance(1)
+        original_verify = self.identity.verify_database
+
+        def concurrent_commit_before_verify(sequence, **kwargs):
+            Store(self.state).record_commit("other-relay", "peer.deliver")
+            FileNodeIdentityStore(self.state).advance(2)
+            return original_verify(sequence, **kwargs)
+
+        with patch.object(self.identity, "verify_database", side_effect=concurrent_commit_before_verify):
+            response = await self.service.handle(request("peer.hello", {"protocol_versions": [1]}))
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(2, response["result"]["max_confirmed_seq"])
+        self.assertEqual("ready", response["result"]["node_state"])
 
     async def test_inspect_node_returns_the_current_node_state(self):
         response = await self.service.handle(request("peer.inspect", {"kind": "node"}))

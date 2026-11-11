@@ -703,6 +703,8 @@ def broadcast(store, group_id, message, revision, request_id, reservation=0, *, 
                 delivery_id, group_id, broadcast_id, target, target_seq, stream_id, authority,
                 message, reservation, revision,
             )
+            if member["target_kind"] == "native" and member["cwd"]:
+                delivery_payload["cwd"] = member["cwd"]
             delivery_payload["operation_id"] = operation_id
             delivery_fingerprint = hashlib.sha256(encode(delivery_payload).encode("utf-8")).hexdigest()
             db.execute(
