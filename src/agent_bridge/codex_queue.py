@@ -48,7 +48,7 @@ def inspect_receipt(client, job, *, message_id=None):
         for turn in page["data"]:
             if any(item.get("type") == "userMessage" and item.get("clientId") == wanted
                    for item in turn.get("items", [])):
-                return {"status": "received", "receipt": job.get("receipt"), "turn_id": turn["id"]}
+                return {"status": "received", "receipt": job.get("receipt") or wanted, "turn_id": turn["id"]}
         cursor = page.get("nextCursor")
         if not cursor or cursor in cursors:
             break
@@ -63,7 +63,9 @@ def advance(client, job):
         return inspect_receipt(client, job)
     try:
         thread = client.request("thread/read", {"threadId": job["native_id"], "includeTurns": False})["thread"]
-        if thread["id"] != job["native_id"] or Path(thread["cwd"]).resolve() != Path(job["cwd"]).resolve():
+        if thread["id"] != job["native_id"] or (
+            job.get("cwd") and Path(thread["cwd"]).resolve() != Path(job["cwd"]).resolve()
+        ):
             return {"status": "failed", "error": "Native thread identity or directory does not match the group member"}
     except Exception as error:
         return {"status": "deferred", "error": "Native thread preflight failed: " + type(error).__name__}
@@ -89,7 +91,7 @@ def main():
             from codex_async.app_server import CodexAppServer
 
             client = stack.enter_context(CodexAppServer(
-                Path(job["cwd"]), timeout=15, sandbox=None, daemon=True, start_daemon=False,
+                Path(job.get("cwd") or Path.home()), timeout=15, sandbox=None, daemon=True, start_daemon=False,
             ))
         except Exception as error:
             print(json.dumps({"status": "deferred", "error": "Shared Codex client unavailable: " + type(error).__name__}))

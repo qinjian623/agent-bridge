@@ -145,6 +145,37 @@ def _native_owned_by_bridge(store, native_id):
         return db.execute("SELECT 1 FROM sessions WHERE native_id=?", (native_id,)).fetchone() is not None
 
 
+async def refresh_queue_receipt(store, config, row, sender=None):
+    """Inspect an existing Codex submission; never enqueue or resume anything."""
+    if config is None or row["runtime"] != "codex" or row["status"] not in {"enqueued", "uncertain"}:
+        return row
+    sender = sender or send
+    status, receipt, turn_id = row["status"], row["receipt"], row["native_turn_id"]
+    try:
+        reply = await sender(config, row, inspect=True)
+        reported = reply.get("status")
+        if reported == "unconfirmed":
+            status, error = "uncertain", reply.get("error") or "Native receipt is not confirmed"
+        elif reported in {"enqueued", "received"}:
+            found = reply.get("receipt")
+            if not isinstance(found, str) or not found or receipt and receipt != found:
+                status, error = "uncertain", "Native receipt does not match the persisted submission"
+            elif reported == "received" and not (isinstance(reply.get("turn_id"), str) and reply["turn_id"]):
+                status, error = "uncertain", "Native receipt has no matching turn"
+            else:
+                status, receipt = reported, found
+                turn_id = reply.get("turn_id") or turn_id
+                error = reply.get("error")
+        else:
+            error = reply.get("error") or "Native receipt inspection is unavailable"
+    except Exception as exc:
+        error = safe_error(exc)
+    return store.update_native_send(
+        row["id"], status=status, receipt=receipt, native_turn_id=turn_id,
+        processing_status=row["processing_status"], error=error, expected_status=row["status"],
+    )
+
+
 async def deliver(store, config, sender=send, *, tasks=None):
     capacity = max(0, config.parallel_limit - len(tasks)) if tasks is not None else 10
     rows = store.claim_eligible_native_sends(capacity, delivery_sources=QUEUE_SOURCES)
@@ -190,6 +221,24 @@ async def deliver(store, config, sender=send, *, tasks=None):
             )
             continue
         row = claimed if legacy is None else {**legacy, **claimed}
+        if claimed["delivery_source"] == str(DeliverySource.PEER_DELIVER):
+            inbox = store.get_inbox_delivery(claimed["delivery_id"])
+            payload = inbox.get("payload") if inbox else None
+            if not isinstance(payload, dict):
+                store.update_native_send(
+                    claimed["id"], status="failed", error="Original peer delivery metadata is missing",
+                    expected_status="sending",
+                )
+                continue
+            row = {**row, "cwd": payload.get("cwd"), "group_id": payload.get("group_id", "")}
+            if row["runtime"] == "antigravity" and (
+                not isinstance(row["cwd"], str) or not Path(row["cwd"]).is_absolute() or not Path(row["cwd"]).is_dir()
+            ):
+                store.update_native_send(
+                    claimed["id"], status="failed", error="Remote AGY member needs its existing native working directory",
+                    expected_status="sending",
+                )
+                continue
         task = asyncio.create_task(process_row(row, claimed["id"]))
         if tasks is not None:
             tasks.add(task)

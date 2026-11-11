@@ -3,7 +3,7 @@
 > **文档状态**：已定稿（技术规范）。2026-11-04 正式版。  
 > **设计对象**：跨物理机/服务器的分布式 CLI Agent 协同系统（协调端与多执行节点）。  
 > **审查集成**：本文已全面整合 Antigravity (`gemini-4-argon-high`) 与 Pi (`deepseek-flash`) 对初稿的对抗性审查结论（共 16 项关键缺陷与防护方案）。  
-> **实施提示**：当前代码库为单机版本，本技术规范作为后续多机功能（`agent-bridge relay` 及集群状态同步）开发的唯一基准。
+> **实现状态**：SSH relay、跨机派单、分组、工作区和事件同步已接入代码。本文保留架构决策与后续计划，当前接口和未实现项以 [接口说明](multi-machine-interface.md) 为准。
 
 ---
 
@@ -28,18 +28,19 @@
 ```mermaid
 flowchart TD
     subgraph HostCoord["协调机器 (Coordinator)"]
-        M[主 Agent / IDE / Telegram] -->|MCP stdio| C[协调端 Bridge Broker]
+        M[主 Agent / IDE / Telegram] -->|MCP stdio| E[MCP 服务]
+        E -->|Unix socket JSONL v1| C[协调端 Bridge Broker]
         C --- CD[(协调端 SQLite: bridge.sqlite)]
     end
 
     subgraph HostA["执行服务器 A (gpu-a)"]
-        RA[agent-bridge relay] -->|Unix Domain Socket| BA[A 节点 Broker]
+        RA[agent-bridge relay / DirectPeerService] --- DA[(A 独立 SQLite)]
         BA --- DA[(A 独立 SQLite)]
         BA --> AA[A 原生 Codex / AGY / 子会话]
     end
 
     subgraph HostB["执行服务器 B (gpu-b)"]
-        RB[agent-bridge relay] -->|Unix Domain Socket| BB[B 节点 Broker]
+        RB[agent-bridge relay / DirectPeerService] --- DB[(B 独立 SQLite)]
         BB --- DB[(B 独立 SQLite)]
         BB --> AB[B 原生 Codex / AGY / 子会话]
     end
@@ -52,11 +53,11 @@ flowchart TD
 1. **纯 SSH 隧道传输**：协调机器主动通过已有 SSH 配置（支持 SSH Config 别名、ProxyJump、Tailscale VPN 等）发起连接，执行远端固定的可执行文件路径与 `relay` 命令。
 2. **严禁开放外部端口**：集群内**不监听任何 TCP 端口**，消除公网暴露风险。
 3. **严禁跨网络共享 SQLite**：SQLite WAL 机制强依赖本地内核 POSIX 共享内存与文件锁（`*-shm` / `*-wal`），在 NFS、SMB 或 SSHFS 上运行会导致静默数据损坏。各机器**必须持有各自独立的 SQLite 数据库**。
-4. **Relay 进程边界**：远端新增 `agent-bridge relay` 进程，仅负责 SSH stdin/stdout 与远端本地 Unix Domain Socket（`broker.sock`）之间的协议转发。SSH 进程中断、Relay 异常退出均不会影响远端已在后台运行的 Broker、Worker 或正在恢复的 AGY 实例。
+4. **Relay 进程**：`agent-bridge relay` 通过 `DirectPeerService` 处理 SSH stdin/stdout 请求，直接访问远端本地 SQLite；Broker 从同一数据库领取任务并启动 Worker。SSH 进程中断、Relay 退出不停止远端已在运行的任务。
 
 ### 2.2 单向主动 RPC 与拉取流（审查决策 A1/D5/D6）
 为防止远端服务器拥有对协调机器的反向 SSH 权限造成横向越权，系统**全面采用单向 RPC 架构**：
-- **正向调用**：由协调机发起请求，经 Relay 调用远端本地 Broker。
+- **正向调用**：由协调机发起请求，经 Relay 调用 `DirectPeerService`，提交到远端本地数据库。
 - **反向出站（拉取模式）**：当远端原生主会话调用跨机组广播时，远端 Broker 仅将操作写入本机的 `node_outbox` 表。协调机后台任务默认每 2 秒发起一次 `peer.pull_requests` 拉取一页出站请求，校验发送权限并完成派发后，调用 `peer.ack_request` 持久化确认。**远端服务器无须反向 SSH 连接协调机器**。
 
 ---

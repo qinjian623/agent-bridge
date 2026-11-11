@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_bridge.broker import Broker
 from agent_bridge.config import Config, Profile
@@ -268,6 +269,55 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], filtered["result"]["entries"])
         self.assert_error(await self.peer("peer.catalog", {"profile": 7}), PeerErrorCode.INVALID_PARAMS)
 
+    async def test_deliver_commit_counter_is_independent_of_legacy_hash_and_replays(self):
+        legacy_hash = Broker._target_seq("abcdef0123456789" + "0" * 48)
+        first = await self.peer("peer.deliver", self.deliver_params(target_seq=legacy_hash))
+        self.assertTrue(first["ok"], first)
+        replay = await self.peer("peer.deliver", self.deliver_params(target_seq=legacy_hash))
+        self.assertEqual(first, replay)
+        self.assertEqual(1, self.store.max_peer_commit_seq())
+        second = await self.peer("peer.deliver", self.deliver_params(
+            operation=self.operation("op-2"), delivery_id="delivery-2", target_seq=2,
+        ))
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(2, self.store.max_peer_commit_seq())
+        self.assertEqual(2, self.identity.load_or_create().max_confirmed_seq)
+
+    async def test_deliver_replay_syncs_identity_after_commit_before_ack_crash(self):
+        real_advance = self.identity.advance
+        def fail_sync(seq):
+            if seq == 1:
+                raise OSError("synthetic fsync failure after SQLite commit")
+            return real_advance(seq)
+        with patch.object(self.identity, "advance", side_effect=fail_sync):
+            with self.assertRaises(OSError):
+                await self.peer("peer.deliver", self.deliver_params())
+        self.assertEqual(1, self.store.max_peer_commit_seq())
+        self.assertEqual(0, self.identity.load_or_create().max_confirmed_seq)
+        replay = await self.peer("peer.deliver", self.deliver_params())
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(1, self.identity.load_or_create().max_confirmed_seq)
+        self.assertEqual(1, self.store.max_peer_commit_seq())
+        with self.store.connection() as db:
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+
+    async def test_cancel_replay_repairs_missing_commit_record_without_cancelling_twice(self):
+        delivered = await self.peer("peer.deliver", self.deliver_params())
+        task_id = delivered["result"]["task_id"]
+        params = {"operation": self.operation("cancel-crash"), "task_id": task_id}
+        with patch.object(self.store, "record_commit", side_effect=OSError("synthetic pre-log crash")):
+            with self.assertRaises(OSError):
+                await self.peer("peer.cancel", params)
+        self.assertEqual("cancelled", self.store.get_task(task_id)["status"])
+        self.assertEqual(1, self.store.max_peer_commit_seq())
+        with patch.object(self.store, "cancel", side_effect=AssertionError("must not cancel again")):
+            replay = await self.peer("peer.cancel", params)
+            again = await self.peer("peer.cancel", params)
+        self.assertTrue(replay["ok"], replay)
+        self.assertEqual(replay, again)
+        self.assertEqual(2, self.store.max_peer_commit_seq())
+        self.assertEqual(2, self.identity.load_or_create().max_confirmed_seq)
+
     async def test_deliver_opens_and_dispatches_in_one_idempotent_operation(self):
         params = self.deliver_params()
         response = await self.peer("peer.deliver", params)
@@ -300,7 +350,8 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("received", inbox["status"])
         self.assertEqual("op-1", inbox["operation_id"])
         self.assertEqual(5, inbox["target_seq"])
-        self.assertEqual(5, self.identity.load_or_create().max_confirmed_seq)
+        self.assertEqual(1, inbox["ack_seq"])
+        self.assertEqual(1, self.identity.load_or_create().max_confirmed_seq)
 
         replay = await self.peer("peer.deliver", params)
         self.assertTrue(replay["ok"], replay)
@@ -487,7 +538,7 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.store.sessions())
         self.assertEqual("cancelled", self.store.get_inbox_delivery("delivery-tombstone")["status"])
         self.assertEqual("cancelled", self.store.get_operation("op-tombstone")["status"])
-        self.assertEqual(8, self.identity.load_or_create().max_confirmed_seq)
+        self.assertEqual(1, self.identity.load_or_create().max_confirmed_seq)
 
     async def test_lookup_delivery_resolves_lost_acknowledgements(self):
         delivered = await self.peer("peer.deliver", self.deliver_params())

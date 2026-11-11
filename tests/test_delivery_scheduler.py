@@ -26,6 +26,8 @@ class FakePeerClient:
     def __init__(self):
         self.deliveries = []
         self.deliver_calls = []
+        self.lookups = []
+        self.lookup_calls = []
 
     async def deliver(self, params):
         self.deliver_calls.append(params)
@@ -33,6 +35,20 @@ class FakePeerClient:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+    async def lookup_delivery(self, params):
+        self.lookup_calls.append(params)
+        if self.lookups:
+            outcome = self.lookups.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        delivered = next(row for row in self.deliver_calls if row["delivery_id"] == params["delivery_id"])
+        return {"found": True, "delivery": {
+            **delivered["operation"], "delivery_id": delivered["delivery_id"],
+            "target_seq": delivered["target_seq"], "target": delivered["target"],
+            "send_status": "pending", "processing_status": None, "receipt": None,
+        }}
 
 
 class FakePeerFactory:
@@ -75,6 +91,15 @@ class DeliverySchedulerTests(unittest.IsolatedAsyncioTestCase):
             return dict(db.execute(
                 "SELECT * FROM broadcast_recipients WHERE broadcast_id=?", (broadcast_id,)
             ).fetchone())
+
+    def native_lookup(self, sent, send_status="received", **changes):
+        outbox = self.outbox(sent["recipients"][0]["delivery_id"])
+        return {"found": True, "delivery": {
+            **{key: outbox[key] for key in ("delivery_id", "node_id", "state_generation", "operation_id", "target_seq")},
+            "target": {"kind": "native", "id": outbox["target_id"], "runtime": outbox["runtime"]},
+            "send_status": send_status, "processing_status": "running", "receipt": "native-receipt",
+            "native_turn_id": "native-turn", **changes,
+        }}
 
     async def test_bridge_ack_releases_the_stream_and_updates_the_recipient(self):
         self.create([REMOTE_BRIDGE])
@@ -133,6 +158,107 @@ class DeliverySchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], await self.scheduler.step())
         self.assertEqual(1, len(self.client.deliver_calls))
         self.assertEqual("pending", self.outbox(second["recipients"][0]["delivery_id"])["status"])
+
+    async def test_native_receipt_releases_once_and_processing_failure_does_not_block(self):
+        self.create([REMOTE_NATIVE])
+        first = self.broadcast("one", "send-1")
+        second = self.broadcast("two", "send-2")
+        self.client.deliveries.extend([
+            {"status": "accepted_remote", "send_status": "pending"},
+            {"status": "accepted_remote", "send_status": "pending"},
+        ])
+        await self.scheduler.step()
+        self.client.lookups.append(self.native_lookup(first, processing_status="failed"))
+        [released] = await self.scheduler.step()
+        self.assertEqual("released", released["status"])
+        self.assertEqual("received", released["send_status"])
+        self.assertEqual("failed", released["processing_status"])
+        self.assertEqual(1, self.stream(released["stream_id"])["released_seq"])
+        self.assertEqual("released", self.recipient(first["broadcast_id"])["status"])
+        await self.scheduler.step()
+        await self.scheduler.step()
+        self.assertEqual(2, len(self.client.deliver_calls))
+        self.assertEqual("accepted_remote", self.outbox(second["recipients"][0]["delivery_id"])["status"])
+        self.assertEqual([first["recipients"][0]["delivery_id"], second["recipients"][0]["delivery_id"]],
+                         [call["delivery_id"] for call in self.client.deliver_calls])
+
+    async def test_native_enqueued_is_not_receipt_and_pump_stops(self):
+        self.create([REMOTE_NATIVE])
+        first = self.broadcast("one", "send-1")
+        self.broadcast("two", "send-2")
+        self.client.deliveries.append({"status": "accepted_remote", "send_status": "pending"})
+        await self.scheduler.step()
+        self.client.lookups.append(self.native_lookup(first, "enqueued", native_turn_id=None))
+        rows = await asyncio.wait_for(self.scheduler.pump(), 2)
+        self.assertEqual("accepted_remote", rows[0]["status"])
+        self.assertEqual("enqueued", rows[0]["send_status"])
+        self.assertEqual(0, self.stream(rows[0]["stream_id"])["released_seq"])
+        self.assertEqual(1, len(self.client.deliver_calls))
+
+    async def test_native_lookup_disconnect_can_recover_without_resubmitting(self):
+        self.create([REMOTE_NATIVE])
+        first = self.broadcast("one", "send-1")
+        self.client.deliveries.append({"status": "accepted_remote", "send_status": "pending"})
+        await self.scheduler.step()
+        self.client.lookups.extend([ConnectionError("lost reply"), self.native_lookup(first)])
+        [waiting] = await self.scheduler.step()
+        self.assertEqual("accepted_remote", waiting["status"])
+        self.assertIn("lost reply", waiting["error"])
+        [released] = await self.scheduler.step()
+        self.assertEqual("released", released["status"])
+        self.assertEqual(1, len(self.client.deliver_calls))
+
+    async def test_native_unknown_failed_and_invalid_receipts_block_without_resending(self):
+        cases = [
+            ("absent", {"found": False}),
+            ("no delivery", {"found": True}),
+            ("uncertain", {"send_status": "uncertain"}),
+            ("failed", {"send_status": "failed", "error": "native preflight failed"}),
+            ("no receipt", {"receipt": None}),
+            ("no turn", {"native_turn_id": None}),
+            ("wrong delivery", {"delivery_id": "other"}),
+            ("wrong node", {"node_id": "other"}),
+            ("wrong generation", {"state_generation": "other"}),
+            ("wrong operation", {"operation_id": "other"}),
+            ("wrong sequence", {"target_seq": 2}),
+            ("boolean sequence", {"target_seq": True}),
+            ("wrong target", {"target": {"kind": "native", "runtime": "codex", "id": "other"}}),
+        ]
+        self.create([REMOTE_NATIVE])
+        for index, (label, changes) in enumerate(cases):
+            with self.subTest(label=label):
+                # Separate streams allow each invalid fact to be tested without bypassing an uncertain head.
+                native = {**REMOTE_NATIVE, "native_id": "native-" + str(index)}
+                group_id = "invalid-" + str(index)
+                self.create([native], group_id)
+                first = self.broadcast("one", "send-1-" + str(index), group_id)
+                second = self.broadcast("two", "send-2-" + str(index), group_id)
+                self.client.deliveries.append({"status": "accepted_remote", "send_status": "pending"})
+                await self.scheduler.step()
+                lookup = changes if "found" in changes else self.native_lookup(first, **changes)
+                self.client.lookups.append(lookup)
+                [uncertain] = await self.scheduler.step()
+                self.assertEqual("uncertain", uncertain["status"])
+                self.assertEqual(0, self.stream(uncertain["stream_id"])["released_seq"])
+                self.assertEqual("pending", self.outbox(second["recipients"][0]["delivery_id"])["status"])
+                self.assertEqual([], await self.scheduler.step())
+        self.assertEqual(len(cases), len(self.client.deliver_calls))
+
+    async def test_native_lookup_cannot_overwrite_a_concurrent_resolution(self):
+        self.create([REMOTE_NATIVE])
+        first = self.broadcast("one", "send-1")
+        self.client.deliveries.append({"status": "accepted_remote", "send_status": "pending"})
+        await self.scheduler.step()
+        delivery_id = first["recipients"][0]["delivery_id"]
+        async def resolve_during_lookup(params):
+            with self.store.connection(write=True) as db:
+                db.execute("UPDATE peer_outbox SET status='uncertain',revision=revision+1 WHERE delivery_id=?", (delivery_id,))
+            return self.native_lookup(first)
+        self.client.lookup_delivery = resolve_during_lookup
+        await self.scheduler.step()
+        self.assertEqual("uncertain", self.outbox(delivery_id)["status"])
+        self.assertEqual(0, self.stream(self.outbox(delivery_id)["stream_id"])["released_seq"])
+        self.assertEqual(1, len(self.client.deliver_calls))
 
     async def test_offline_and_uncertain_heads_block_without_skipping(self):
         self.create([REMOTE_BRIDGE])

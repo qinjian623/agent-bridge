@@ -1,4 +1,3 @@
-import json
 import sqlite3
 import tempfile
 import unittest
@@ -215,19 +214,23 @@ class PhaseCCommitLogTests(unittest.TestCase):
         self.assertEqual([1, 2, 3], [row["ack_seq"] for row in rows])
         self.assertEqual(["open:session-a", "cancel:session-a", "open:session-b"], [row["mutation_key"] for row in rows])
 
-    def test_commit_log_starts_above_identity_floor(self):
-        (self.state / "node_identity.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "node_id": "node-a",
-                    "state_generation": "gen-a",
-                    "max_confirmed_seq": 7,
-                    "state": "ready",
-                }
-            ),
-            encoding="utf-8",
-        )
+    def legacy_delivery(self, store, seq):
+        from agent_bridge.node_identity import FileNodeIdentityStore
+
+        identity = FileNodeIdentityStore(self.state).load_or_create()
+        with store.connection(write=True) as db:
+            db.execute(
+                "INSERT INTO peer_inbox(delivery_id,host_id,node_id,state_generation,target_seq,seq_kind,"
+                "operation_id,payload,status,created) VALUES(?,?,?,?,?,'message',?,'{}','received',1.0)",
+                (f"delivery-{seq}", "h", identity.node_id, identity.state_generation, seq, f"op-{seq}"),
+            )
+
+    def test_commit_log_starts_above_verified_identity_floor(self):
+        from agent_bridge.node_identity import FileNodeIdentityStore
+
+        store = Store(self.state)
+        self.legacy_delivery(store, 7)
+        FileNodeIdentityStore(self.state).advance(7)
         store = Store(self.state)
         self.assertEqual(8, store.record_commit("after-floor", "peer.deliver"))
         reopened = Store(self.state)
@@ -237,6 +240,56 @@ class PhaseCCommitLogTests(unittest.TestCase):
                 "SELECT ack_seq FROM peer_commit_log WHERE mutation_key='migration_floor'"
             ).fetchall()
         self.assertEqual([7], [row["ack_seq"] for row in floors])
+
+    def test_legacy_hash_floor_is_preserved_above_an_existing_commit_log(self):
+        from agent_bridge.node_identity import FileNodeIdentityStore
+
+        store = Store(self.state)
+        self.assertEqual(1, store.record_commit("old-global-commit", "peer.workspace"))
+        legacy_hash = 3156441702022342537
+        self.legacy_delivery(store, legacy_hash)
+        identity = FileNodeIdentityStore(self.state)
+        identity.advance(legacy_hash)
+        reopened = Store(self.state)
+        self.assertEqual(legacy_hash + 1, reopened.record_commit("new-deliver", "peer.deliver"))
+        self.assertEqual("ready", identity.load_or_create().state.value)
+        self.assertEqual(legacy_hash, identity.load_or_create().max_confirmed_seq)
+
+    def test_identity_floor_without_a_matching_legacy_delivery_marks_rollback(self):
+        from agent_bridge.node_identity import FileNodeIdentityStore
+
+        store = Store(self.state)
+        self.legacy_delivery(store, 4)
+        store.record_commit("older", "peer.workspace")
+        identity = FileNodeIdentityStore(self.state)
+        identity.advance(5)
+        reopened = Store(self.state)
+        self.assertEqual(1, reopened.max_peer_commit_seq())
+        self.assertEqual("state_corrupted", identity.load_or_create().state.value)
+        Store(self.state)
+        self.assertEqual(1, reopened.max_peer_commit_seq())
+
+    def test_empty_restored_database_cannot_seed_from_identity_file(self):
+        from agent_bridge.node_identity import FileNodeIdentityStore
+
+        identity = FileNodeIdentityStore(self.state)
+        identity.advance(5)
+        restored = Store(self.state)
+        self.assertEqual(0, restored.max_peer_commit_seq())
+        self.assertEqual("state_corrupted", identity.load_or_create().state.value)
+
+    def test_migration_never_clears_an_already_corrupted_identity(self):
+        from agent_bridge.node_identity import FileNodeIdentityStore
+
+        store = Store(self.state)
+        self.legacy_delivery(store, 5)
+        identity = FileNodeIdentityStore(self.state)
+        identity.advance(5)
+        with self.assertRaises(BridgeError):
+            identity.verify_database(4)
+        reopened = Store(self.state)
+        self.assertEqual(0, reopened.max_peer_commit_seq())
+        self.assertEqual("state_corrupted", identity.load_or_create().state.value)
 
     def test_commit_log_starts_above_existing_acked_sequence(self):
         store = Store(self.state)

@@ -604,8 +604,9 @@ class DirectRelayServer:
     functionality. Input and output may be asyncio streams or plain binary file objects.
     """
 
-    def __init__(self, service: PeerService) -> None:
+    def __init__(self, service: PeerService, *, retire=None) -> None:
         self._service = service
+        self._retire = retire or (lambda: False)
 
     async def serve(self, stdin: Any, stdout: Any) -> None:
         while True:
@@ -628,7 +629,18 @@ class DirectRelayServer:
                 break
             if not line.strip():
                 continue  # keepalive/blank lines are not frames
-            response = await self._handle_line(line)
+            if self._retire():
+                try:
+                    request = json.loads(line)
+                    request_id = request.get("id", "") if isinstance(request, dict) else ""
+                except (ValueError, UnicodeDecodeError):
+                    request_id = ""
+                response = fail(request_id, peer_error(
+                    PeerErrorCode.HOST_OFFLINE,
+                    "Execution node release changed; reconnect before retrying; no request was executed",
+                ))
+            else:
+                response = await self._handle_line(line)
             payload = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
             if len(payload) > MAX_FRAME_BYTES:
                 payload = (
@@ -646,6 +658,8 @@ class DirectRelayServer:
                     + b"\n"
                 )
             await _write(stdout, payload)
+            if self._retire():
+                break
 
     async def _handle_line(self, line: Any) -> PeerResponse:
         if isinstance(line, str):

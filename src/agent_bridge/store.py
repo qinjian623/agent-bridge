@@ -15,7 +15,7 @@ from .codex_parent import read_resume_config
 from .config import Config, Profile
 from .errors import BridgeError
 from .parent_usage import meter_usage, refresh_meter, start_meter
-from .peer_protocol import DeliverySource, PeerErrorCode, compute_stream_id
+from .peer_protocol import MAX_FRAME_BYTES, DeliverySource, PeerErrorCode, compute_stream_id
 
 
 def encode(value):
@@ -528,28 +528,37 @@ class Store:
             )
 
     def _initialize_commit_log(self, db):
-        """Seed the commit log above the pre-migration confirmed sequence, once."""
-        if db.execute("SELECT 1 FROM peer_commit_log LIMIT 1").fetchone():
-            return
-        floor = self._identity_floor()
-        if "ack_seq" in {row[1] for row in db.execute("PRAGMA table_info(peer_inbox)")}:
-            value = db.execute("SELECT MAX(ack_seq) FROM peer_inbox").fetchone()[0]
-            if isinstance(value, int) and not isinstance(value, bool) and value > floor:
-                floor = value
-        if floor > 0:
+        """Preserve a legacy counter only when its acknowledged delivery still exists in the DB."""
+        from .node_identity import FileNodeIdentityStore
+
+        committed = self.max_peer_commit_seq(db=db)
+        acknowledged = db.execute("SELECT COALESCE(MAX(ack_seq),0) FROM peer_inbox").fetchone()[0]
+        floor = max(committed, acknowledged)
+        identity_store = FileNodeIdentityStore(self.state)
+        if identity_store.path().exists():
+            identity = identity_store.load_or_create()
+            if identity.state.value == "state_corrupted":
+                return
+            if identity.max_confirmed_seq > floor:
+                legacy = db.execute(
+                    "SELECT COALESCE(MAX(target_seq),0) FROM peer_inbox WHERE ack_seq IS NULL "
+                    "AND node_id=? AND state_generation=?",
+                    (identity.node_id, identity.state_generation),
+                ).fetchone()[0]
+                if legacy < identity.max_confirmed_seq:
+                    try:
+                        identity_store.verify_database(floor)
+                    except BridgeError as error:
+                        if error.code != PeerErrorCode.STATE_CORRUPTED:
+                            raise
+                    return
+                floor = identity.max_confirmed_seq
+        if floor > committed:
+            key = "migration_floor" if committed == 0 else f"legacy_floor:{floor}"
             db.execute(
                 "INSERT INTO peer_commit_log(ack_seq,mutation_key,method,created) VALUES(?,?,?,?)",
-                (floor, "migration_floor", "migration", time.time()),
+                (floor, key, "migration", time.time()),
             )
-
-    def _identity_floor(self):
-        """Return the verified pre-migration max_confirmed_seq, or 0 when absent/unreadable."""
-        try:
-            data = json.loads((self.state / "node_identity.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            return 0
-        value = data.get("max_confirmed_seq") if isinstance(data, dict) else None
-        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
     def create_group_prune_run(
         self, run_id: str, request_id: str, fingerprint: str, cutoff: float, now: float | None = None
@@ -1811,6 +1820,12 @@ class Store:
         with self.connection(write=True) as connection:
             return self._record_commit(connection, mutation_key, method)
 
+    def max_peer_commit_seq(self, *, db=None) -> int:
+        if db is not None:
+            return db.execute("SELECT COALESCE(MAX(ack_seq),0) FROM peer_commit_log").fetchone()[0]
+        with self.connection() as connection:
+            return self.max_peer_commit_seq(db=connection)
+
     @staticmethod
     def _record_commit(db, mutation_key: str, method: str) -> int:
         existing = db.execute(
@@ -2110,6 +2125,15 @@ class Store:
                         "operation_id was already used for a different outbox request",
                     )
                 return existing["seq"]
+            # Reject an unsendable request before it can block a durable member outbox.
+            wire_fields = {
+                "operation_id": operation_id, "method": method, "payload": payload,
+                "group_id": group_id, "native_id": native_id, "binding_id": binding_id,
+                "request_id": request_id, "sender_ref": encoded_sender, "authority_ref": encoded_authority,
+                "authorization_revision": authorization_revision, "fingerprint": fingerprint,
+            }
+            if len(encode(wire_fields).encode("utf-8")) > MAX_FRAME_BYTES - 4096:
+                raise BridgeError(PeerErrorCode.FRAME_TOO_LARGE, "Member request is too large for one relay frame")
             cursor = db.execute(
                 "INSERT INTO node_outbox(operation_id,group_id,native_id,method,payload,status,created,"
                 "binding_id,request_id,sender_ref,authority_ref,authorization_revision,fingerprint) "

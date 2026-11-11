@@ -159,12 +159,14 @@ class DeliveryScheduler:
         }
         if isinstance(payload.get("parent_ref"), dict):
             params["parent_ref"] = payload["parent_ref"]
+        if outbox["target_kind"] == "native" and isinstance(payload.get("cwd"), str) and payload["cwd"]:
+            params["cwd"] = payload["cwd"]
         if outbox["seq_kind"] == "message":
             params["message"] = payload.get("message", "")
             params["reservation"] = int(payload.get("reservation") or 0)
         return params
 
-    def _finish(self, outbox, status, *, result=None, error=None, release=False):
+    def _finish(self, outbox, status, *, result=None, error=None, release=False, expected_revision=None):
         receipt = None
         send_status = None
         processing_status = None
@@ -178,6 +180,11 @@ class DeliveryScheduler:
         if error is not None:
             encoded_error = error if isinstance(error, str) else encode(error)
         with self.store.connection(write=True) as db:
+            current = db.execute(
+                "SELECT * FROM peer_outbox WHERE delivery_id=?", (outbox["delivery_id"],),
+            ).fetchone()
+            if expected_revision is not None and current["revision"] != expected_revision:
+                return dict(current)
             db.execute(
                 "UPDATE peer_outbox SET status=?,receipt=COALESCE(?,receipt),send_status=?,"
                 "processing_status=?,error=?,revision=revision+1,updated=? WHERE delivery_id=?",
@@ -237,10 +244,66 @@ class DeliveryScheduler:
         # Native ACK only commits the send-queue row; the stream stays blocked until native receipt.
         return self._finish(outbox, str(PeerDeliveryStatus.ACCEPTED_REMOTE), result=result)
 
+    async def _refresh_native(self, outbox):
+        """Read the existing delivery's receipt; never submit the message again."""
+        status = str(PeerDeliveryStatus.ACCEPTED_REMOTE)
+        result = {key: outbox[key] for key in ("send_status", "processing_status", "receipt")}
+        error = None
+        release = False
+        try:
+            lookup = await self._client(outbox["host_id"]).lookup_delivery({
+                "delivery_id": outbox["delivery_id"],
+                "operation": {key: outbox[key] for key in ("node_id", "state_generation", "operation_id")},
+            })
+        except Exception as exc:
+            # A failed read says nothing about native receipt; keep polling the same committed delivery.
+            error = safe_error(exc)
+        else:
+            delivery = lookup.get("delivery") if isinstance(lookup, dict) and lookup.get("found") is True else None
+            expected_target = {"kind": "native", "id": outbox["target_id"], "runtime": outbox["runtime"]}
+            if not isinstance(delivery, dict) or type(delivery.get("target_seq")) is not int or any(
+                delivery.get(key) != outbox[key]
+                for key in ("delivery_id", "node_id", "state_generation", "operation_id", "target_seq")
+            ) or delivery.get("target") != expected_target:
+                status = str(PeerDeliveryStatus.UNCERTAIN)
+                error = "Native delivery lookup did not confirm the original target and operation"
+            else:
+                result = delivery
+                send_status = delivery.get("send_status")
+                if send_status == "received":
+                    if (isinstance(delivery.get("receipt"), str) and delivery["receipt"].strip()
+                            and isinstance(delivery.get("native_turn_id"), str) and delivery["native_turn_id"].strip()):
+                        status = str(PeerDeliveryStatus.RELEASED)
+                        release = True
+                    else:
+                        status = str(PeerDeliveryStatus.UNCERTAIN)
+                        error = "Native receipt lacks a matching receipt and native turn"
+                elif send_status not in {"pending", "sending", "enqueued"}:
+                    status = str(PeerDeliveryStatus.UNCERTAIN)
+                    error = delivery.get("error") or f"Native delivery outcome is {send_status!r}; inspect before resolving"
+                if error is None:
+                    error = delivery.get("error")
+        encoded_error = error if isinstance(error, str) or error is None else encode(error)
+        receipt = result.get("receipt")
+        encoded_receipt = receipt if isinstance(receipt, str) or receipt is None else encode(receipt)
+        if (status == outbox["status"] and encoded_error == outbox["error"]
+                and result.get("send_status") == outbox["send_status"]
+                and result.get("processing_status") == outbox["processing_status"]
+                and encoded_receipt == outbox["receipt"]):
+            return None
+        return self._finish(
+            outbox, status, result=result, error=error, release=release, expected_revision=outbox["revision"],
+        )
+
     async def step(self, host_id=None):
         """Launch at most one pending head per target stream; blocked heads are left untouched."""
         processed = []
         for head in self.heads(host_id):
+            if head["status"] == str(PeerDeliveryStatus.ACCEPTED_REMOTE) and head["target_kind"] == "native":
+                refreshed = await self._refresh_native(head)
+                if refreshed is not None:
+                    processed.append(refreshed)
+                continue
             if head["status"] not in {
                 str(PeerDeliveryStatus.PENDING), str(PeerDeliveryStatus.TOMBSTONE_PENDING),
             }:
@@ -259,6 +322,8 @@ class DeliveryScheduler:
             if not rows:
                 return processed
             processed.extend(rows)
+            if not any(row["status"] in _TERMINAL_PEER_STATUSES for row in rows):
+                return processed
 
     def cancel(self, delivery_id):
         """Turn a still-pending logical message into a tombstone at its original target_seq."""
@@ -534,7 +599,16 @@ class OutboxPuller:
     async def _run_once(self, host_id: str) -> int:
         client = self._client(host_id)
         after = self._temp_after.get(host_id, 0)
-        response = await client.pull_requests({"after": after, "limit": 100})
+        limit = 100
+        while True:
+            try:
+                response = await client.pull_requests({"after": after, "limit": limit})
+                break
+            except BridgeError as error:
+                if str(error.code) != str(PeerErrorCode.FRAME_TOO_LARGE) or limit == 1:
+                    raise
+                # Older relays page by count only; retry this read with a smaller bounded page.
+                limit = max(1, limit // 2)
         items = response.get("items") if isinstance(response, dict) else None
         if not isinstance(items, list):
             items = []
