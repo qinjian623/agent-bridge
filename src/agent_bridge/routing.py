@@ -6,6 +6,7 @@ from statistics import median
 
 from .errors import BridgeError
 from .parent_usage import meter_usage
+from .store import validate_task_timeout
 
 
 def task_samples(store, profile, kind):
@@ -83,12 +84,14 @@ def choose(config, store, requirements, profile_name=None, access="read-only"):
         "hard_budget",
         "strategy",
         "learn_from_result",
+        "task_timeout",
     }
     if not isinstance(requirements, dict) or set(requirements) - supported:
         raise BridgeError(
             "unsupported_requirement",
-            "Only documented task requirements are supported; monetary caps and deadlines are not yet enforced",
+            "Only documented task requirements are supported; monetary caps and arbitrary deadlines are not supported",
         )
+    validate_task_timeout(requirements.get("task_timeout"))
     if requirements.get("hard_budget"):
         raise BridgeError("hard_budget_unsupported", "The installed backends have no verified hard token limit")
     strategy = requirements.get("strategy", config.default_strategy)

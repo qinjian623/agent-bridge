@@ -196,6 +196,11 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(ended))
         self.assertEqual("turn" if accepted else "native_acceptance", ended[0]["data"]["stage"])
         self.assertEqual({None: "task_timeout", "cancel": "task_cancel", "pause": "session_control"}[control], ended[0]["data"]["cause"])
+        result = self.store.get_task(first)["result"]
+        self.assertEqual(ended[0]["data"], result["termination"])
+        self.assertIn(result["termination"]["cause"], result["error"])
+        self.assertIn("execution outcome is unknown", result["error"])
+        self.assertTrue(result["native_error"])
 
     async def test_unconfirmed_task_acceptance_cannot_wait_past_total_deadline(self):
         await self.check_stalled_task(accepted=False)
@@ -208,6 +213,222 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_accepted_task_without_terminal_result_becomes_unknown_after_interrupt_deadline(self):
         await self.check_stalled_task(accepted=True)
+
+    async def check_known_termination_result(self, native_status, cause="task_timeout"):
+        label = native_status + "-" + cause
+        source = self.root / ("source-" + label)
+        source.mkdir()
+        (source / "file.txt").write_text("input")
+        cwd, metadata = directory_copy(self.root, str(source), "copy-" + label, ["file.txt"])
+        sid = self.store.open(self.profile, cwd, "workspace-write", "open-" + label, workspace=metadata)["session_id"]
+        tid = self.store.dispatch(sid, "task", "dispatch-" + label)["task_id"]
+        self.config.task_timeout = .02 if cause == "task_timeout" else 3600
+        worker = Worker(self.root, self.config, sid)
+        begin = worker.store.begin_attempt
+        interrupted = asyncio.Event()
+
+        def assign(*args):
+            worker.store.claim(self.config)
+            return begin(*args)
+
+        async def run(instruction, on_started, on_event):
+            await on_started("native-turn")
+            (Path(cwd) / "file.txt").write_text("retained native work")
+            if cause == "session_control":
+                self.store.control(sid, "pause", self.store.get_session(sid)["revision"], "pause-" + label)
+            elif cause == "task_cancel":
+                self.store.cancel(tid, "cancel-" + label)
+            elif cause == "token_budget":
+                worker.config.token_budget = 0
+            await interrupted.wait()
+            worker.shutdown = True
+            return native_status, {
+                "answer": "preserved native answer", "error": None if native_status == "completed" else "Request/operation aborted",
+            }, {"total_tokens": 23, "complete": True}
+
+        agent = SimpleNamespace(
+            native_id="native", connect=AsyncMock(), run=run,
+            interrupt=AsyncMock(side_effect=interrupted.set), close=AsyncMock(),
+        )
+        try:
+            with patch("agent_bridge.worker.runtime", return_value=agent), patch.object(worker.store, "begin_attempt", assign):
+                await asyncio.wait_for(worker.run(), 2)
+        finally:
+            self.config.token_budget = None
+        task = self.store.get_task(tid)
+        expected = "completed" if native_status == "completed" else "cancelled" if cause == "task_cancel" else "interrupted"
+        self.assertEqual(expected, task["status"])
+        result = task["result"]
+        ended = [e for e in self.store.events(task_id=tid) if e["kind"] == "native_wait_ended"]
+        self.assertEqual(1, len(ended))
+        self.assertEqual(ended[0]["data"], result["termination"])
+        self.assertEqual(cause, result["termination"]["cause"])
+        self.assertEqual("turn", result["termination"]["stage"])
+        self.assertEqual("preserved native answer", result["answer"])
+        self.assertEqual(23, task["attempts"][0]["usage"]["total_tokens"])
+        self.assertEqual(["file.txt"], result["files"]["changed_files"])
+        self.assertEqual("retained native work", (Path(cwd) / "file.txt").read_text())
+        self.assertEqual("input", (source / "file.txt").read_text())
+        agent.interrupt.assert_awaited_once()
+        if native_status == "completed":
+            self.assertIsNone(task["error"])
+            self.assertNotIn("native_error", result)
+        else:
+            self.assertIn(cause, task["error"])
+            self.assertEqual("Request/operation aborted", result["native_error"])
+
+    async def test_known_timeout_classifies_native_failed_and_interrupted_results(self):
+        for status in ("failed", "interrupted"):
+            with self.subTest(status=status):
+                await self.check_known_termination_result(status)
+
+    async def test_native_completed_wins_timeout_race_and_preserves_files_usage_answer(self):
+        await self.check_known_termination_result("completed")
+
+    async def test_known_pause_cancel_and_budget_causes_survive_native_failed_result(self):
+        for cause in ("session_control", "task_cancel", "token_budget"):
+            with self.subTest(cause=cause):
+                await self.check_known_termination_result("failed", cause)
+
+    async def check_native_failure_during_known_timeout(self, error):
+        label = type(error).__name__
+        sid = self.store.open(self.profile, str(self.root), "read-only", "open-" + label)["session_id"]
+        tid = self.store.dispatch(sid, "task", "dispatch-" + label)["task_id"]
+        self.config.task_timeout = .02
+        worker = Worker(self.root, self.config, sid)
+        begin = worker.store.begin_attempt
+        interrupted = asyncio.Event()
+        def assign(*args):
+            worker.store.claim(self.config)
+            return begin(*args)
+        async def run(instruction, on_started, on_event):
+            await on_started("turn")
+            await interrupted.wait()
+            raise error
+        agent = SimpleNamespace(native_id="native", connect=AsyncMock(), run=run,
+                                interrupt=AsyncMock(side_effect=interrupted.set), close=AsyncMock())
+        with patch("agent_bridge.worker.runtime", return_value=agent), patch.object(worker.store, "begin_attempt", assign):
+            await asyncio.wait_for(worker.run(), 1)
+        task = self.store.get_task(tid)
+        self.assertEqual("recovery_needed", task["status"])
+        self.assertEqual("task_timeout", task["result"]["termination"]["cause"])
+        self.assertEqual("Native connection closed before terminal result", task["result"]["native_error"])
+        self.assertIn("execution outcome is unknown", task["error"])
+        self.assertFalse(task["attempts"][0]["usage"]["complete"])
+
+    async def test_native_failure_during_known_timeout_stays_unknown(self):
+        message = "Native connection closed before terminal result"
+        for error in (BridgeError("native_error", message), RuntimeError(message), ValueError(message)):
+            with self.subTest(error=type(error).__name__):
+                await self.check_native_failure_during_known_timeout(error)
+
+    async def check_non_interrupt_native_failure_racing_timeout(self, label, result_payload):
+        sid = self.store.open(self.profile, str(self.root), "read-only", "open-" + label)["session_id"]
+        tid = self.store.dispatch(sid, "task", "dispatch-" + label)["task_id"]
+        self.config.task_timeout = 0.02
+        worker = Worker(self.root, self.config, sid)
+        begin = worker.store.begin_attempt
+        interrupted = asyncio.Event()
+
+        def assign(*args):
+            worker.store.claim(self.config)
+            return begin(*args)
+
+        async def run(instruction, on_started, on_event):
+            await on_started("native-turn")
+            await interrupted.wait()
+            worker.shutdown = True
+            return "failed", dict(result_payload), {"total_tokens": 11, "complete": True}
+
+        agent = SimpleNamespace(
+            native_id="native",
+            connect=AsyncMock(),
+            run=run,
+            interrupt=AsyncMock(side_effect=interrupted.set),
+            close=AsyncMock(),
+        )
+        with patch("agent_bridge.worker.runtime", return_value=agent), patch.object(
+            worker.store, "begin_attempt", assign
+        ):
+            await asyncio.wait_for(worker.run(), 2)
+        task = self.store.get_task(tid)
+        self.assertEqual("failed", task["status"])
+        self.assertEqual(result_payload["error"], task["error"])
+        self.assertEqual("task_timeout", task["result"]["termination"]["cause"])
+        if result_payload.get("provider_limit"):
+            quotas = [q for q in self.store.quotas() if q["quota_group"] == self.profile.quota_group]
+            self.assertEqual(1, len(quotas))
+            self.assertGreater(quotas[0]["blocked_until"], time.time())
+            with self.store.connection(write=True) as db:
+                db.execute("DELETE FROM quota_cooldowns")
+
+    async def test_non_interrupt_native_failure_racing_timeout_keeps_failed_and_cooldown(self):
+        for label, result_payload in (
+            (
+                "provider-limit",
+                {
+                    "error": "Rate limit exceeded (429)",
+                    "provider_limit": {"retry_after_seconds": 120, "reason": "Rate limit exceeded (429)"},
+                },
+            ),
+            (
+                "model-mismatch",
+                {
+                    "error": "Claude reported a different model; configure an exact model rather than an alias",
+                    "requested_model": "claude-opus-4-5",
+                    "reported_model": "claude-sonnet-4-5",
+                },
+            ),
+            (
+                "empty-error-no-answer",
+                {
+                    "answer": "",
+                    "error": None,
+                },
+            ),
+        ):
+            with self.subTest(case=label):
+                await self.check_non_interrupt_native_failure_racing_timeout(label, result_payload)
+
+    async def test_pausing_one_worker_does_not_interrupt_other_sessions(self):
+        self.config.parallel_limit = self.config.quota_limit = 3
+        workers = []
+        checked = [asyncio.Event() for _ in range(3)]
+        paused = asyncio.Event()
+        for index in range(3):
+            sid = self.store.open(self.profile, str(self.root), "read-only", f"open-{index}")["session_id"]
+            worker = Worker(self.root, self.config, sid)
+            self.store.worker_ready(sid, worker.generation, 1, "fixture", f"native-{index}")
+            self.store.dispatch(sid, "task", f"dispatch-{index}")
+            workers.append(worker)
+        for _ in workers:
+            self.store.claim(self.config)
+        for index, worker in enumerate(workers):
+            worker.task = self.store.begin_attempt(worker.session_id, worker.generation)
+            worker.started = time.monotonic()
+            worker.native_accepted.set()
+            worker.agent = SimpleNamespace(interrupt=AsyncMock(side_effect=paused.set if index == 0 else None))
+            original = worker.store.get_session
+
+            def observed(session_id, get=original, seen=checked[index]):
+                session = get(session_id)
+                seen.set()
+                return session
+
+            worker.store.get_session = observed
+        monitors = [asyncio.create_task(worker.watch_control(SimpleNamespace(cancel=lambda: None))) for worker in workers]
+        try:
+            sid = workers[0].session_id
+            self.store.control(sid, "pause", self.store.get_session(sid)["revision"], "pause-only-first")
+            await asyncio.wait_for(asyncio.gather(paused.wait(), *(event.wait() for event in checked)), 1)
+            self.assertEqual([1, 0, 0], [worker.agent.interrupt.await_count for worker in workers])
+            self.assertEqual("session_control", workers[0].termination["cause"])
+            self.assertIsNone(workers[1].termination)
+            self.assertIsNone(workers[2].termination)
+        finally:
+            for monitor in monitors:
+                monitor.cancel()
+            await asyncio.gather(*monitors, return_exceptions=True)
 
     async def test_pi_final_statistics_failure_preserves_confirmed_answer_usage_and_files(self):
         source = self.root / "source"
@@ -306,6 +527,9 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         else:
             self.assertEqual("completed", later["status"])
             self.assertEqual("healthy B", later["result"]["answer"])
+            self.assertNotIn("termination", later["result"])
+            self.assertNotIn("native_error", later["result"])
+            self.assertEqual("task_cancel", self.store.get_task(first)["result"]["termination"]["cause"])
 
     async def test_next_task_waits_for_previous_interrupt_and_has_its_own_deadline(self):
         await self.check_late_interrupt()

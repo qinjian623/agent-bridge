@@ -60,7 +60,7 @@ from .peer_protocol import (
     validate_manifest_path,
     validate_object_ref,
 )
-from .store import Store, encode, identifier, validate_session_name
+from .store import Store, encode, identifier, validate_session_name, validate_task_timeout
 from .workspace import git as workspace_git
 
 # ---------------------------------------------------------------- MCP tool parameter contracts
@@ -213,6 +213,7 @@ class DirectPeerService:
         config: Any = None,
         config_path: Path | None = None,
         model_directory: Any = None,
+        capability_probe: Any = None,
         broker_version: str = __version__,
     ) -> None:
         self._identity = identity_store
@@ -222,6 +223,7 @@ class DirectPeerService:
         self._config_path = config_path
         self._config_digest = None
         self._models = model_directory
+        self._capability_probe = capability_probe
         self._broker_version = broker_version
         self._workspace_locks: dict[str, threading.Lock] = {}
         self._workspace_locks_guard = threading.Lock()
@@ -284,10 +286,13 @@ class DirectPeerService:
             params = request.get("params", {})
             if not isinstance(params, dict):
                 raise peer_error(PeerErrorCode.INVALID_PARAMS, "Peer params must be a JSON object")
+            if spec.name == "peer.deliver" and validate_task_timeout(params.get("task_timeout")) is not None:
+                if not await self._supports_task_timeout():
+                    raise BridgeError("unsupported_task_timeout", "The running Broker does not support per-task timeouts; this request performed no delivery")
             if spec.mutating and self._store is not None:
                 self._ready_identity()
             if spec.name == "peer.hello":
-                result = self._hello(params)
+                result = await self._hello(params)
             elif spec.name == "peer.inspect":
                 result = self._inspect(params)
             elif spec.name == "peer.catalog":
@@ -330,7 +335,16 @@ class DirectPeerService:
 
     # ---------------------------------------------------------------- handlers
 
-    def _hello(self, params: dict[str, Any]) -> HelloResult:
+    async def _supports_task_timeout(self):
+        if self._capability_probe is None:
+            return False
+        try:
+            result = await asyncio.wait_for(self._capability_probe(), 5)
+        except Exception:
+            return False
+        return isinstance(result, dict) and isinstance(result.get("features"), list) and "task_timeout_v1" in result["features"]
+
+    async def _hello(self, params: dict[str, Any]) -> HelloResult:
         versions = params.get("protocol_versions")
         if not isinstance(versions, list) or any(
             isinstance(version, bool) or not isinstance(version, int) for version in versions
@@ -348,12 +362,15 @@ class DirectPeerService:
             node_id=identity.node_id,
             state_generation=identity.state_generation,
         )
+        capabilities = list(IMPLEMENTED_PEER_METHODS) + list(CAPABILITIES)
+        if not await self._supports_task_timeout():
+            capabilities.remove("task_timeout_v1")
         return {
             "protocol_version": protocol_version,
             "node": node.as_dict(),
             "node_state": identity.state.value,
             "max_confirmed_seq": identity.max_confirmed_seq,
-            "capabilities": list(IMPLEMENTED_PEER_METHODS) + list(CAPABILITIES),
+            "capabilities": capabilities,
             "broker_version": self._broker_version,
         }
 
@@ -1461,6 +1478,9 @@ class DirectPeerService:
             reservation = 0
         if type(reservation) is not int or reservation < 0:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "reservation must be a non-negative integer")
+        timeout = validate_task_timeout(params.get("task_timeout"))
+        if timeout is not None and (kind != "bridge" or not message.strip()):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "task_timeout requires a bridge task")
         ordering_mode = params.get("ordering_mode", "legacy")
         if ordering_mode not in {"legacy", "bootstrap", "ordered"}:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "ordering_mode must be legacy, bootstrap or ordered")
@@ -1641,17 +1661,18 @@ class DirectPeerService:
                     if workspace_ref is not None:
                         store.attach_workspace_transfer(workspace_ref["workspace_id"], session_id, db=db)
                 if message.strip():
+                    details = {
+                        "kind": "peer", "operation_id": operation["operation_id"], "delivery_id": delivery_id,
+                    }
+                    if timeout is not None:
+                        details["task_timeout"] = timeout
                     queued = store.enqueue_task(
                         db,
                         session_id,
                         message,
                         [],
                         reservation,
-                        {
-                            "kind": "peer",
-                            "operation_id": operation["operation_id"],
-                            "delivery_id": delivery_id,
-                        },
+                        details,
                     )
                     task_id = queued["task_id"]
             elif kind == "native":
