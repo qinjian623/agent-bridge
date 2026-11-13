@@ -188,7 +188,9 @@ class Worker:
                 interrupted_attempt = attempt
                 self.interrupt_done.clear()
                 try:
-                    await asyncio.wait_for(self.agent.interrupt(), self.config.interrupt_timeout)
+                    # wait_for can swallow concurrent cancellation on Python 3.11.
+                    async with asyncio.timeout(self.config.interrupt_timeout):
+                        await self.agent.interrupt()
                 except Exception as error:
                     self.last_error = "Native wait failed during interrupt: " + (safe_error(error) or type(error).__name__)
                     self.store.record("interrupt_failed", {"error": self.last_error}, self.session_id, task["id"], attempt)
