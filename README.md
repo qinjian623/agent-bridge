@@ -181,6 +181,12 @@ Antigravity 的 MCP 可用 `agy mcp add cli-agent-bridge /absolute/path/cli-agen
 
 下一任务会等待上一任务的原生中断请求返回，中断计时只影响原来的 attempt。中断请求报错或超时时停止该 worker，未执行任务保持排队，等待检查后明确恢复。用户取消或关闭与超时、预算同时发生时优先记录为取消。
 
+`task_timeout` 是一次任务执行的总时限，默认 3600 秒，持续有输出不会延长它。长编译任务可在 `agent_dispatch` 中指定 `requirements={"task_timeout":21600}`，将这一条任务的时限设为 6 小时；省略参数时仍用节点默认值，其他任务不变。值必须是有限正数，单位秒。时限在 attempt 开始时固定，审批等待也使用该时限。本地重试省略参数沿用原任务值，明确传值仅影响下一次执行；不能修改运行中任务的时限。远端 `retry_task_id` 暂不支持，会明确拒绝。
+
+节点和 worker 都必须加载支持 `task_timeout_v1` 的版本。旧节点或仍在运行的旧 worker 会明确拒绝覆盖时限，不会把入队当作参数已经生效；升级不要求中断它们，后续使用支持该功能的新 worker。已知超时、暂停或取消原因保存在结果的 `termination` 中，原生模糊错误保留为 `native_error`；执行结果不明仍需检查后恢复。
+
+Linux 文件名可以包含非 UTF-8 字节。结果中的 `untracked_files` 和 `changed_files` 用安全转义显示；发生转义时，平行的 `untracked_files_raw_hex` / `changed_files_raw_hex` 保存原始路径字节。不要把显示文字直接用作文件路径。Git patch 按原始 bytes 保存；copy 的 JSON 清单保留可逆转义，符号链接目标也不丢字节。采集失败单独记录于 `files.error`，不会盖掉已经确认的原生回答、用量或中断原因。
+
 向已有会话派发任务时，省略 `access` 会沿用会话权限；明确传入不同权限会报错，需要新建会话。派发前检查指令、依赖、重试条件和预算，无效参数不会新建工作目录或会话。
 
 任务 `completed` 仅表示原生程序结束了回答。主 agent 检查文件和测试后调用 `agent_review(decision=accepted)`，依赖任务才可以开始。失败或换程序时使用 `retry_task_id`，旧程序、原生轮次和费用保留在旧 attempt 中。

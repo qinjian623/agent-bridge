@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import unicodedata
@@ -52,6 +53,23 @@ def task_input(instruction, reservation, dependencies=None):
     return list(dict.fromkeys(dependencies or []))
 
 
+def validate_task_timeout(value):
+    if value is None:
+        return None
+    try:
+        valid = type(value) in {int, float} and math.isfinite(value) and value > 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise BridgeError("invalid_task_timeout", "task_timeout must be a finite positive number of seconds")
+    return value
+
+
+def check_task_timeout_support(session, details):
+    if details.get("task_timeout") is not None and session["worker_pid"] is not None and not session["worker_task_timeout"]:
+        raise BridgeError("worker_upgrade_required", "This worker does not support per-task timeouts; keep its current work and use a worker running the updated code")
+
+
 def check_retry(task, instruction):
     if not (task["status"] in {"failed", "interrupted", "cancelled"} or task["validation"] == "rejected"):
         raise BridgeError("invalid_retry", "Retry requires a settled failed/interrupted/cancelled or rejected task")
@@ -88,7 +106,8 @@ CREATE TABLE IF NOT EXISTS sessions (
  id TEXT PRIMARY KEY, profile TEXT NOT NULL, cwd TEXT NOT NULL, access TEXT NOT NULL,
  parent TEXT, native_id TEXT, desired TEXT NOT NULL DEFAULT 'open', observed TEXT NOT NULL DEFAULT 'stopped',
  revision INTEGER NOT NULL DEFAULT 0, worker_pid INTEGER, worker_start TEXT,
- generation TEXT, error TEXT, created REAL NOT NULL
+ generation TEXT, error TEXT, created REAL NOT NULL,
+ worker_task_timeout INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS session_names (
  session_id TEXT PRIMARY KEY, name TEXT NOT NULL, created REAL NOT NULL
@@ -358,6 +377,8 @@ class Store:
                 db.execute("ALTER TABLE sessions ADD COLUMN workspace TEXT NOT NULL DEFAULT '{}'")
             if "process_scope" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
                 db.execute("ALTER TABLE sessions ADD COLUMN process_scope TEXT")
+            if "worker_task_timeout" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
+                db.execute("ALTER TABLE sessions ADD COLUMN worker_task_timeout INTEGER NOT NULL DEFAULT 0")
             if "resume_config_file" not in {row[1] for row in db.execute("PRAGMA table_info(parents)")}:
                 db.execute("ALTER TABLE parents ADD COLUMN resume_config_file TEXT")
             if "first_output" not in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}:
@@ -798,7 +819,10 @@ class Store:
         self, session_id: str, instruction: str, request_id: str, dependencies=None, reservation=0, details=None
     ):
         dependencies = task_input(instruction, reservation, dependencies)
-        details = details or {}
+        details = dict(details or {})
+        timeout = validate_task_timeout(details.get("task_timeout"))
+        if timeout is None:
+            details.pop("task_timeout", None)
         payload = {
             "op": "dispatch",
             "session": session_id,
@@ -820,6 +844,12 @@ class Store:
             return self.remember(db, request_id, fingerprint, result)
 
     def enqueue_task(self, db, session_id, instruction, dependencies, reservation, details):
+        details = dict(details or {})
+        timeout = validate_task_timeout(details.get("task_timeout"))
+        if timeout is None:
+            details.pop("task_timeout", None)
+        else:
+            check_task_timeout_support(self.required(db, "sessions", session_id), details)
         task = identifier()
         db.execute(
             "INSERT INTO tasks(id,session_id,instruction,dependencies,reservation,created,details) VALUES(?,?,?,?,?,?,?)",
@@ -1018,6 +1048,10 @@ class Store:
             return {"code": "dependencies", "tasks": pending}
         if session["observed"] != "idle":
             return {"code": "worker_state", "observed": session["observed"], "error": session["error"]}
+        try:
+            check_task_timeout_support(session, json.loads(task["details"]))
+        except BridgeError as error:
+            return {"code": error.code, "message": str(error)}
         if len(active) >= config.parallel_limit:
             return {"code": "parallel_limit", "limit": config.parallel_limit}
         group = json.loads(session["profile"])["quota_group"]
@@ -1068,10 +1102,13 @@ class Store:
                 return {"task_id": task["id"], "session_id": session["id"], "attempt_id": attempt}
         return None
 
-    def retry(self, task_id, session_id, instruction, request_id, reservation=None):
+    def retry(self, task_id, session_id, instruction, request_id, reservation=None, task_timeout=None):
+        task_timeout = validate_task_timeout(task_timeout)
         payload = {"op": "retry", "task": task_id, "session": session_id, "instruction": instruction}
         if reservation is not None:
             payload["reservation"] = reservation
+        if task_timeout is not None:
+            payload["task_timeout"] = task_timeout
         with self.connection(write=True) as db:
             fingerprint, old = self.previous(db, request_id, payload)
             if old is not None:
@@ -1083,9 +1120,13 @@ class Store:
             check_retry(task, instruction)
             reservation = task["reservation"] if reservation is None else reservation
             task_input(instruction, reservation)
+            details = json.loads(task["details"])
+            if task_timeout is not None:
+                details["task_timeout"] = task_timeout
+            check_task_timeout_support(target, details)
             db.execute(
-                "UPDATE tasks SET session_id=?,reservation=?,status='queued',validation='pending',active_attempt=NULL,cancel_requested=0,result=NULL,error=NULL WHERE id=?",
-                (session_id, reservation, task_id),
+                "UPDATE tasks SET session_id=?,reservation=?,details=?,status='queued',validation='pending',active_attempt=NULL,cancel_requested=0,result=NULL,error=NULL WHERE id=?",
+                (session_id, reservation, encode(details), task_id),
             )
             self.event(db, "retry_requested", {"previous_session_id": task["session_id"]}, session_id, task_id)
             return self.remember(
@@ -1136,12 +1177,12 @@ class Store:
             if session["desired"] != "open" or session["observed"] not in {"stopped", "starting"}:
                 return False
             db.execute(
-                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,process_scope=?,observed='starting' WHERE id=?",
+                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,process_scope=?,worker_task_timeout=0,observed='starting' WHERE id=?",
                 (generation, pid, start, process_scope, session_id),
             )
             return True
 
-    def worker_ready(self, session_id, generation, pid, start, native_id):
+    def worker_ready(self, session_id, generation, pid, start, native_id, *, task_timeout_supported=False):
         with self.connection(write=True) as db:
             session = self.required(db, "sessions", session_id)
             if session["generation"] not in {None, generation}:
@@ -1149,8 +1190,8 @@ class Store:
             if session["native_id"] and session["native_id"] != native_id:
                 raise BridgeError("session_mismatch", "Native session identity changed")
             db.execute(
-                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,native_id=?,observed='idle',error=NULL WHERE id=?",
-                (generation, pid, start, native_id, session_id),
+                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,native_id=?,worker_task_timeout=?,observed='idle',error=NULL WHERE id=?",
+                (generation, pid, start, native_id, int(task_timeout_supported), session_id),
             )
             self.event(db, "worker_ready", {}, session_id)
 
@@ -1280,7 +1321,7 @@ class Store:
             if observed == "recovery_needed" and session["observed"] != "recovery_needed":
                 self.notify_queued_failure(db, session, error or "Worker disappeared during execution")
             db.execute(
-                "UPDATE sessions SET observed=?,worker_pid=NULL,error=?,desired=CASE WHEN desired='draining' THEN 'paused' ELSE desired END WHERE id=?",
+                "UPDATE sessions SET observed=?,worker_pid=NULL,worker_task_timeout=0,error=?,desired=CASE WHEN desired='draining' THEN 'paused' ELSE desired END WHERE id=?",
                 (observed, error, session_id),
             )
             self.event(db, "worker_stopped", {"observed": observed, "error": error}, session_id)

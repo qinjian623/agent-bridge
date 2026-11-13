@@ -34,7 +34,7 @@ from .peer_protocol import (
 )
 from .peer_transport import DefaultPeerClientFactory
 from .routing import choose
-from .store import Store, encode, task_input, validate_session_name
+from .store import Store, encode, task_input, validate_session_name, validate_task_timeout
 from .worker import alive, owned_processes
 from .workspace import (
     MAX_WORKSPACE_FILE_BYTES,
@@ -1821,6 +1821,9 @@ class Broker:
             parameters["open"] = self._remote_open_spec(args)
         if not open_only:
             parameters["message"] = instruction or ""
+            timeout = validate_task_timeout((args.get("requirements") or {}).get("task_timeout"))
+            if timeout is not None:
+                parameters["task_timeout"] = timeout
         fingerprint = hashlib.sha256(encode(parameters).encode("utf-8")).hexdigest()
         existing = self.store.get_operation(operation_id)
         if existing is not None:
@@ -1882,6 +1885,9 @@ class Broker:
             requirements = {}
         if not isinstance(requirements, dict):
             raise BridgeError("invalid_request", "requirements must be an object")
+        validate_task_timeout(requirements.get("task_timeout"))
+        if args.get("retry_task_id") is not None:
+            raise BridgeError("unsupported_remote_retry", "Remote retry_task_id is not supported; inspect the original task before dispatching new work")
         if requirements.get("hard_budget"):
             raise BridgeError("hard_budget_unsupported", "No verified hard cap is available")
         instruction = args.get("instruction")
@@ -1891,6 +1897,11 @@ class Broker:
         task_input(instruction, reservation, args.get("dependencies"))
         if not args.get("session_id") and not args.get("profile"):
             raise BridgeError("invalid_request", "profile is required when a remote dispatch opens a session")
+        if requirements.get("task_timeout") is not None:
+            hello = await self.peer_factory.client(host_id).hello({"protocol_versions": [PROTOCOL_VERSION]})
+            capabilities = hello.get("capabilities") if isinstance(hello, dict) else None
+            if not isinstance(capabilities, list) or "task_timeout_v1" not in capabilities:
+                raise BridgeError("unsupported_task_timeout", "The remote node does not support per-task timeouts; no task was dispatched")
         return await self._remote_deliver(host_id, "agent_dispatch", args, instruction=instruction)
 
     async def _cancel(self, args):
@@ -2107,6 +2118,10 @@ class Broker:
             return await self._call(method, args)
 
     async def _call(self, method, args):
+        if method == "agent_capabilities":
+            if args:
+                raise BridgeError("invalid_request", "agent_capabilities accepts no parameters")
+            return {"features": ["task_timeout_v1"], "version": __version__}
         if method == "agent_monitor":
             from .monitor import MonitorCollector
 
@@ -2278,6 +2293,7 @@ class Broker:
                 requirements = {}
             if not isinstance(requirements, dict):
                 raise BridgeError("invalid_request", "requirements must be an object")
+            timeout = validate_task_timeout(requirements.get("task_timeout"))
             if requirements.get("hard_budget"):
                 raise BridgeError("hard_budget_unsupported", "No verified hard cap is available")
             session_name = validate_session_name(args.get("name"))
@@ -2356,12 +2372,16 @@ class Broker:
             try:
                 if args.get("retry_task_id"):
                     return self.store.retry(
-                        args["retry_task_id"], session_id, args["instruction"], args["request_id"], reservation
+                        args["retry_task_id"], session_id, args["instruction"], args["request_id"], reservation,
+                        task_timeout=timeout,
                     )
+                details = {"kind": requirements.get("kind", "general"), "selection": selection,
+                           "learn_from_result": requirements.get("learn_from_result", True)}
+                if timeout is not None:
+                    details["task_timeout"] = timeout
                 return self.store.dispatch(
                     session_id, args["instruction"], args["request_id"], args.get("dependencies"), reservation,
-                    {"kind": requirements.get("kind", "general"), "selection": selection,
-                     "learn_from_result": requirements.get("learn_from_result", True)},
+                    details,
                 )
             except BridgeError:
                 if opened:
@@ -2494,7 +2514,7 @@ class Broker:
             if set(args) != {"token"}:
                 raise BridgeError("invalid_request", "agent_update_finish requires only token")
             return {"result": update_guard.finish(self.state, args["token"])}
-        readonly = method in {"agent_hosts", "agent_monitor"} or method == "agent_inspect" and not args.get("parent_id")
+        readonly = method in {"agent_hosts", "agent_monitor", "agent_capabilities"} or method == "agent_inspect" and not args.get("parent_id")
         with update_guard.operation(self.state, readonly=readonly):
             return await self._api_call(method, args)
 

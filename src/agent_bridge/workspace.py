@@ -37,6 +37,10 @@ def git(directory, *args):
 def selected_path(root, name):
     if not isinstance(name, str) or not name or "\x00" in name:
         raise BridgeError("invalid_snapshot", "Snapshot paths must be individual relative file names")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        raise BridgeError("invalid_snapshot", "Selected snapshot paths must be valid UTF-8") from None
     path = Path(name)
     if path.is_absolute() or any(part in {"..", ".git"} for part in path.parts) or path.as_posix() != name:
         raise BridgeError("invalid_snapshot", "Snapshot paths must stay inside the project and exclude .git")
@@ -50,7 +54,8 @@ def selected_path(root, name):
 
 def save_manifest(path, value):
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2))
+    # Filesystem surrogate escapes must remain reversible JSON escapes, never invalid UTF-8 bytes.
+    temporary.write_bytes(json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8", "backslashreplace"))
     temporary.chmod(0o600)
     temporary.replace(path)
 
@@ -433,6 +438,10 @@ def create_workspace_manifest(
     return manifest
 
 
+def _display_path(value):
+    return json.dumps(os.fsdecode(value), ensure_ascii=False)[1:-1].encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def capture_patch(directory, destination, workspace=None):
     if workspace and workspace.get("kind") == "copy":
         changes, current = {}, set()
@@ -454,14 +463,16 @@ def capture_patch(directory, destination, workspace=None):
             changes[name] = {"deleted": True}
         destination = destination.with_suffix(".files.json")
         save_manifest(destination, changes)
-        return {"patch": None, "changes": str(destination), "workspace": directory, "changed_files": list(changes)}
+        names = list(changes)
+        result = {"patch": None, "changes": str(destination), "workspace": directory,
+                  "changed_files": [_display_path(name) for name in names]}
+        if result["changed_files"] != names:
+            result["changed_files_raw_hex"] = [os.fsencode(name).hex() for name in names]
+        return result
     patch = git(directory, "diff", "--binary", (workspace or {}).get("snapshot_tree", "HEAD"))
-    status = git(directory, "status", "--porcelain=v1").decode(errors="replace")
-    untracked = [
-        name
-        for name in git(directory, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
-        if name
-    ]
+    raw_status = git(directory, "status", "--porcelain=v1")
+    status = raw_status.decode("utf-8", "backslashreplace")
+    untracked = [name for name in git(directory, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0") if name]
     for name in untracked:
         diff = subprocess.run(
             ["git", "diff", "--no-index", "--binary", "--", "/dev/null", name],
@@ -472,9 +483,14 @@ def capture_patch(directory, destination, workspace=None):
         patch += diff.stdout
     destination.write_bytes(patch)
     destination.chmod(0o600)
-    return {
+    result = {
         "patch": str(destination),
         "status": status,
-        "untracked_files": untracked,
+        "untracked_files": [_display_path(name) for name in untracked],
         "base_snapshot": (workspace or {}).get("snapshot_tree", "HEAD"),
     }
+    if result["untracked_files"] != [os.fsdecode(name) for name in untracked]:
+        result["untracked_files_raw_hex"] = [name.hex() for name in untracked]
+    if status.encode("utf-8") != raw_status:
+        result["status_raw_hex"] = raw_status.hex()
+    return result

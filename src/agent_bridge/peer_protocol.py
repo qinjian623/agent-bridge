@@ -28,6 +28,7 @@ CAPABILITIES = (
     "workspace_v1",
     "session_name_v1",
     "prune_guard_v1",
+    "task_timeout_v1",
 )
 
 
@@ -431,6 +432,7 @@ class DeliverParams(TypedDict):
     target_seq: int
     seq_kind: str  # SeqKind
     message: NotRequired[str]  # omitted for tombstones
+    task_timeout: NotRequired[float]  # per-task total seconds; omitted uses the execution node default
     cwd: NotRequired[str]  # existing native member directory on the execution host
     expected_group_revision: int
     # Composite open+dispatch (ADR-13): present when target.kind == "bridge" and no session exists yet.

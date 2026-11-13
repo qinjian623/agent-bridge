@@ -445,6 +445,10 @@ class DirectPeerClient:
                     self._hello_params = cast(HelloParams, dict(params))
                     return hello
                 verifying = False
+                if name == "deliver" and params.get("task_timeout") is not None:
+                    capabilities = hello.get("capabilities")
+                    if not isinstance(capabilities, list) or "task_timeout_v1" not in capabilities:
+                        raise BridgeError("unsupported_task_timeout", "The remote node does not support per-task timeouts; no task was dispatched")
                 generation = (
                     self._transport.connection_generation if isinstance(self._transport, SshPeerTransport) else None
                 )

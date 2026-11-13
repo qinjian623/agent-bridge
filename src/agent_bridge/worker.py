@@ -12,7 +12,7 @@ from pathlib import Path
 from .config import Config, Profile, safe_error
 from .errors import BridgeError
 from .runtimes import runtime
-from .store import Store, identifier
+from .store import Store, identifier, validate_task_timeout
 from .telegram_guard import register_child
 from .usage import priced_usage
 from .workspace import capture_patch
@@ -100,7 +100,10 @@ class Worker:
         self.agent = None
         self.shutdown = False
         self.stop_reason = None
+        self.termination = None
+        self.termination_attempt = None
         self.started = 0
+        self.task_timeout = config.task_timeout
         self.last_error = None
         self.native_accepted = asyncio.Event()
         self.interrupt_done = asyncio.Event()
@@ -114,7 +117,7 @@ class Worker:
             return denial(data)
         # Large native inputs stay private in SQLite; they are never copied to logs.
         try:
-            expires = time.time() + max(0, self.config.task_timeout - (time.monotonic() - self.started))
+            expires = time.time() + max(0, self.task_timeout - (time.monotonic() - self.started))
             key = self.store.question(self.session_id, self.task["id"], self.task["active_attempt"], data, expires)
         except BridgeError:
             return denial(data)
@@ -157,7 +160,7 @@ class Worker:
             if task and task["cancel_requested"]:
                 reason = "cancelled"
                 cause = "task_cancel"
-            if task and not reason and time.monotonic() - self.started > self.config.task_timeout:
+            if task and not reason and time.monotonic() - self.started > self.task_timeout:
                 reason = "interrupted"
                 cause = "task_timeout"
             if task and not reason and self.config.token_budget is not None:
@@ -167,11 +170,13 @@ class Worker:
                     cause = "token_budget"
             if task and reason and not self.stop_reason:
                 stage = "turn" if self.native_accepted.is_set() else "native_acceptance"
-                self.store.record("native_wait_ended", {
+                self.termination = {
                     "stage": stage, "cause": cause,
                     "elapsed_seconds": time.monotonic() - self.started,
-                    "task_timeout_seconds": self.config.task_timeout,
-                }, self.session_id, task["id"], attempt)
+                    "task_timeout_seconds": self.task_timeout,
+                }
+                self.termination_attempt = attempt
+                self.store.record("native_wait_ended", self.termination, self.session_id, task["id"], attempt)
                 if not self.native_accepted.is_set():
                     self.stop_reason, self.shutdown = reason, True
                     self.last_error = (
@@ -200,6 +205,53 @@ class Worker:
                 self.last_error = "Native interrupt did not confirm a terminal result before timeout"
                 owner.cancel()
                 return
+
+    @staticmethod
+    def _is_interrupt_related_failure(result):
+        if result.get("provider_limit"):
+            return False
+        requested_model = result.get("requested_model")
+        reported_model = result.get("reported_model")
+        if requested_model and reported_model and requested_model != reported_model:
+            return False
+        reason = str(result.get("terminal_reason") or "").lower()
+        if reason in {"aborted_streaming", "aborted_tools"}:
+            return True
+        error = str(result.get("error") or "").strip().lower()
+        if not error:
+            return False
+        return any(token in error for token in ("abort", "interrupt", "cancel"))
+
+    def termination_result(self, status, result):
+        if not self.termination or not self.task or self.termination_attempt != self.task["active_attempt"]:
+            return status, result
+        result = {**result, "termination": dict(self.termination)}
+        # A native terminal success wins a race with the interrupt request.
+        if status == "completed":
+            return status, result
+        if self.termination["stage"] == "native_acceptance" or self.shutdown and self.last_error:
+            status = "recovery_needed"
+        elif status == "failed" and not self._is_interrupt_related_failure(result):
+            return status, result
+        elif self.stop_reason and status in {"failed", "interrupted", "cancelled"}:
+            status = self.stop_reason
+        if result.get("error"):
+            result["native_error"] = result["error"]
+        cause = self.termination["cause"]
+        reason = {
+            "task_timeout": "total task deadline exceeded",
+            "session_control": "session pause/close or worker shutdown requested",
+            "task_cancel": "task cancellation requested",
+            "token_budget": "configured token budget reached",
+        }[cause]
+        result["error"] = (
+            f"Bridge {cause}: {reason}; stage={self.termination['stage']}; "
+            f"elapsed={self.termination['elapsed_seconds']:.3f}s; "
+            f"task_timeout={self.termination['task_timeout_seconds']:g}s"
+        )
+        if status == "recovery_needed":
+            result["error"] += "; execution outcome is unknown"
+        return status, result
 
     async def run(self):
         lock_path = self.state / (self.session_id + ".lock")
@@ -251,7 +303,9 @@ class Worker:
                         f"Native startup timed out during connect after {self.config.task_timeout:g}s; no task was dispatched"
                     ) from error
                 register_child(self.config.telegram_database, profile.runtime, self.agent.native_id)
-                self.store.worker_ready(self.session_id, self.generation, pid, start, self.agent.native_id)
+                self.store.worker_ready(
+                    self.session_id, self.generation, pid, start, self.agent.native_id, task_timeout_supported=True,
+                )
                 monitor = asyncio.create_task(self.watch_control(asyncio.current_task()))
                 while not self.shutdown:
                     # Pi's abort is untargeted; it must settle before another prompt starts.
@@ -264,6 +318,11 @@ class Worker:
                         await asyncio.sleep(0.15)
                         continue
                     self.stop_reason, self.started = None, time.monotonic()
+                    self.termination, self.termination_attempt = None, None
+                    details = self.task["details"]
+                    details = json.loads(details) if isinstance(details, str) else details
+                    override = validate_task_timeout(details.get("task_timeout"))
+                    self.task_timeout = self.config.task_timeout if override is None else override
                     self.native_accepted.clear()
                     instruction = self.task["instruction"]
                     previous = self.store.get_task(self.task["id"])["attempts"]
@@ -274,14 +333,13 @@ class Worker:
                         )
                     try:
                         status, result, usage = await self.agent.run(instruction, self.started_native, self.event)
-                        if self.stop_reason and status == "interrupted":
-                            status = self.stop_reason
+                        status, result = self.termination_result(status, result)
                         if session["access"] == "workspace-write":
                             try:
                                 result["files"] = capture_patch(
                                     session["cwd"], self.state / (self.task["active_attempt"] + ".patch"), session["workspace"],
                                 )
-                            except (BridgeError, OSError, subprocess.TimeoutExpired) as error:
+                            except Exception as error:
                                 result["files"] = {"workspace": session["cwd"], "error": safe_error(error)}
                                 if status == "completed":
                                     status, result["error"] = "failed", "Patch capture failed: " + safe_error(error)
@@ -300,20 +358,32 @@ class Worker:
                         if isinstance(error, TimeoutError):
                             stage = "turn" if self.native_accepted.is_set() else "native_acceptance"
                             self.last_error = f"Native wait timed out during {stage}: " + self.last_error
+                        status, result = self.termination_result(
+                            "recovery_needed",
+                            {"error": self.last_error, "provider_limit": getattr(error, "provider_limit", None)},
+                        )
+                        self.last_error = result["error"]
                         self.store.finish(
                             self.session_id,
                             self.generation,
                             self.task["id"],
                             self.task["active_attempt"],
-                            "recovery_needed",
-                            {"error": self.last_error, "provider_limit": getattr(error, "provider_limit", None)},
+                            status,
+                            result,
                         )
                         break
                     self.task = None
-            except asyncio.CancelledError:
-                self.last_error = self.last_error or "Worker was interrupted before a terminal result was confirmed"
-            except Exception as error:
-                self.last_error = safe_error(error) or type(error).__name__
+            except (asyncio.CancelledError, Exception) as error:
+                if isinstance(error, asyncio.CancelledError):
+                    self.last_error = self.last_error or "Worker was interrupted before a terminal result was confirmed"
+                else:
+                    self.last_error = safe_error(error) or type(error).__name__
+                if self.task and (self.termination or isinstance(error, asyncio.CancelledError)):
+                    status, result = self.termination_result("recovery_needed", {"error": self.last_error})
+                    self.last_error = result["error"]
+                    self.store.finish(
+                        self.session_id, self.generation, self.task["id"], self.task["active_attempt"], status, result,
+                    )
             finally:
                 if monitor:
                     monitor.cancel()

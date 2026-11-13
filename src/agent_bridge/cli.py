@@ -175,6 +175,7 @@ def main():
 
             asyncio.run(Worker(state, Config.load(state / "config.json"), args.session_id).run())
         elif args.command == "relay":
+            from .broker import request
             from .discovery import ModelDirectory
             from .node_identity import FileNodeIdentityStore
             from .peer_api import DirectPeerService
@@ -183,6 +184,10 @@ def main():
 
             config_path = state / "config.json"
             config = Config.load(config_path) if config_path.exists() else None
+
+            async def capability_probe():
+                return await request(state, "agent_capabilities", {})
+
             service = DirectPeerService(
                 FileNodeIdentityStore(state),
                 host_id=socket.gethostname(),
@@ -190,6 +195,7 @@ def main():
                 config=config,
                 config_path=config_path,
                 model_directory=ModelDirectory(state),
+                capability_probe=capability_probe,
             )
             asyncio.run(DirectRelayServer(service, retire=_relay_release_changed(state)).serve(
                 _AsyncStdinReader(sys.stdin.buffer), sys.stdout.buffer,

@@ -1,10 +1,14 @@
 import json
+import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from agent_bridge.errors import BridgeError
+from agent_bridge.store import encode
 from agent_bridge.workspace import capture_patch, directory_copy, git, worktree
 
 
@@ -115,3 +119,96 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual("output\n", (Path(destination) / "tracked.txt").read_text())
         self.assertEqual(b"\x00\xfe\x02", (Path(destination) / "new.bin").read_bytes())
         self.assertEqual("input snapshot\n", (self.source / "tracked.txt").read_text())
+
+    def test_capture_preserves_raw_git_paths_contents_and_symlink_targets(self):
+        git(self.source, "config", "core.quotePath", "false")
+        tracked = (b"tracked-\xff.txt", b"tracked-\\xff.txt")
+        for name in tracked:
+            with open(os.fsencode(self.source) + b"/" + name, "wb") as stream:
+                stream.write(b"original\n")
+        git(self.source, "add", "--", *tracked)
+        git(self.source, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-qm", "raw names")
+        directory, metadata = worktree(self.state, self.source, "raw-capture")
+        destination, _ = worktree(self.state, self.source, "raw-apply")
+        raw_root = os.fsencode(directory)
+        for name in tracked:
+            with open(raw_root + b"/" + name, "wb") as stream:
+                stream.write(b"modified tracked\n")
+        untracked = {
+            b"new-\xff.txt": b"binary\x00\xff\n",
+            b"new-\\xff.txt": b"literal escape\n",
+            b"new-line\n.txt": b"newline path\n",
+            "新文件.txt".encode(): b"unicode name\n",
+        }
+        for name, content in untracked.items():
+            with open(raw_root + b"/" + name, "wb") as stream:
+                stream.write(content)
+        link_name, link_target = b"link-\xff", b"target-\xff\n"
+        os.symlink(link_target, raw_root + b"/" + link_name)
+        raw_status = git(directory, "status", "--porcelain=v1")
+        result = capture_patch(directory, self.state / "raw.patch", metadata)
+        names = [bytes.fromhex(value) for value in result["untracked_files_raw_hex"]]
+        self.assertEqual(set(untracked) | {link_name}, set(names))
+        displays = dict(zip(names, result["untracked_files"], strict=True))
+        self.assertEqual("new-\\udcff.txt", displays[b"new-\xff.txt"])
+        self.assertEqual("new-\\\\xff.txt", displays[b"new-\\xff.txt"])
+        self.assertEqual("new-line\\n.txt", displays[b"new-line\n.txt"])
+        self.assertEqual("新文件.txt", displays["新文件.txt".encode()])
+        self.assertEqual(len(names), len(set(result["untracked_files"])))
+        self.assertEqual(raw_status, bytes.fromhex(result["status_raw_hex"]))
+        # This is the same UTF-8 JSON and SQLite transport used by task results.
+        serialized = encode(result)
+        serialized.encode("utf-8")
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.execute("CREATE TABLE results(value TEXT)")
+            db.execute("INSERT INTO results VALUES(?)", (serialized,))
+            self.assertEqual(result, json.loads(db.execute("SELECT value FROM results").fetchone()[0]))
+        patch = Path(result["patch"]).read_bytes()
+        self.assertIn(b"GIT binary patch", patch)
+        subprocess.run(["git", "-C", destination, "apply", result["patch"]], check=True)
+        for name in tracked:
+            with open(os.fsencode(destination) + b"/" + name, "rb") as stream:
+                self.assertEqual(b"modified tracked\n", stream.read())
+            with open(os.fsencode(self.source) + b"/" + name, "rb") as stream:
+                self.assertEqual(b"original\n", stream.read())
+        for name, content in untracked.items():
+            for root in (raw_root, os.fsencode(destination)):
+                with open(root + b"/" + name, "rb") as stream:
+                    self.assertEqual(content, stream.read())
+        self.assertEqual(link_target, os.readlink(os.fsencode(destination) + b"/" + link_name))
+        self.assertEqual(link_target, os.readlink(raw_root + b"/" + link_name))
+
+    def test_copy_capture_keeps_raw_names_and_symlink_targets_in_valid_json(self):
+        directory, metadata = directory_copy(self.state, self.source, "raw-copy", ["tracked.txt"])
+        raw_root = os.fsencode(directory)
+        files = {b"raw-\xff": b"raw", b"raw-\\xff": b"literal", b"line\nname": b"line"}
+        for name, content in files.items():
+            with open(raw_root + b"/" + name, "wb") as stream:
+                stream.write(content)
+        link_name, link_target = b"link-\xff", b"../target-\xfe\n"
+        os.symlink(link_target, raw_root + b"/" + link_name)
+        (Path(directory) / "新文件.txt").write_text("normal unicode")
+        result = capture_patch(directory, self.state / "raw-copy.patch", metadata)
+        encoded = encode(result).encode("utf-8")
+        self.assertEqual(result, json.loads(encoded))
+        raw_manifest = Path(result["changes"]).read_bytes()
+        self.assertIn(b"\\udcff", raw_manifest)
+        self.assertIn("新文件.txt".encode(), raw_manifest)
+        changes = json.loads(raw_manifest.decode("utf-8"))
+        raw_names = {os.fsencode(name): record for name, record in changes.items()}
+        self.assertEqual(set(files) | {link_name, "新文件.txt".encode()}, set(raw_names))
+        self.assertEqual(link_target, os.fsencode(raw_names[link_name]["symlink"]))
+        names = [bytes.fromhex(value) for value in result["changed_files_raw_hex"]]
+        self.assertEqual(set(raw_names), set(names))
+        self.assertEqual(len(names), len(set(result["changed_files"])))
+        for name, content in files.items():
+            self.assertEqual(raw_root + b"/" + name, os.fsencode(raw_names[name]["path"]))
+            with open(raw_root + b"/" + name, "rb") as stream:
+                self.assertEqual(content, stream.read())
+        self.assertEqual(link_target, os.readlink(raw_root + b"/" + link_name))
+        self.assertEqual("base\n", (self.source / "tracked.txt").read_text())
+
+    def test_non_utf8_selected_snapshot_input_is_rejected_explicitly(self):
+        with self.assertRaises(BridgeError) as caught:
+            directory_copy(self.state, self.source, "bad-selected", [os.fsdecode(b"raw-\xff")])
+        self.assertEqual("invalid_snapshot", caught.exception.code)
