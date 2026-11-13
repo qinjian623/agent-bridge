@@ -307,6 +307,21 @@ Telegram 仍使用原来的话题和发送记录。配置 `telegram_database` �
 
 开发中发现旧 bot 曾把测试子会话当普通会话，自动发出 11 条回复；已补过滤并保留原消息，没有删除。此次冷恢复测试的父、子会话也先登记过滤，确认 bot 扫描后没有新增 outbox 记录。主动创建测试话题和发送真实 Telegram 消息仍等待授权。
 
+## 监控与接入接口
+
+TUI（`agent-bridge monitor`）、Web（`agent-bridge monitor --web`）和 MCP `agent_monitor` 统一覆盖 `pi`、`claude`、`antigravity`（`agy`）、`codex` 四个运行时，分别统计 Bridge 托管会话与本机原生 CLI / worker 进程（例如 `agy-real` 配合 `presence/*.lock`、`codex resume`、独立 `pi` 与 `claude` 终端）。Web 与 Bridge 会话列表优先展示活跃 / 运行中 / 待审批会话，避免被大量历史已停止记录淹没。
+
+- CLI 过滤：`agent-bridge monitor --once --format json --runtime agy --source all --active-only --session-limit 50`（也支持 `--no-native`）。
+- MCP 工具：`agent_monitor` 支持 `runtime`（含 `agy` 别名）、`source`（`all`/`bridge`/`native`）、`status`（`all`/`active`/`running`/`idle`/`waiting`/`stopped`）、`session_limit`、`include_native`、`after_seq`。
+- HTTP / SSE 接口（携带 `Authorization: Bearer <admin.token>` 或 Web 登录 Cookie）：
+  - `GET /api/v1/health`：节点身份、总指标与四运行时汇总；
+  - `GET /api/v1/runtimes`：`pi` / `claude` / `antigravity`（`agy`）/ `codex` 状态与总数；
+  - `GET /api/v1/sessions`：统一返回 Bridge 与原生进程会话（支持 `runtime`、`source`、`status`、`host_id`、`limit`）；
+  - `GET /api/v1/events`：按 `after_seq` 增量拉取事件；
+  - `GET /api/v1/stream`：SSE 实时流（支持 `runtime`、`source`、`status`、`after_seq`、`interval`、`once=1`）；
+  - `GET /api/v1/schema`：接口与字段自描述清单；
+  - `GET /api/snapshot`：保留完整快照格式，支持上述筛选 query 参数。
+
 ## 检查
 
 ```bash

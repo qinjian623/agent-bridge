@@ -25,11 +25,19 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .config import MAX_TOKEN_BYTES, read_admin_token, safe_error, state_directory  # noqa: F401 (re-exported)
 from .errors import BridgeError
 from .monitor import MonitorCollector
+from .native_monitor import (
+    MONITORED_RUNTIMES,
+    collect_native_sessions,
+    display_runtime,
+    normalize_runtime,
+    summarize_runtimes,
+    unified_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +314,60 @@ _HTML_HEAD = """<!DOCTYPE html>
       box-shadow: 0 0 8px var(--green);
     }
     .empty-cell { text-align: center; color: var(--text-muted); }
+
+    /* Runtime summary cards & filters */
+    .runtime-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    @media (max-width: 900px) {
+      .runtime-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    .runtime-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      cursor: pointer;
+      text-align: left;
+      color: var(--text);
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .runtime-card:hover { background: var(--card-hover); border-color: var(--accent); }
+    .runtime-card.selected { border-color: var(--accent); background: rgba(56, 139, 253, 0.10); }
+    .runtime-card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+    .runtime-title { font-weight: 700; font-size: 14px; text-transform: uppercase; color: #fff; }
+    .runtime-live { font-size: 12px; font-weight: 700; color: var(--green); }
+    .runtime-live.zero { color: var(--text-muted); }
+    .runtime-meta { font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; gap: 8px; }
+    .filter-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+    .filter-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .chip-btn {
+      background: var(--card-bg);
+      color: var(--text-muted);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 4px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .chip-btn.active { background: var(--blue-bg); color: var(--accent); border-color: var(--accent); }
+    .badge-worker { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+    .badge-native { background: rgba(188, 140, 255, 0.15); color: var(--purple); }
+    .api-bar {
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 10px 14px;
+      border: 1px dashed var(--card-border);
+      border-radius: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .api-bar code { color: var(--accent); background: rgba(56, 139, 253, 0.08); padding: 1px 6px; border-radius: 4px; }
   </style>
 </head>
 <body>
@@ -323,7 +385,11 @@ _HTML_BODY = """  <header>
       </div>
       <div class="stat-pill">
         <span class="val" id="statActive">0</span>
-        <span class="lbl">Active Agents</span>
+        <span class="lbl">Bridge Active</span>
+      </div>
+      <div class="stat-pill">
+        <span class="val" id="statNative">0</span>
+        <span class="lbl">Native Live</span>
       </div>
       <div class="stat-pill">
         <span class="val" id="statTasks">0</span>
@@ -348,6 +414,21 @@ _HTML_BODY = """  <header>
     <!-- Pending Approvals Alert -->
     <div id="approvalSection" style="display: none;"></div>
 
+    <!-- Multi-Runtime Summary (pi / claude / agy / codex) -->
+    <div class="filter-bar">
+      <div class="filter-chips" id="runtimeFilterBar">
+        <button class="chip-btn active" type="button" data-runtime="all">All Runtimes</button>
+        <button class="chip-btn" type="button" data-runtime="pi">Pi</button>
+        <button class="chip-btn" type="button" data-runtime="claude">Claude</button>
+        <button class="chip-btn" type="button" data-runtime="antigravity">AGY</button>
+        <button class="chip-btn" type="button" data-runtime="codex">Codex</button>
+      </div>
+      <div class="filter-chips">
+        <button class="chip-btn" type="button" id="activeOnlyBtn">Active Only: OFF</button>
+      </div>
+    </div>
+    <div class="runtime-grid" id="runtimeGrid"></div>
+
     <!-- Cluster Topology Card -->
     <div class="card">
       <div class="card-header">
@@ -360,7 +441,7 @@ _HTML_BODY = """  <header>
         </div>
         <p id="topoScope" style="margin: 8px 4px 0; color: var(--text-muted); font-size: 12px;">
           Host links show SSH connection status. Sessions shown: local Bridge workers with live processes.
-          Remote/native sessions and message traffic are not collected.
+          Remote/native sessions and message traffic are not collected. (Live local native pi, claude, agy, codex processes appear in the Native Agents panel below.)
         </p>
       </div>
     </div>
@@ -444,6 +525,31 @@ _HTML_BODY = """  <header>
       </div>
     </div>
 
+    <!-- Native CLI Processes & Workers -->
+    <div class="card">
+      <div class="card-header">
+        <div>Native CLI Processes &amp; Workers (pi · claude · agy · codex)</div>
+        <div style="font-size: 11px; color: var(--text-muted);" id="nativeCount">0 native</div>
+      </div>
+      <div class="card-body" style="max-height: 360px; overflow-y: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Runtime</th>
+              <th>PID</th>
+              <th>Session / Title</th>
+              <th>Model</th>
+              <th>State</th>
+              <th>Kind / CWD</th>
+            </tr>
+          </thead>
+          <tbody id="nativeTable">
+            <tr><td colspan="6" class="empty-cell">No native processes detected</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Events Stream -->
     <div class="card">
       <div class="card-header">
@@ -456,6 +562,18 @@ _HTML_BODY = """  <header>
         </div>
       </div>
     </div>
+
+    <!-- Integration API Reference -->
+    <div class="api-bar">
+      <span>Integration APIs:</span>
+      <code>GET /api/v1/health</code>
+      <code>GET /api/v1/runtimes</code>
+      <code>GET /api/v1/sessions?runtime=all&amp;source=all&amp;status=active</code>
+      <code>GET /api/v1/events?after_seq=0</code>
+      <code>GET /api/v1/stream</code>
+      <code>GET /api/v1/schema</code>
+      <code>GET /api/snapshot?runtime=agy</code>
+    </div>
   </main>
 
 """
@@ -465,7 +583,29 @@ _HTML_SCRIPT = """  <script>
     const SVG_NS = 'http://www.w3.org/2000/svg';
     let currentData = null;
     let csrfToken = null;
+    let selectedRuntime = 'all';
+    let activeOnly = false;
     const approvalRequestIds = new Map();
+
+    function runtimeLabel(runtime) {
+      return runtime === 'antigravity' ? 'agy' : (runtime || '-');
+    }
+
+    function setRuntimeFilter(runtime) {
+      selectedRuntime = runtime || 'all';
+      document.querySelectorAll('#runtimeFilterBar .chip-btn').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.runtime === selectedRuntime);
+      });
+      if (currentData) renderDashboard(currentData);
+    }
+
+    function sessionMatchesFilter(session) {
+      if (selectedRuntime !== 'all' && session.runtime !== selectedRuntime) return false;
+      if (activeOnly && session.observed !== 'running' && !session.waiting_question && session.observed !== 'idle') {
+        return false;
+      }
+      return true;
+    }
 
     function setText(element, value) {
       element.textContent = value === null || value === undefined ? '' : String(value);
@@ -757,23 +897,72 @@ _HTML_SCRIPT = """  <script>
       }
     }
 
+    function renderRuntimes(runtimes) {
+      const grid = document.getElementById('runtimeGrid');
+      if (!grid) return;
+      grid.replaceChildren();
+      const order = ['pi', 'claude', 'antigravity', 'codex'];
+      order.forEach((key) => {
+        const info = (runtimes && runtimes[key]) || {};
+        const card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'runtime-card' + (selectedRuntime === key ? ' selected' : '');
+        card.addEventListener('click', () => {
+          setRuntimeFilter(selectedRuntime === key ? 'all' : key);
+        });
+
+        const top = makeElement('div', 'runtime-card-top');
+        const label = info.display_name || runtimeLabel(key);
+        top.appendChild(makeElement('span', 'runtime-title', label.toUpperCase()));
+        const liveTotal = Number(info.total_live || 0);
+        const liveEl = makeElement(
+          'span',
+          'runtime-live' + (liveTotal === 0 ? ' zero' : ''),
+          liveTotal + ' live'
+        );
+        top.appendChild(liveEl);
+        card.appendChild(top);
+
+        const meta1 = makeElement('div', 'runtime-meta');
+        meta1.appendChild(makeElement('span', '', 'Bridge: ' + (info.bridge_active || 0) + ' active / ' + (info.bridge_total || 0) + ' total'));
+        const waiting = Number(info.bridge_waiting || 0);
+        if (waiting > 0) {
+          const waitEl = makeElement('span', '', waiting + ' waiting');
+          waitEl.style.color = 'var(--yellow)';
+          meta1.appendChild(waitEl);
+        }
+        card.appendChild(meta1);
+
+        const meta2 = makeElement('div', 'runtime-meta');
+        meta2.style.marginTop = '4px';
+        meta2.appendChild(makeElement('span', '', 'Native CLI: ' + (info.native_active || 0)));
+        if (info.native_daemons) {
+          meta2.appendChild(makeElement('span', '', '+' + info.native_daemons + ' daemon'));
+        }
+        card.appendChild(meta2);
+        grid.appendChild(card);
+      });
+    }
+
     function renderSessions(sessions, metrics) {
       const body = document.getElementById('sessionTable');
       body.replaceChildren();
+      const filtered = (sessions || []).filter(sessionMatchesFilter);
       document.getElementById('sessionCount').textContent =
-        sessions.length + ' sessions (' + (metrics.active_sessions || 0) + ' active)';
-      if (!sessions.length) {
-        body.appendChild(emptyRow(6, 'No sessions'));
+        filtered.length + '/' + (sessions ? sessions.length : 0) + ' shown (' + (metrics.active_sessions || 0) + ' active)';
+      if (!filtered.length) {
+        body.appendChild(emptyRow(6, 'No matching bridge sessions'));
         return;
       }
-      sessions.slice(0, 15).forEach((session) => {
+      filtered.slice(0, 60).forEach((session) => {
         const row = document.createElement('tr');
         const nameCell = document.createElement('td');
         const nameLine = makeElement('div', '', session.name || String(session.id || '').substring(0, 10));
         nameLine.style.fontWeight = '600';
         nameLine.style.color = '#fff';
         nameLine.style.fontSize = '13px';
-        const metaLine = makeElement('div', '', (session.profile || '-') + ' • ');
+        const modelSuffix = session.model ? ' • ' + session.model : '';
+        const metaLine = makeElement('div', '', (session.profile || '-') + modelSuffix + ' • ');
         metaLine.style.fontSize = '11px';
         metaLine.style.color = 'var(--text-muted)';
         metaLine.appendChild(makeElement('code', '', String(session.id || '').substring(0, 8)));
@@ -786,7 +975,7 @@ _HTML_SCRIPT = """  <script>
         hostCell.appendChild(hostBadge);
 
         const runtimeCell = document.createElement('td');
-        const runtimeText = makeElement('span', '', session.runtime || '-');
+        const runtimeText = makeElement('span', '', session.display_runtime || runtimeLabel(session.runtime));
         runtimeText.style.fontWeight = '600';
         runtimeText.style.color = 'var(--accent)';
         runtimeCell.appendChild(runtimeText);
@@ -799,7 +988,9 @@ _HTML_SCRIPT = """  <script>
         const statusText = session.waiting_question ? 'WAITING APPROVAL' : (session.observed || 'unknown');
         statusCell.appendChild(makeElement('span', 'badge ' + badgeClass, statusText));
 
-        const goal = session.task ? session.task.instruction : (session.observed === 'running' ? 'Active' : '-');
+        const goal = (session.task && session.task.instruction)
+          ? session.task.instruction
+          : (session.error ? session.error : (session.cwd || (session.observed === 'running' ? 'Active' : '-')));
         const goalCell = makeElement('td', '', goal || '-');
         goalCell.style.maxWidth = '240px';
         goalCell.style.overflow = 'hidden';
@@ -819,6 +1010,65 @@ _HTML_SCRIPT = """  <script>
         row.appendChild(statusCell);
         row.appendChild(goalCell);
         row.appendChild(costCell);
+        body.appendChild(row);
+      });
+    }
+
+    function renderNativeSessions(nativeSessions, metrics) {
+      const body = document.getElementById('nativeTable');
+      if (!body) return;
+      body.replaceChildren();
+      const allNative = nativeSessions || [];
+      const filtered = allNative.filter((proc) => {
+        if (selectedRuntime !== 'all' && proc.runtime !== selectedRuntime) return false;
+        if (activeOnly && proc.observed !== 'running' && proc.observed !== 'active') return false;
+        return true;
+      });
+      document.getElementById('nativeCount').textContent =
+        filtered.length + '/' + allNative.length + ' processes (' + (metrics.native_sessions || 0) + ' active)';
+      if (!filtered.length) {
+        body.appendChild(emptyRow(6, 'No matching native CLI processes'));
+        return;
+      }
+      filtered.slice(0, 60).forEach((proc) => {
+        const row = document.createElement('tr');
+        const rtCell = document.createElement('td');
+        const rtEl = makeElement('span', 'badge badge-native', proc.display_runtime || runtimeLabel(proc.runtime));
+        rtCell.appendChild(rtEl);
+
+        const pidCell = document.createElement('td');
+        pidCell.appendChild(makeElement('code', '', String(proc.pid || '-')));
+
+        const title = proc.name || proc.native_id || proc.comm || '-';
+        const titleCell = makeElement('td', '', title);
+        titleCell.style.maxWidth = '260px';
+        titleCell.style.overflow = 'hidden';
+        titleCell.style.textOverflow = 'ellipsis';
+        titleCell.style.whiteSpace = 'nowrap';
+        titleCell.title = (proc.native_id ? proc.native_id + ' — ' : '') + title;
+
+        const modelCell = makeElement('td', '', proc.model || '-');
+        modelCell.style.color = 'var(--text-muted)';
+
+        const stateCell = document.createElement('td');
+        const badgeClass = (proc.observed === 'running' || proc.observed === 'active') ? 'badge-worker' : 'badge-idle';
+        stateCell.appendChild(makeElement('span', 'badge ' + badgeClass, proc.observed || 'unknown'));
+
+        const kindText = (proc.kind || 'cli') + (proc.cwd ? ' • ' + proc.cwd : '');
+        const kindCell = makeElement('td', '', kindText);
+        kindCell.style.maxWidth = '240px';
+        kindCell.style.overflow = 'hidden';
+        kindCell.style.textOverflow = 'ellipsis';
+        kindCell.style.whiteSpace = 'nowrap';
+        kindCell.style.color = 'var(--text-muted)';
+        kindCell.title = kindText;
+
+        row.appendChild(rtCell);
+        row.appendChild(pidCell);
+        row.appendChild(titleCell);
+        row.appendChild(modelCell);
+        row.appendChild(stateCell);
+        row.appendChild(kindCell);
         body.appendChild(row);
       });
     }
@@ -877,16 +1127,27 @@ _HTML_SCRIPT = """  <script>
       });
     }
 
-    function renderEvents(events) {
+    function renderEvents(events, sessions) {
       const container = document.getElementById('eventLog');
       container.replaceChildren();
-      if (!events.length) {
+      let list = events || [];
+      if (selectedRuntime !== 'all') {
+        const runtimeBySession = new Map();
+        (sessions || []).forEach((item) => {
+          if (item && item.id) runtimeBySession.set(item.id, item.runtime);
+        });
+        list = list.filter((ev) => {
+          const evRt = ev.runtime || runtimeBySession.get(ev.session_id);
+          return !evRt || evRt === selectedRuntime;
+        });
+      }
+      if (!list.length) {
         const placeholder = makeElement('div', '', 'Waiting for events...');
         placeholder.style.color = 'var(--text-muted)';
         container.appendChild(placeholder);
         return;
       }
-      events.slice(0, 15).forEach((event) => {
+      list.slice(0, 25).forEach((event) => {
         const entry = makeElement('div', 'log-entry');
         entry.appendChild(makeElement('span', 'log-time', event.created_rel || '-'));
         entry.appendChild(makeElement('span', 'log-kind', event.kind || '-'));
@@ -1026,16 +1287,20 @@ _HTML_SCRIPT = """  <script>
       document.getElementById('statNodes').textContent =
         (metrics.online_hosts || 1) + '/' + (metrics.total_hosts || 1);
       document.getElementById('statActive').textContent = metrics.active_sessions || 0;
+      const statNative = document.getElementById('statNative');
+      if (statNative) statNative.textContent = metrics.native_sessions || 0;
       document.getElementById('statTasks').textContent = metrics.running_tasks || 0;
       document.getElementById('statBroadcasts').textContent = metrics.total_broadcasts || 0;
       document.getElementById('statCost').textContent =
         '$' + Number(metrics.total_cost_usd || 0).toFixed(4);
 
       renderApprovals(data.pending_questions || []);
+      renderRuntimes(data.runtimes || {});
       renderHosts(data.hosts || [], coordinator);
       renderSessions(data.sessions || [], metrics);
+      renderNativeSessions(data.native_sessions || [], metrics);
       renderBroadcasts(data.broadcasts || []);
-      renderEvents(data.events || []);
+      renderEvents(data.events || [], data.sessions || []);
       renderTopology(data);
     }
 
@@ -1049,6 +1314,18 @@ _HTML_SCRIPT = """  <script>
       window.setInterval(fetchData, 2000);
     }
 
+    document.querySelectorAll('#runtimeFilterBar .chip-btn').forEach((btn) => {
+      btn.addEventListener('click', () => setRuntimeFilter(btn.dataset.runtime || 'all'));
+    });
+    const activeOnlyBtn = document.getElementById('activeOnlyBtn');
+    if (activeOnlyBtn) {
+      activeOnlyBtn.addEventListener('click', () => {
+        activeOnly = !activeOnly;
+        activeOnlyBtn.classList.toggle('active', activeOnly);
+        setText(activeOnlyBtn, 'Active Only: ' + (activeOnly ? 'ON' : 'OFF'));
+        if (currentData) renderDashboard(currentData);
+      });
+    }
     document.getElementById('refreshBtn').addEventListener('click', fetchData);
     document.getElementById('logoutBtn').addEventListener('click', async () => {
       try {
@@ -1485,7 +1762,35 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                     raise _HTTPError(401, "Unauthorized")
                 if self.collector is None:
                     raise _HTTPError(500, "Collector not configured")
-                self._send_json(200, self.collector.collect(limit=25))
+                params = self._query_params()
+                if not params:
+                    self._send_json(200, self._upgrade_snapshot(self.collector.collect(limit=25), {}))
+                else:
+                    self._send_json(200, self._collect_filtered_snapshot(params, default_limit=25))
+            elif path == "/api/v1/health":
+                if identity is None:
+                    raise _HTTPError(401, "Unauthorized")
+                self._handle_api_v1_health()
+            elif path == "/api/v1/runtimes":
+                if identity is None:
+                    raise _HTTPError(401, "Unauthorized")
+                self._handle_api_v1_runtimes()
+            elif path == "/api/v1/sessions":
+                if identity is None:
+                    raise _HTTPError(401, "Unauthorized")
+                self._handle_api_v1_sessions()
+            elif path == "/api/v1/events":
+                if identity is None:
+                    raise _HTTPError(401, "Unauthorized")
+                self._handle_api_v1_events()
+            elif path == "/api/v1/stream":
+                if identity is None:
+                    raise _HTTPError(401, "Unauthorized")
+                self._handle_api_v1_stream()
+            elif path == "/api/v1/schema":
+                if identity is None:
+                    raise _HTTPError(401, "Unauthorized")
+                self._handle_api_v1_schema()
             else:
                 raise _HTTPError(404, "Not Found")
         except _HTTPError as error:
@@ -1514,12 +1819,406 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                 if token is None:
                     raise _HTTPError(401, "Unauthorized")
                 self._handle_host_ping(token)
-            elif path in ("/", "/index.html", "/auth/session", "/api/snapshot"):
+            elif path in (
+                "/",
+                "/index.html",
+                "/auth/session",
+                "/api/snapshot",
+                "/api/v1/health",
+                "/api/v1/runtimes",
+                "/api/v1/sessions",
+                "/api/v1/events",
+                "/api/v1/stream",
+                "/api/v1/schema",
+            ):
                 raise _HTTPError(405, "Method Not Allowed")
             else:
                 raise _HTTPError(404, "Not Found")
         except _HTTPError as error:
             self._send_json(error.status, {"ok": False, "error": str(error)})
+
+    # ------------------------------------------------------------------ external v1 API
+
+    def _query_params(self) -> dict[str, list[str]]:
+        return parse_qs(urlsplit(self.path).query, keep_blank_values=False)
+
+    @staticmethod
+    def _first_param(params: dict[str, list[str]], name: str) -> str | None:
+        values = params.get(name)
+        if not values:
+            return None
+        value = str(values[-1]).strip()
+        return value or None
+
+    @classmethod
+    def _parse_bool_param(cls, params: dict[str, list[str]], name: str, default: bool) -> bool:
+        raw = cls._first_param(params, name)
+        if raw is None:
+            return default
+        lower = raw.lower()
+        if lower in {"1", "true", "yes", "on"}:
+            return True
+        if lower in {"0", "false", "no", "off"}:
+            return False
+        raise _HTTPError(400, f"Invalid boolean parameter {name!r}")
+
+    @classmethod
+    def _parse_int_param(
+        cls,
+        params: dict[str, list[str]],
+        name: str,
+        default: int,
+        *,
+        minimum: int = 0,
+        maximum: int = 1000,
+    ) -> int:
+        raw = cls._first_param(params, name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            raise _HTTPError(400, f"Invalid integer parameter {name!r}") from None
+        if value < minimum or value > maximum:
+            raise _HTTPError(400, f"Parameter {name!r} must be between {minimum} and {maximum}")
+        return value
+
+    def _require_collector(self) -> MonitorCollector:
+        if self.collector is None:
+            raise _HTTPError(500, "Collector not configured")
+        return self.collector
+
+    def _upgrade_snapshot(self, snapshot: dict[str, Any], params: dict[str, list[str]]) -> dict[str, Any]:
+        """Backfill multi-runtime & native discovery if an older broker daemon replied."""
+        if not isinstance(snapshot, dict) or "sessions" not in snapshot:
+            return snapshot
+        if "runtimes" in snapshot and "native_sessions" in snapshot:
+            return snapshot
+
+        collector = self.collector
+        proc_root = getattr(collector, "proc_root", None) if collector is not None else None
+        native_home = getattr(collector, "native_home", None) if collector is not None else None
+        include_native = self._parse_bool_param(params, "include_native", True)
+
+        sessions = list(snapshot.get("sessions") or [])
+        live_pids: set[int] = set()
+        live_native_ids: set[tuple[str, str]] = set()
+        for sess in sessions:
+            rt = normalize_runtime(sess.get("runtime")) or sess.get("runtime") or ""
+            sess["runtime"] = rt
+            sess.setdefault("display_runtime", display_runtime(rt))
+            sess.setdefault("source", "bridge")
+            sess.setdefault("managed", True)
+            wpid = sess.get("worker_pid")
+            obs = sess.get("observed")
+            is_live = obs in ("running", "idle", "waiting_input", "starting") or bool(sess.get("alive"))
+            if sess.get("alive") and isinstance(wpid, int) and wpid > 0:
+                live_pids.add(wpid)
+            nid = sess.get("native_id")
+            if is_live and nid and rt:
+                live_native_ids.add((rt, str(nid)))
+
+        native_sessions: list[dict[str, Any]] = []
+        if include_native and "native_sessions" not in snapshot:
+            native_sessions = collect_native_sessions(
+                proc_root=proc_root,
+                home=native_home,
+                exclude_pids=live_pids,
+                exclude_native_ids=live_native_ids,
+            )
+        elif "native_sessions" in snapshot:
+            native_sessions = list(snapshot.get("native_sessions") or [])
+
+        metrics = dict(snapshot.get("metrics") or {})
+        runtimes = summarize_runtimes(sessions, native_sessions)
+        metrics.setdefault("native_sessions", sum(1 for n in native_sessions if n.get("kind") != "daemon"))
+        metrics.setdefault("native_workers", sum(1 for n in native_sessions if n.get("kind") == "worker"))
+        metrics.setdefault("native_daemons", sum(1 for n in native_sessions if n.get("kind") == "daemon"))
+        metrics.setdefault(
+            "total_all_active",
+            int(metrics.get("active_sessions") or 0) + int(metrics.get("native_sessions") or 0),
+        )
+
+        upgraded = dict(snapshot)
+        upgraded["sessions"] = sessions
+        upgraded["native_sessions"] = native_sessions
+        upgraded["runtimes"] = runtimes
+        upgraded["metrics"] = metrics
+        return upgraded
+
+    def _collect_filtered_snapshot(
+        self,
+        params: dict[str, list[str]],
+        *,
+        default_limit: int = 25,
+        default_events: bool = True,
+    ) -> dict[str, Any]:
+        collector = self._require_collector()
+        limit = self._parse_int_param(params, "limit", default_limit, minimum=1, maximum=500)
+        session_limit_raw = self._first_param(params, "session_limit")
+        include_events = self._parse_bool_param(params, "include_events", default_events)
+        include_native = self._parse_bool_param(params, "include_native", True)
+        runtime_raw = self._first_param(params, "runtime")
+        runtime = normalize_runtime(runtime_raw)
+        if runtime_raw and runtime is None and runtime_raw.lower() != "all":
+            raise _HTTPError(400, f"Unsupported runtime {runtime_raw!r}")
+        source = self._first_param(params, "source")
+        if source is not None:
+            source = source.lower()
+            if source not in {"all", "bridge", "native"}:
+                raise _HTTPError(400, f"Unsupported source {source!r}")
+        status = self._first_param(params, "status")
+        if status is not None:
+            status = status.lower()
+            if status not in {"all", "active", "running", "idle", "waiting", "stopped"}:
+                raise _HTTPError(400, f"Unsupported status {status!r}")
+        after_seq = None
+        if self._first_param(params, "after_seq") is not None:
+            after_seq = self._parse_int_param(params, "after_seq", 0, minimum=0, maximum=10**12)
+
+        kwargs: dict[str, Any] = {
+            "limit": limit,
+            "include_events": include_events,
+        }
+        if runtime is not None:
+            kwargs["runtime"] = runtime
+        if source is not None and source != "all":
+            kwargs["source"] = source
+        if status is not None and status != "all":
+            kwargs["status"] = status
+        if session_limit_raw is not None:
+            kwargs["session_limit"] = self._parse_int_param(params, "session_limit", limit, minimum=1, maximum=1000)
+        if not include_native:
+            kwargs["include_native"] = False
+        if after_seq is not None:
+            kwargs["after_seq"] = after_seq
+        return self._upgrade_snapshot(collector.collect(**kwargs), params)
+
+    def _handle_api_v1_health(self) -> None:
+        params = self._query_params()
+        include_native = self._parse_bool_param(params, "include_native", True)
+        collector = self._require_collector()
+        snapshot = self._upgrade_snapshot(
+            collector.collect(limit=1, include_events=False, include_native=include_native),
+            params,
+        )
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "version": "1.0",
+                "timestamp": snapshot.get("timestamp"),
+                "coordinator": snapshot.get("coordinator", {}),
+                "metrics": snapshot.get("metrics", {}),
+                "runtimes": snapshot.get("runtimes", {}),
+            },
+        )
+
+    def _handle_api_v1_runtimes(self) -> None:
+        params = self._query_params()
+        include_native = self._parse_bool_param(params, "include_native", True)
+        collector = self._require_collector()
+        snapshot = self._upgrade_snapshot(
+            collector.collect(limit=1, include_events=False, include_native=include_native),
+            params,
+        )
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "timestamp": snapshot.get("timestamp"),
+                "monitored_runtimes": list(MONITORED_RUNTIMES),
+                "aliases": {"agy": "antigravity"},
+                "runtimes": snapshot.get("runtimes", {}),
+                "metrics": snapshot.get("metrics", {}),
+            },
+        )
+
+    def _handle_api_v1_sessions(self) -> None:
+        params = self._query_params()
+        snapshot = self._collect_filtered_snapshot(params, default_limit=200, default_events=False)
+        runtime_raw = self._first_param(params, "runtime")
+        runtime = normalize_runtime(runtime_raw)
+        source = (self._first_param(params, "source") or "all").lower()
+        status = (self._first_param(params, "status") or "all").lower()
+        host_id = self._first_param(params, "host_id")
+        limit = self._parse_int_param(params, "limit", 200, minimum=1, maximum=1000)
+        rows = unified_sessions(
+            snapshot,
+            runtime=runtime,
+            source=source,
+            status=status,
+            host_id=host_id,
+            limit=limit,
+        )
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "timestamp": snapshot.get("timestamp"),
+                "filters": {
+                    "runtime": runtime or "all",
+                    "source": source,
+                    "status": status,
+                    "host_id": host_id,
+                    "limit": limit,
+                },
+                "count": len(rows),
+                "runtimes": snapshot.get("runtimes", {}),
+                "metrics": snapshot.get("metrics", {}),
+                "sessions": rows,
+            },
+        )
+
+    def _handle_api_v1_events(self) -> None:
+        params = self._query_params()
+        limit = self._parse_int_param(params, "limit", 50, minimum=1, maximum=500)
+        after_seq = None
+        if self._first_param(params, "after_seq") is not None:
+            after_seq = self._parse_int_param(params, "after_seq", 0, minimum=0, maximum=10**12)
+        runtime_raw = self._first_param(params, "runtime")
+        runtime = normalize_runtime(runtime_raw)
+        if runtime_raw and runtime is None and runtime_raw.lower() != "all":
+            raise _HTTPError(400, f"Unsupported runtime {runtime_raw!r}")
+        collector = self._require_collector()
+        collect_kwargs: dict[str, Any] = {"limit": limit, "include_events": True, "include_native": False}
+        if runtime is not None:
+            collect_kwargs["runtime"] = runtime
+        if after_seq is not None:
+            collect_kwargs["after_seq"] = after_seq
+        snapshot = collector.collect(**collect_kwargs)
+        events = list(snapshot.get("events") or [])
+        next_seq = max((int(ev.get("seq", 0)) for ev in events), default=after_seq or 0)
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "timestamp": snapshot.get("timestamp"),
+                "after_seq": after_seq,
+                "next_seq": next_seq,
+                "count": len(events),
+                "events": events,
+            },
+        )
+
+    def _handle_api_v1_schema(self) -> None:
+        self._send_json(
+            200,
+            {
+                "ok": True,
+                "version": "1.0",
+                "auth": {
+                    "schemes": ["Authorization: Bearer <admin.token>", "Cookie: cab_monitor_session=<id>"],
+                    "csrf_required_for": ["POST /api/respond", "POST /api/host/ping", "POST /auth/logout"],
+                },
+                "runtimes": [
+                    {"id": rt, "display": display_runtime(rt)}
+                    for rt in MONITORED_RUNTIMES
+                ],
+                "aliases": {"agy": "antigravity"},
+                "endpoints": {
+                    "GET /api/snapshot": {
+                        "description": "Full monitor snapshot (backward-compatible) with optional runtime/source/status/session_limit/include_native/after_seq query filters.",
+                    },
+                    "GET /api/v1/health": {
+                        "description": "Lightweight health, coordinator identity, metrics, and per-runtime counters.",
+                    },
+                    "GET /api/v1/runtimes": {
+                        "description": "Per-runtime inventory across pi, claude, antigravity (agy), and codex.",
+                    },
+                    "GET /api/v1/sessions": {
+                        "description": "Unified Bridge + native worker/session feed.",
+                        "query": ["runtime=all|pi|claude|antigravity|agy|codex", "source=all|bridge|native", "status=all|active|running|idle|waiting|stopped", "host_id", "limit"],
+                    },
+                    "GET /api/v1/events": {
+                        "description": "Incremental Bridge event feed ordered by seq.",
+                        "query": ["after_seq", "runtime", "limit"],
+                    },
+                    "GET /api/v1/stream": {
+                        "description": "Server-Sent Events (SSE) stream emitting snapshot and event frames.",
+                        "query": ["after_seq", "runtime", "source", "status", "interval", "once=1", "max_events"],
+                    },
+                    "GET /api/v1/schema": {
+                        "description": "Machine-readable schema describing monitor API endpoints and supported runtimes.",
+                    },
+                },
+            },
+        )
+
+    def _handle_api_v1_stream(self) -> None:
+        params = self._query_params()
+        self._require_collector()
+        once = self._parse_bool_param(params, "once", False)
+        max_events = self._parse_int_param(params, "max_events", 0, minimum=0, maximum=10000)
+        interval_raw = self._first_param(params, "interval")
+        interval = 1.0
+        if interval_raw is not None:
+            try:
+                interval = float(interval_raw)
+            except ValueError:
+                raise _HTTPError(400, "Invalid interval parameter") from None
+            interval = max(0.2, min(10.0, interval))
+        runtime_raw = self._first_param(params, "runtime")
+        runtime = normalize_runtime(runtime_raw)
+        if runtime_raw and runtime is None and runtime_raw.lower() != "all":
+            raise _HTTPError(400, f"Unsupported runtime {runtime_raw!r}")
+        after_seq = None
+        if self._first_param(params, "after_seq") is not None:
+            after_seq = self._parse_int_param(params, "after_seq", 0, minimum=0, maximum=10**12)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def write_sse(event_name: str, payload: dict[str, Any], event_id: str | int | None = None) -> None:
+            lines: list[str] = []
+            if event_id is not None:
+                lines.append(f"id: {event_id}")
+            lines.append(f"event: {event_name}")
+            lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
+            lines.append("")
+            self.wfile.write(("\n".join(lines) + "\n").encode("utf-8"))
+            self.wfile.flush()
+
+        emitted = 0
+        last_digest: str | None = None
+        last_seq = after_seq or 0
+        try:
+            while True:
+                snap = self._collect_filtered_snapshot(params, default_limit=50, default_events=True)
+                digest_basis = {
+                    "metrics": snap.get("metrics"),
+                    "runtimes": snap.get("runtimes"),
+                    "sessions": snap.get("sessions"),
+                    "native_sessions": snap.get("native_sessions"),
+                    "pending_questions": snap.get("pending_questions"),
+                }
+                digest = hashlib.sha256(
+                    json.dumps(digest_basis, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+                if digest != last_digest:
+                    write_sse("snapshot", snap, event_id=last_seq)
+                    last_digest = digest
+                    emitted += 1
+                    if max_events and emitted >= max_events:
+                        break
+                events = [ev for ev in (snap.get("events") or []) if int(ev.get("seq", 0)) > last_seq]
+                events.sort(key=lambda item: int(item.get("seq", 0)))
+                for ev in events:
+                    seq = int(ev.get("seq", 0))
+                    if runtime and ev.get("runtime") and ev.get("runtime") != runtime:
+                        continue
+                    write_sse("event", ev, event_id=seq)
+                    last_seq = max(last_seq, seq)
+                    emitted += 1
+                    if max_events and emitted >= max_events:
+                        break
+                if once or (max_events and emitted >= max_events):
+                    break
+                time.sleep(interval)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def _handle_login(self, token: str) -> None:
         origin = self.headers.get("Origin")

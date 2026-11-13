@@ -2113,7 +2113,16 @@ class Broker:
             collector = MonitorCollector(self.state, host_registry=self.host_registry)
             limit = args.get("limit", 15)
             include_events = args.get("include_events", True)
-            return collector.collect(limit=limit, include_events=include_events)
+            return collector.collect(
+                limit=limit,
+                include_events=include_events,
+                runtime=args.get("runtime"),
+                source=args.get("source"),
+                status=args.get("status"),
+                session_limit=args.get("session_limit"),
+                include_native=args.get("include_native", True),
+                after_seq=args.get("after_seq"),
+            )
         if method == "agent_hosts":
             host_id = args.get("host_id")
             if host_id is not None and not isinstance(host_id, str):
