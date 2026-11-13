@@ -89,6 +89,21 @@ def build_parser():
     monitor.add_argument("--interval", type=float, default=2.0, help="Terminal refresh interval in seconds (default: 2.0)")
     monitor.add_argument("--once", action="store_true", help="Print a single terminal dashboard snapshot and exit")
     monitor.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --once (default: text)")
+    monitor.add_argument(
+        "--runtime",
+        choices=["all", "pi", "claude", "agy", "antigravity", "codex"],
+        default="all",
+        help="Filter sessions and events to a specific runtime",
+    )
+    monitor.add_argument(
+        "--source",
+        choices=["all", "bridge", "native"],
+        default="all",
+        help="Filter sessions by source (bridge, native, or all)",
+    )
+    monitor.add_argument("--active-only", action="store_true", help="Show only active/running/waiting sessions")
+    monitor.add_argument("--session-limit", type=int, default=None, help="Maximum sessions per source to return")
+    monitor.add_argument("--no-native", action="store_true", help="Skip native local CLI process discovery")
     group = commands.add_parser("group", help="Inspect and prune explicit groups")
     group_commands = group.add_subparsers(dest="group_command", required=True)
     group_prune = group_commands.add_parser(
@@ -218,7 +233,17 @@ def main():
             else:
                 from .monitor import run_tui_monitor
 
-                run_tui_monitor(state, interval=args.interval, once=args.once, output_format=args.format)
+                run_tui_monitor(
+                    state,
+                    interval=args.interval,
+                    once=args.once,
+                    output_format=args.format,
+                    runtime=args.runtime,
+                    source=args.source,
+                    active_only=args.active_only,
+                    session_limit=args.session_limit,
+                    include_native=not args.no_native,
+                )
         elif args.command == "name":
             from .monitor import set_session_name
 

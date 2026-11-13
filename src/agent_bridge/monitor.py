@@ -9,13 +9,20 @@ import shutil
 import socket
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .config import state_directory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
+from .native_monitor import (
+    MONITORED_RUNTIMES,
+    collect_native_sessions,
+    display_runtime,
+    normalize_runtime,
+    summarize_runtimes,
+)
 from .node_identity import FileNodeIdentityStore
 from .store import Store
 
@@ -68,6 +75,8 @@ class MonitorSnapshot:
     peer_queues: dict[str, Any]
     events: list[dict[str, Any]]
     metrics: dict[str, Any]
+    native_sessions: list[dict[str, Any]] = field(default_factory=list)
+    runtimes: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -119,12 +128,21 @@ def derive_session_name(
 
 
 class MonitorCollector:
-    """Collects multi-agent status, communications, and cluster health directly from local store."""
+    """Collects multi-agent status, communications, and cluster health across all runtimes."""
 
-    def __init__(self, state: Path | str | None = None, *, host_registry=None) -> None:
+    def __init__(
+        self,
+        state: Path | str | None = None,
+        *,
+        host_registry=None,
+        proc_root: Path | str | None = None,
+        native_home: Path | str | None = None,
+    ) -> None:
         self.state = state_directory(state)
         self.db_path = self.state / "bridge.sqlite"
         self.host_registry = host_registry
+        self.proc_root = Path(proc_root) if proc_root is not None else None
+        self.native_home = Path(native_home) if native_home is not None else None
 
     def _open_db(self) -> sqlite3.Connection | None:
         if not self.db_path.exists():
@@ -145,17 +163,41 @@ class MonitorCollector:
         cur = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
         return cur.fetchone() is not None
 
-    def collect(self, limit: int = 15, include_events: bool = True) -> dict[str, Any]:
+    def collect(
+        self,
+        limit: int = 15,
+        include_events: bool = True,
+        *,
+        runtime: str | None = None,
+        source: str | None = None,
+        status: str | None = None,
+        session_limit: int | None = None,
+        include_native: bool = True,
+        after_seq: int | None = None,
+    ) -> dict[str, Any]:
+        filter_runtime_arg = runtime
         if self.host_registry is None and (self.state / "broker.sock").exists():
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
                 from .broker import request
 
+                rpc_args: dict[str, Any] = {"limit": limit, "include_events": include_events}
+                if runtime is not None:
+                    rpc_args["runtime"] = runtime
+                if source is not None:
+                    rpc_args["source"] = source
+                if status is not None:
+                    rpc_args["status"] = status
+                if session_limit is not None:
+                    rpc_args["session_limit"] = session_limit
+                if not include_native:
+                    rpc_args["include_native"] = False
+                if after_seq is not None:
+                    rpc_args["after_seq"] = after_seq
+
                 async def live_snapshot():
-                    return await asyncio.wait_for(request(self.state, "agent_monitor", {
-                        "limit": limit, "include_events": include_events,
-                    }), 2)
+                    return await asyncio.wait_for(request(self.state, "agent_monitor", rpc_args), 2)
 
                 try:
                     return asyncio.run(live_snapshot())
@@ -222,6 +264,10 @@ class MonitorCollector:
         broadcasts: list[dict[str, Any]] = []
         peer_queues: dict[str, Any] = {"inbox": {}, "outbox": {}, "member_outbox": {}, "operations": {}}
         events: list[dict[str, Any]] = []
+        native_group_labels: dict[tuple[str, str], str] = {}
+        session_runtime_map: dict[str, str] = {}
+        live_worker_pids: set[int] = set()
+        live_bridge_native_ids: set[tuple[str, str]] = set()
         metrics: dict[str, Any] = {
             "total_hosts": len(hosts) + 1,
             "online_hosts": sum(1 for h in hosts if h.get("state") == "online") + 1,
@@ -231,6 +277,11 @@ class MonitorCollector:
             "waiting_questions": 0,
             "total_broadcasts": 0,
             "total_cost_usd": 0.0,
+            "native_sessions": 0,
+            "native_workers": 0,
+            "native_daemons": 0,
+            "total_all_active": 0,
+            "schema_version": "1",
         }
 
         if db is not None:
@@ -272,11 +323,14 @@ class MonitorCollector:
                     custom_names = {r[0]: r[1] for r in c_cur.fetchall()}
 
                 group_labels: dict[str, str] = {}
+                native_group_labels: dict[tuple[str, str], str] = {}
                 if self._has_table(db, "native_group_members"):
-                    g_cur = db.execute("SELECT native_id, label FROM native_group_members")
+                    g_cur = db.execute("SELECT runtime, native_id, label FROM native_group_members")
                     for r in g_cur.fetchall():
-                        if r[0] and r[1]:
-                            group_labels[r[0]] = r[1]
+                        if r[1] and r[2]:
+                            group_labels[r[1]] = r[2]
+                            rt_norm = normalize_runtime(r[0]) or str(r[0] or "")
+                            native_group_labels[(rt_norm, r[1])] = r[2]
 
                 session_hosts: dict[str, str] = {}
                 if self._has_table(db, "peer_outbox"):
@@ -291,6 +345,9 @@ class MonitorCollector:
                         session_hosts[r["target_id"]] = r["host_id"]
 
                 session_names_map: dict[str, str] = {}
+                session_runtime_map: dict[str, str] = {}
+                live_worker_pids: set[int] = set()
+                live_bridge_native_ids: set[tuple[str, str]] = set()
 
                 if self._has_table(db, "sessions"):
                     cur = db.execute(
@@ -305,18 +362,19 @@ class MonitorCollector:
                         alive = _is_pid_alive(worker_pid)
                         profile_raw = row["profile"]
                         profile_name = profile_raw
-                        runtime = ""
+                        session_rt = ""
                         model_name = ""
                         if profile_raw and profile_raw.startswith("{"):
                             try:
                                 p_data = json.loads(profile_raw)
                                 profile_name = p_data.get("name", profile_name)
                                 model_name = p_data.get("model", "")
-                                runtime = p_data.get("runtime", "")
+                                session_rt = p_data.get("runtime", "")
                             except Exception:
                                 pass
-                        if not runtime:
-                            runtime = profile_name.split("-")[0] if "-" in profile_name else profile_name
+                        session_rt = normalize_runtime(session_rt) or normalize_runtime(profile_name) or (
+                            profile_name.split("-")[0] if "-" in profile_name else profile_name
+                        )
 
                         # Join latest task
                         task_info = None
@@ -368,12 +426,18 @@ class MonitorCollector:
                         if sid in question_sessions:
                             observed = "waiting_input"
 
+                        is_live = observed in ("running", "idle", "waiting_input", "starting") or alive
                         if observed in ("running", "idle", "waiting_input") or alive:
                             metrics["active_sessions"] += 1
                         if task_info and task_info["status"] == "running":
                             metrics["running_tasks"] += 1
 
                         native_id = row["native_id"]
+                        if alive and isinstance(worker_pid, int) and worker_pid > 0:
+                            live_worker_pids.add(worker_pid)
+                        if is_live and native_id and session_rt:
+                            live_bridge_native_ids.add((session_rt, native_id))
+
                         inst = task_info["instruction"] if task_info else ""
                         s_name = derive_session_name(
                             sid=sid,
@@ -383,15 +447,22 @@ class MonitorCollector:
                             group_label=group_labels.get(native_id) if native_id else None,
                         )
                         session_names_map[sid] = s_name
+                        session_runtime_map[sid] = session_rt
 
                         sessions.append(
                             {
                                 "id": sid,
+                                "source": "bridge",
+                                "managed": True,
                                 "name": s_name,
                                 "host_id": session_hosts.get(sid, "local"),
                                 "profile": profile_name,
                                 "model": model_name,
-                                "runtime": runtime,
+                                "runtime": session_rt,
+                                "display_runtime": display_runtime(session_rt),
+                                "cwd": row["cwd"],
+                                "native_id": native_id,
+                                "error": row["error"],
                                 "desired": row["desired"],
                                 "observed": observed,
                                 "worker_pid": worker_pid,
@@ -404,6 +475,22 @@ class MonitorCollector:
                                 "waiting_question": sid in question_sessions,
                             }
                         )
+
+                    def _session_priority(item: dict[str, Any]) -> tuple[int, float]:
+                        obs_val = item.get("observed")
+                        if item.get("waiting_question") or obs_val == "waiting_input":
+                            tier = 0
+                        elif obs_val == "running":
+                            tier = 1
+                        elif obs_val == "recovery_needed":
+                            tier = 2
+                        elif obs_val in ("idle", "starting") or item.get("alive"):
+                            tier = 3
+                        else:
+                            tier = 4
+                        return (tier, -(item.get("created") or 0.0))
+
+                    sessions.sort(key=_session_priority)
 
                 for q in pending_questions:
                     q["session_name"] = session_names_map.get(q["session_id"], q["session_id"][:8])
@@ -495,11 +582,18 @@ class MonitorCollector:
 
                 # 6. Events
                 if include_events and self._has_table(db, "events"):
-                    cur = db.execute(
-                        "SELECT seq, session_id, task_id, attempt_id, kind, data, created "
-                        "FROM events ORDER BY seq DESC LIMIT ?",
-                        (limit,),
-                    )
+                    if after_seq is not None:
+                        cur = db.execute(
+                            "SELECT seq, session_id, task_id, attempt_id, kind, data, created "
+                            "FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+                            (int(after_seq), limit),
+                        )
+                    else:
+                        cur = db.execute(
+                            "SELECT seq, session_id, task_id, attempt_id, kind, data, created "
+                            "FROM events ORDER BY seq DESC LIMIT ?",
+                            (limit,),
+                        )
                     for row in cur.fetchall():
                         raw_data = row["data"]
                         parsed = {}
@@ -529,6 +623,7 @@ class MonitorCollector:
                                 "session_name": session_names_map.get(
                                     row["session_id"], row["session_id"][:8] if row["session_id"] else "-"
                                 ),
+                                "runtime": session_runtime_map.get(row["session_id"]),
                                 "task_id": row["task_id"],
                                 "kind": kind,
                                 "summary": summary,
@@ -540,7 +635,57 @@ class MonitorCollector:
             finally:
                 db.close()
 
+        native_sessions: list[dict[str, Any]] = []
+        if include_native:
+            native_sessions = collect_native_sessions(
+                proc_root=self.proc_root,
+                home=self.native_home,
+                exclude_pids=live_worker_pids,
+                exclude_native_ids=live_bridge_native_ids,
+                group_labels=native_group_labels,
+            )
+
+        runtimes = summarize_runtimes(sessions, native_sessions)
         metrics["total_cost_usd"] = round(metrics["total_cost_usd"], 4)
+        metrics["native_sessions"] = sum(1 for n in native_sessions if n.get("kind") != "daemon")
+        metrics["native_workers"] = sum(1 for n in native_sessions if n.get("kind") == "worker")
+        metrics["native_daemons"] = sum(1 for n in native_sessions if n.get("kind") == "daemon")
+        metrics["total_all_active"] = metrics["active_sessions"] + metrics["native_sessions"]
+
+        rt_filter = (
+            normalize_runtime(filter_runtime_arg)
+            if filter_runtime_arg and filter_runtime_arg.lower() != "all"
+            else None
+        )
+        src_filter = source.lower() if source and source.lower() != "all" else None
+        st_filter = status.lower() if status and status.lower() != "all" else None
+
+        if rt_filter:
+            sessions = [s for s in sessions if normalize_runtime(s.get("runtime")) == rt_filter]
+            native_sessions = [n for n in native_sessions if normalize_runtime(n.get("runtime")) == rt_filter]
+            events = [e for e in events if normalize_runtime(e.get("runtime")) == rt_filter]
+
+        if src_filter == "bridge":
+            native_sessions = []
+        elif src_filter == "native":
+            sessions = []
+
+        if st_filter:
+            if st_filter == "active":
+                sessions = [
+                    s
+                    for s in sessions
+                    if s.get("observed") in ("running", "idle", "waiting_input", "starting", "recovery_needed")
+                    or s.get("alive")
+                ]
+                native_sessions = [n for n in native_sessions if n.get("kind") != "daemon"]
+            else:
+                sessions = [s for s in sessions if str(s.get("observed") or "").lower() == st_filter]
+                native_sessions = [n for n in native_sessions if str(n.get("observed") or "").lower() == st_filter]
+
+        if session_limit is not None and session_limit >= 0:
+            sessions = sessions[:session_limit]
+            native_sessions = native_sessions[:session_limit]
 
         return MonitorSnapshot(
             timestamp=now,
@@ -553,6 +698,8 @@ class MonitorCollector:
             peer_queues=peer_queues,
             events=events,
             metrics=metrics,
+            native_sessions=native_sessions,
+            runtimes=runtimes,
         ).as_dict()
 
 
@@ -649,15 +796,39 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
             f"{h.get('last_contact_rel') or _format_relative_time(h.get('last_contact'))}"
         )
 
+    # 3b. Runtime Coverage (pi · claude · agy · codex)
+    runtimes = snapshot.get("runtimes") or {}
+    lines.append(f"\n{BOLD}{CYAN}▶ Runtimes (Pi · Claude · AGY · Codex){RESET}")
+    lines.append(f"{DIM}  {'Runtime':<10} {'Bridge Live/All':<17} {'Native Live':<13} {'Running':<9} {'Waiting':<9} {'Cost'}{RESET}")
+    lines.append(f"  {DIM}{'─' * 10} {'─' * 17} {'─' * 13} {'─' * 9} {'─' * 9} {'─' * 10}{RESET}")
+    for rt_key in MONITORED_RUNTIMES:
+        info = runtimes.get(rt_key, {})
+        disp = info.get("display_name") or display_runtime(rt_key)
+        b_live = f"{info.get('bridge_active', 0)}/{info.get('bridge_total', 0)}"
+        n_live = str(info.get("native_active", 0))
+        if info.get("native_daemons", 0):
+            n_live += f" (+{info['native_daemons']}d)"
+        running_cnt = str(info.get("bridge_running", 0) + info.get("native_workers", 0))
+        waiting_cnt = str(info.get("bridge_waiting", 0) + info.get("bridge_recovery", 0))
+        rt_cost = f"${float(info.get('total_cost_usd', 0.0)):.3f}"
+        lines.append(
+            f"  {BOLD}{disp:<10}{RESET} "
+            f"{b_live:<17} "
+            f"{GREEN if info.get('native_active') else DIM}{n_live:<13}{RESET} "
+            f"{running_cnt:<9} "
+            f"{YELLOW if (info.get('bridge_waiting') or info.get('bridge_recovery')) else DIM}{waiting_cnt:<9}{RESET} "
+            f"{rt_cost}"
+        )
+
     # 4. Active Agents & Sessions Section
     sessions = snapshot.get("sessions", [])
-    lines.append(f"\n{BOLD}{CYAN}▶ Agents & Sessions ({len(sessions)}){RESET}")
+    lines.append(f"\n{BOLD}{CYAN}▶ Bridge Sessions ({len(sessions)}){RESET}")
     lines.append(f"{DIM}  {'Agent / Session Name':<28} {'Host':<10} {'Runtime':<9} {'Model/Profile':<15} {'Status':<14} {'PID':<8} {'Cost':<7} {'ID':<10}{RESET}")
     lines.append(f"  {DIM}{'─' * 28} {'─' * 10} {'─' * 9} {'─' * 15} {'─' * 14} {'─' * 8} {'─' * 7} {'─' * 10}{RESET}")
     if not sessions:
         lines.append(f"  {DIM}(No sessions created yet){RESET}")
     else:
-        for s in sessions[:12]:
+        for s in sessions[:20]:
             obs = s.get("observed", "stopped")
             if s.get("waiting_question"):
                 status_str = f"{BG_YELLOW}{BOLD}WAIT_INPUT{RESET}"
@@ -667,6 +838,8 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
                 status_str = f"{BLUE}IDLE{RESET}"
             elif obs == "waiting_input":
                 status_str = f"{YELLOW}WAIT_INPUT{RESET}"
+            elif obs == "recovery_needed":
+                status_str = f"{RED}RECOVERY{RESET}"
             else:
                 status_str = f"{DIM}{obs}{RESET}"
 
@@ -677,16 +850,38 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
             cost = f"${s['attempt']['cost_usd']:.3f}" if s.get("attempt") and s["attempt"].get("cost_usd") is not None else "-"
             s_name = s.get("name") or s["id"][:8]
             host_tag = s.get("host_id", "local")[:9]
+            rt_tag = (s.get("display_runtime") or s.get("runtime") or "-")[:9]
 
             lines.append(
                 f"  {BOLD}{s_name[:28]:<28}{RESET} "
                 f"{DIM}{host_tag:<10}{RESET} "
-                f"{s.get('runtime', '-')[:9]:<9} "
-                f"{s.get('profile', '-')[:15]:<15} "
+                f"{rt_tag:<9} "
+                f"{(s.get('model') or s.get('profile') or '-')[:15]:<15} "
                 f"{status_str:<14} "
                 f"{pid_str:<8} "
                 f"{cost:<7} "
                 f"{DIM}{s.get('id', '-')[:8]:<10}{RESET}"
+            )
+
+    # 4b. Native CLI Processes & Workers
+    native_sessions = snapshot.get("native_sessions", [])
+    lines.append(f"\n{BOLD}{CYAN}▶ Native CLI Processes & Workers ({len(native_sessions)}){RESET}")
+    lines.append(f"{DIM}  {'Title / Native Session':<28} {'Runtime':<9} {'Mode':<12} {'Model':<20} {'PID':<8} {'CWD'}{RESET}")
+    lines.append(f"  {DIM}{'─' * 28} {'─' * 9} {'─' * 12} {'─' * 20} {'─' * 8} {'─' * 28}{RESET}")
+    if not native_sessions:
+        lines.append(f"  {DIM}(No live native pi/claude/agy/codex processes){RESET}")
+    else:
+        for n in native_sessions[:20]:
+            rt_tag = (n.get("display_runtime") or n.get("runtime") or "-")[:9]
+            mode_tag = (n.get("mode") or "-")[:12]
+            m_color = GREEN if mode_tag == "headless" else (CYAN if mode_tag == "interactive" else DIM)
+            lines.append(
+                f"  {BOLD}{(n.get('name') or '-')[:28]:<28}{RESET} "
+                f"{rt_tag:<9} "
+                f"{m_color}{mode_tag:<12}{RESET} "
+                f"{(n.get('model') or '-')[:20]:<20} "
+                f"{str(n.get('pid') or '-'):<8} "
+                f"{DIM}{str(n.get('cwd') or '-')[:36]}{RESET}"
             )
 
     # 5. Communications & Broadcasts Section
@@ -737,10 +932,28 @@ def run_tui_monitor(
     interval: float = 2.0,
     once: bool = False,
     output_format: str = "text",
+    *,
+    runtime: str | None = None,
+    source: str | None = None,
+    active_only: bool = False,
+    session_limit: int | None = None,
+    include_native: bool = True,
 ) -> None:
     collector = MonitorCollector(state)
+    collect_kwargs: dict[str, Any] = {}
+    if runtime and runtime != "all":
+        collect_kwargs["runtime"] = runtime
+    if source and source != "all":
+        collect_kwargs["source"] = source
+    if active_only:
+        collect_kwargs["status"] = "active"
+    if session_limit is not None:
+        collect_kwargs["session_limit"] = session_limit
+    if not include_native:
+        collect_kwargs["include_native"] = False
+
     if once:
-        snapshot = collector.collect(limit=20)
+        snapshot = collector.collect(limit=20, **collect_kwargs)
         if output_format == "json":
             print(json.dumps(snapshot, indent=2))
         else:
@@ -753,7 +966,7 @@ def run_tui_monitor(
     try:
         while True:
             term_width = shutil.get_terminal_size((100, 30)).columns
-            snapshot = collector.collect(limit=15)
+            snapshot = collector.collect(limit=15, **collect_kwargs)
             output = render_tui(snapshot, width=term_width)
             # Home cursor and redraw
             print("\033[H" + output + f"\n\n{DIM}[Press Ctrl+C to exit monitor | Refreshing every {interval}s]{RESET}\033[J", flush=True)

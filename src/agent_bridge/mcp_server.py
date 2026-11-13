@@ -24,9 +24,28 @@ def server(state):
         return await request(state, "agent_hosts_reload", {})
 
     @mcp.tool(annotations=read_only)
-    async def agent_monitor(limit: int = 15, include_events: bool = True) -> dict:
-        """Overall multi-agent monitor snapshot: cluster hosts, active sessions, running tasks, pending questions/approvals, broadcasts, and recent communications."""
-        return await request(state, "agent_monitor", locals())
+    async def agent_monitor(
+        limit: int = 15,
+        include_events: bool = True,
+        runtime: str | None = None,
+        source: str | None = None,
+        status: str | None = None,
+        session_limit: int | None = None,
+        include_native: bool = True,
+    ) -> dict:
+        """Overall multi-agent monitor snapshot across pi, claude, agy (antigravity), and codex: cluster hosts, runtime summary, bridge sessions, live native processes, pending approvals, broadcasts, and events."""
+        params: dict = {"limit": limit, "include_events": include_events}
+        if runtime is not None:
+            params["runtime"] = runtime
+        if source is not None:
+            params["source"] = source
+        if status is not None:
+            params["status"] = status
+        if session_limit is not None:
+            params["session_limit"] = session_limit
+        if not include_native:
+            params["include_native"] = False
+        return await request(state, "agent_monitor", params)
 
     @mcp.tool(annotations=read_only)
     async def agent_groups(group_id: str | None = None, active_only: bool = False) -> dict:
