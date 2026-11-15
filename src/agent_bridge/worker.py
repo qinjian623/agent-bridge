@@ -5,14 +5,18 @@ import fcntl
 import json
 import os
 import signal
+import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 
+from . import __version__, update_guard
 from .config import Config, Profile, safe_error
 from .errors import BridgeError
 from .runtimes import runtime
 from .store import Store, identifier, validate_task_timeout
+from .updater import release_change_detector
 from .usage import priced_usage
 from .workspace import capture_patch
 
@@ -91,7 +95,7 @@ def denial(data):
 
 
 class Worker:
-    def __init__(self, state: Path, config: Config, session_id: str):
+    def __init__(self, state: Path, config: Config, session_id: str, *, release_changed=None):
         self.state, self.config, self.session_id = state, config, session_id
         self.store = Store(state)
         self.generation = identifier()
@@ -108,6 +112,32 @@ class Worker:
         self.interrupt_done = asyncio.Event()
         self.interrupt_done.set()
         self.read_only = False
+        self.release_changed = release_changed if release_changed is not None else release_change_detector(state)
+
+    def _should_retire_for_release(self) -> bool:
+        """Retire only between turns once the release changed and broker maintenance cleared."""
+        if not self.release_changed():
+            return False
+        try:
+            return update_guard.maintenance(self.state) is None
+        except BridgeError:
+            return False
+
+    async def _acquire_session_lock(self, lock) -> bool:
+        """Acquire the per-session lock, waiting briefly for a stopping worker handoff."""
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                try:
+                    session = self.store.get_session(self.session_id)
+                except BridgeError:
+                    return False
+                if session["worker_pid"] is not None or time.monotonic() >= deadline:
+                    return False
+                await asyncio.sleep(0.05)
 
     async def question(self, data):
         if not self.task:
@@ -133,12 +163,24 @@ class Worker:
         self.native_accepted.set()
 
     async def event(self, kind, data):
-        if kind == "usage_updated":
-            self.store.progress_usage(
-                self.session_id, self.generation, self.task["id"], self.task["active_attempt"], data
-            )
-            return
-        self.store.record(kind, data, self.session_id, self.task["id"], self.task["active_attempt"])
+        for attempt in range(3):
+            try:
+                if kind == "usage_updated":
+                    self.store.progress_usage(
+                        self.session_id, self.generation, self.task["id"], self.task["active_attempt"], data
+                    )
+                    return
+                self.store.record(kind, data, self.session_id, self.task["id"], self.task["active_attempt"])
+                return
+            except sqlite3.OperationalError as error:
+                if attempt < 2:
+                    await asyncio.sleep(0.25)
+                    continue
+                print(
+                    json.dumps({"session_id": self.session_id, "warning": f"Transient event write skipped: {safe_error(error)}"}),
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     async def watch_control(self, owner):
         interrupted_at = None
@@ -256,143 +298,158 @@ class Worker:
 
     async def run(self):
         lock_path = self.state / (self.session_id + ".lock")
-        with lock_path.open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return
-            pid, start = os.getpid(), process_identity(os.getpid())
-            scope = process_scope(pid) if self.config.worker_launcher == "systemd" else None
-            if not self.store.worker_starting(self.session_id, self.generation, pid, start, scope):
-                return
-            session = self.store.get_session(self.session_id)
-            with self.store.connection() as db:
-                session["has_native_history"] = bool(
-                    db.execute(
-                        "SELECT 1 FROM attempts WHERE session_id=? AND started IS NOT NULL", (self.session_id,)
+        registered = False
+        try:
+            with lock_path.open("a") as lock:
+                if not await self._acquire_session_lock(lock):
+                    return
+                pid, start = os.getpid(), process_identity(os.getpid())
+                scope = process_scope(pid) if self.config.worker_launcher == "systemd" else None
+                if not self.store.worker_starting(
+                    self.session_id, self.generation, pid, start, scope, worker_version=__version__,
+                ):
+                    return
+                registered = True
+                session = self.store.get_session(self.session_id)
+                with self.store.connection() as db:
+                    session["has_native_history"] = bool(
+                        db.execute(
+                            "SELECT 1 FROM attempts WHERE session_id=? AND started IS NOT NULL", (self.session_id,)
+                        ).fetchone()
+                    )
+                    last = db.execute(
+                        "SELECT result FROM attempts WHERE session_id=? AND started IS NOT NULL ORDER BY started DESC,rowid DESC LIMIT 1",
+                        (self.session_id,),
                     ).fetchone()
-                )
-                last = db.execute(
-                    "SELECT result FROM attempts WHERE session_id=? AND started IS NOT NULL ORDER BY started DESC,rowid DESC LIMIT 1",
-                    (self.session_id,),
-                ).fetchone()
-                if last:
-                    session["native_usage_total"] = json.loads(last[0] or "{}").get("native_usage_total")
-            self.read_only = session["access"] == "read-only"
-            profile = Profile(**session["profile"])
-            self.agent = runtime(profile, session, self.state, self.question)
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.add_signal_handler(sig, self.request_shutdown)
-            monitor = None
-            try:
-                # The SDK's connect, receive and disconnect share one AnyIO task.
-                startup_deadline = asyncio.timeout(self.config.task_timeout)
+                    if last:
+                        session["native_usage_total"] = json.loads(last[0] or "{}").get("native_usage_total")
+                self.read_only = session["access"] == "read-only"
+                profile = Profile(**session["profile"])
+                self.agent = runtime(profile, session, self.state, self.question)
+                loop = asyncio.get_running_loop()
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, self.request_shutdown)
+                monitor = None
                 try:
-                    async with startup_deadline:
-                        await self.agent.connect()
-                except TimeoutError as error:
-                    if not startup_deadline.expired():
-                        raise TimeoutError(
-                            "Native startup failed during connect: " + (safe_error(error) or type(error).__name__)
-                        ) from error
-                    self.store.record("native_wait_ended", {
-                        "stage": "connect", "cause": "task_timeout",
-                        "task_timeout_seconds": self.config.task_timeout,
-                    }, self.session_id)
-                    raise TimeoutError(
-                        f"Native startup timed out during connect after {self.config.task_timeout:g}s; no task was dispatched"
-                    ) from error
-                self.store.worker_ready(
-                    self.session_id, self.generation, pid, start, self.agent.native_id, task_timeout_supported=True,
-                )
-                monitor = asyncio.create_task(self.watch_control(asyncio.current_task()))
-                while not self.shutdown:
-                    # Pi's abort is untargeted; it must settle before another prompt starts.
-                    await self.interrupt_done.wait()
-                    session = self.store.get_session(self.session_id)
-                    if self.shutdown or session["desired"] != "open":
-                        break
-                    self.task = self.store.begin_attempt(self.session_id, self.generation)
-                    if not self.task:
-                        await asyncio.sleep(0.15)
-                        continue
-                    self.stop_reason, self.started = None, time.monotonic()
-                    self.termination, self.termination_attempt = None, None
-                    details = self.task["details"]
-                    details = json.loads(details) if isinstance(details, str) else details
-                    override = validate_task_timeout(details.get("task_timeout"))
-                    self.task_timeout = self.config.task_timeout if override is None else override
-                    self.native_accepted.clear()
-                    instruction = self.task["instruction"]
-                    previous = self.store.get_task(self.task["id"])["attempts"]
-                    if len(previous) > 1:
-                        instruction = (
-                            "Continue the interrupted task. Inspect existing files and native history before acting; do not repeat completed side effects.\n\n"
-                            + instruction
-                        )
+                    # The SDK's connect, receive and disconnect share one AnyIO task.
+                    startup_deadline = asyncio.timeout(self.config.task_timeout)
                     try:
-                        status, result, usage = await self.agent.run(instruction, self.started_native, self.event)
-                        status, result = self.termination_result(status, result)
-                        if session["access"] == "workspace-write":
-                            try:
-                                result["files"] = capture_patch(
-                                    session["cwd"], self.state / (self.task["active_attempt"] + ".patch"), session["workspace"],
-                                )
-                            except Exception as error:
-                                result["files"] = {"workspace": session["cwd"], "error": safe_error(error)}
-                                if status == "completed":
-                                    status, result["error"] = "failed", "Patch capture failed: " + safe_error(error)
-                        self.store.finish(
-                            self.session_id,
-                            self.generation,
-                            self.task["id"],
-                            self.task["active_attempt"],
-                            status,
-                            result,
-                            priced_usage(usage, {**profile.price, "model": profile.model} if profile.price else None),
-                        )
-                    except (BridgeError, OSError, TimeoutError) as error:
-                        # A transport failure after send cannot establish whether work ran.
+                        async with startup_deadline:
+                            await self.agent.connect()
+                    except TimeoutError as error:
+                        if not startup_deadline.expired():
+                            raise TimeoutError(
+                                "Native startup failed during connect: " + (safe_error(error) or type(error).__name__)
+                            ) from error
+                        self.store.record("native_wait_ended", {
+                            "stage": "connect", "cause": "task_timeout",
+                            "task_timeout_seconds": self.config.task_timeout,
+                        }, self.session_id)
+                        raise TimeoutError(
+                            f"Native startup timed out during connect after {self.config.task_timeout:g}s; no task was dispatched"
+                        ) from error
+                    self.store.worker_ready(
+                        self.session_id,
+                        self.generation,
+                        pid,
+                        start,
+                        self.agent.native_id,
+                        task_timeout_supported=True,
+                        worker_version=__version__,
+                    )
+                    monitor = asyncio.create_task(self.watch_control(asyncio.current_task()))
+                    while not self.shutdown:
+                        # Pi's abort is untargeted; it must settle before another prompt starts.
+                        await self.interrupt_done.wait()
+                        session = self.store.get_session(self.session_id)
+                        if self.shutdown or session["desired"] != "open" or self._should_retire_for_release():
+                            break
+                        self.task = self.store.begin_attempt(self.session_id, self.generation)
+                        if not self.task:
+                            await asyncio.sleep(0.15)
+                            continue
+                        self.stop_reason, self.started = None, time.monotonic()
+                        self.termination, self.termination_attempt = None, None
+                        details = self.task["details"]
+                        details = json.loads(details) if isinstance(details, str) else details
+                        override = validate_task_timeout(details.get("task_timeout"))
+                        self.task_timeout = self.config.task_timeout if override is None else override
+                        self.native_accepted.clear()
+                        instruction = self.task["instruction"]
+                        previous = self.store.get_task(self.task["id"])["attempts"]
+                        if any(
+                            attempt["id"] != self.task["active_attempt"] and attempt.get("started") is not None
+                            for attempt in previous
+                        ):
+                            instruction = (
+                                "Continue the interrupted task. Inspect existing files and native history before acting; do not repeat completed side effects.\n\n"
+                                + instruction
+                            )
+                        try:
+                            status, result, usage = await self.agent.run(instruction, self.started_native, self.event)
+                            status, result = self.termination_result(status, result)
+                            if session["access"] == "workspace-write":
+                                try:
+                                    result["files"] = capture_patch(
+                                        session["cwd"], self.state / (self.task["active_attempt"] + ".patch"), session["workspace"],
+                                    )
+                                except Exception as error:
+                                    result["files"] = {"workspace": session["cwd"], "error": safe_error(error)}
+                                    if status == "completed":
+                                        status, result["error"] = "failed", "Patch capture failed: " + safe_error(error)
+                            self.store.finish(
+                                self.session_id,
+                                self.generation,
+                                self.task["id"],
+                                self.task["active_attempt"],
+                                status,
+                                result,
+                                priced_usage(usage, {**profile.price, "model": profile.model} if profile.price else None),
+                            )
+                        except (BridgeError, OSError, TimeoutError) as error:
+                            # A transport failure after send cannot establish whether work ran.
+                            self.last_error = safe_error(error) or type(error).__name__
+                            if isinstance(error, TimeoutError):
+                                stage = "turn" if self.native_accepted.is_set() else "native_acceptance"
+                                self.last_error = f"Native wait timed out during {stage}: " + self.last_error
+                            status, result = self.termination_result(
+                                "recovery_needed",
+                                {"error": self.last_error, "provider_limit": getattr(error, "provider_limit", None)},
+                            )
+                            self.last_error = result["error"]
+                            self.store.finish(
+                                self.session_id,
+                                self.generation,
+                                self.task["id"],
+                                self.task["active_attempt"],
+                                status,
+                                result,
+                            )
+                            break
+                        self.task = None
+                except (asyncio.CancelledError, Exception) as error:
+                    if isinstance(error, asyncio.CancelledError):
+                        self.last_error = self.last_error or "Worker was interrupted before a terminal result was confirmed"
+                    else:
                         self.last_error = safe_error(error) or type(error).__name__
-                        if isinstance(error, TimeoutError):
-                            stage = "turn" if self.native_accepted.is_set() else "native_acceptance"
-                            self.last_error = f"Native wait timed out during {stage}: " + self.last_error
-                        status, result = self.termination_result(
-                            "recovery_needed",
-                            {"error": self.last_error, "provider_limit": getattr(error, "provider_limit", None)},
-                        )
+                    if self.task and (self.termination or isinstance(error, asyncio.CancelledError)):
+                        status, result = self.termination_result("recovery_needed", {"error": self.last_error})
                         self.last_error = result["error"]
                         self.store.finish(
-                            self.session_id,
-                            self.generation,
-                            self.task["id"],
-                            self.task["active_attempt"],
-                            status,
-                            result,
+                            self.session_id, self.generation, self.task["id"], self.task["active_attempt"], status, result,
                         )
-                        break
-                    self.task = None
-            except (asyncio.CancelledError, Exception) as error:
-                if isinstance(error, asyncio.CancelledError):
-                    self.last_error = self.last_error or "Worker was interrupted before a terminal result was confirmed"
-                else:
-                    self.last_error = safe_error(error) or type(error).__name__
-                if self.task and (self.termination or isinstance(error, asyncio.CancelledError)):
-                    status, result = self.termination_result("recovery_needed", {"error": self.last_error})
-                    self.last_error = result["error"]
-                    self.store.finish(
-                        self.session_id, self.generation, self.task["id"], self.task["active_attempt"], status, result,
-                    )
-            finally:
-                if monitor:
-                    monitor.cancel()
-                    await asyncio.gather(monitor, return_exceptions=True)
-                try:
-                    async with asyncio.timeout(self.config.interrupt_timeout):
-                        await self.agent.close()
-                except Exception as error:
-                    self.last_error = self.last_error or "Native cleanup failed: " + (safe_error(error) or type(error).__name__)
+                finally:
+                    if monitor:
+                        monitor.cancel()
+                        await asyncio.gather(monitor, return_exceptions=True)
+                    try:
+                        async with asyncio.timeout(self.config.interrupt_timeout):
+                            await self.agent.close()
+                    except Exception as error:
+                        self.last_error = self.last_error or "Native cleanup failed: " + (safe_error(error) or type(error).__name__)
+        finally:
+            if registered:
+                # Publish `observed='stopped'` only after `lock` closes and releases `flock`.
                 self.store.worker_stopped(self.session_id, self.generation, self.last_error)
                 if self.last_error:
                     print(json.dumps({"session_id": self.session_id, "error": self.last_error}), flush=True)

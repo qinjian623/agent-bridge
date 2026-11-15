@@ -62,11 +62,12 @@ GitHub 在 push/PR 后运行离线测试、Ruff 和 Linux/macOS 打包安装检�
 agent-bridge update install
 agent-bridge update check
 agent-bridge update run
+agent-bridge update run --drain-workers
 ```
 
 更新配置为 `~/.local/state/cli-agent-bridge/update.json`（0600），可配置 GitHub 仓库、独立版本目录、systemd/launchd 服务名和检查间隔。私有仓库使用该用户已有的 `gh` 登录，先用 `gh auth login` 完成授权；不在代码、包或定时器中保存 token。安装时默认不启动定时器，也不修改已有 Broker 服务；完成首次服务迁移后再使用 `agent-bridge update install --enable`。Linux 每小时检查并随机延迟最多 5 分钟，macOS 使用 LaunchAgent 定时检查。
 
-更新下载经过 SHA256 检查的 wheel，在新版本专用虚拟环境中安装，先运行配置与隔离服务检查。还有任务、worker、通知/helper 或未返回请求时延期；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录禁止新派单和发送，其他节点也不能在此时投递新工作。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。
+更新下载经过 SHA256 检查的 wheel，在新版本专用虚拟环境中安装，先运行配置与隔离服务检查。默认启用 OTA 热更新：不中断运行中的任务和兼容 worker，进入维护前仅排空短在途请求、通知与非 SSH helper；兼容 Worker 与 SSH relay 在当前轮次结束或空闲后自行退场由新版拉起（仅当目标版声明不兼容、或指定 `--drain-workers` 时才等待全部任务与 Worker 清空）；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录禁止新派单和发送，其他节点也不能在此时投递新工作；CLI 在维护和重启短暂窗口内对只读与带 `request_id` 的幂等请求自动重试。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。详情参见 [docs/ota-hot-update-20261116.md](docs/ota-hot-update-20261116.md)。
 
 `~/.local/share/cli-agent-bridge/bin/agent-bridge` 是固定入口，Broker、CLI、MCP、远端 relay 和 skill 应使用该入口或 `current/skill`，不能只改 Broker 而让其它入口仍指向旧 checkout。版本目录保留，源仓库及其未提交修改不被更新程序覆盖。正在运行的原生终端不被重启，MCP 配置修改在下次加载时生效。定时器只更新 Bridge，不更新 Codex、Claude、Pi 或 AGY 本身。
 

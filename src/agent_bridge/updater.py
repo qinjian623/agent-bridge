@@ -1,4 +1,4 @@
-"""Install checked GitHub wheels beside existing code; replace only an idle broker."""
+"""Install checked GitHub wheels beside existing code; drain and hot-swap the broker while compatible workers run."""
 
 from __future__ import annotations
 
@@ -26,7 +26,10 @@ from .errors import BridgeError
 
 REPOSITORY = "qinjian623/cli-agent-bridge"
 TAG = re.compile(r"v(\d+)\.(\d+)\.(\d+)\Z")
+VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)\Z")
 NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
+DEFAULT_DRAIN_TIMEOUT = 15.0
+LEGACY_WORKER_VERSION = (0, 2, 0)
 
 
 class UpdateUncertain(RuntimeError):
@@ -116,14 +119,69 @@ def _children(pid):
     return names
 
 
-def busy_snapshot(state: Path, broker_pid: int | None = None):
-    """Read only. Paused historical queues are preserved and do not prevent updates."""
+def _parse_version(version):
+    """Parse a semantic version string (`X.Y.Z` or `vX.Y.Z`) into an integer tuple."""
+    if not isinstance(version, str):
+        raise ValueError("Invalid release version")
+    match = VERSION.fullmatch(version)
+    if not match:
+        raise ValueError("Invalid release version")
+    return tuple(map(int, match.groups()))
+
+
+def _worker_version_tuple(version):
+    """Convert a recorded worker version into a comparable tuple for compatibility checks."""
+    if version is None:
+        return LEGACY_WORKER_VERSION
+    try:
+        return _parse_version(version)
+    except ValueError:
+        return (0, 0, 0)
+
+
+def release_change_detector(state: Path, *, allow_missing_current: bool = True):
+    """Return a zero-arg callable reporting whether the active managed release changed."""
+    if not (state / "update.json").exists():
+        return lambda: False
+    try:
+        current = Path(load_settings(state)["root"]) / "current"
+    except (OSError, ValueError):
+        return lambda: False
+    releases_dir = (current.parent / "releases").resolve()
+    running = Path(sys.prefix).resolve()
+    try:
+        initial = current.resolve(strict=True)
+    except OSError:
+        initial = None if allow_missing_current else current.resolve()
+    expected = running if running.parent == releases_dir else initial
+
+    def changed():
+        try:
+            resolved = current.resolve(strict=True)
+        except OSError:
+            return expected is not None
+        return expected is None or resolved != expected
+
+    return changed
+
+
+def busy_snapshot(
+    state: Path,
+    broker_pid: int | None = None,
+    *,
+    hot: bool = True,
+    check_inflight: bool = True,
+    min_worker_version: str | None = None,
+):
+    """Read only. Paused queues stay preserved; hot OTA only blocks on broker-inflight work or incompatible workers."""
     from .worker import process_identity
 
     counts, reasons = {}, []
-    queries = {
+    worker_queries = {
         "open_queued_tasks": "SELECT COUNT(*) FROM tasks t JOIN sessions s ON s.id=t.session_id WHERE t.status='queued' AND s.desired='open'",
         "active_tasks": "SELECT COUNT(*) FROM tasks WHERE status IN ('assigned','running','waiting_input')",
+    }
+    inflight_queries = {
         "api_inflight": "SELECT COUNT(*) FROM api_requests WHERE response IS NULL",
         "notification_sending": "SELECT COUNT(*) FROM deliveries WHERE status='sending'",
         "native_broadcast_sending": "SELECT COUNT(*) FROM native_broadcast_deliveries WHERE status='sending' OR processing_status='running'",
@@ -131,23 +189,38 @@ def busy_snapshot(state: Path, broker_pid: int | None = None):
         "peer_sending": "SELECT COUNT(*) FROM peer_outbox WHERE status='sending'",
     }
     try:
+        min_tuple = _parse_version(min_worker_version) if min_worker_version is not None else None
         with contextlib.closing(sqlite3.connect(f"file:{state / 'bridge.sqlite'}?mode=ro", uri=True, timeout=2)) as db:
             db.execute("BEGIN")
-            counts = {name: db.execute(query).fetchone()[0] for name, query in queries.items()}
-            workers = db.execute("SELECT worker_pid,worker_start FROM sessions WHERE worker_pid IS NOT NULL").fetchall()
-            counts["live_workers"] = sum(
-                bool(identity and (not expected or identity == expected))
-                for pid, expected in workers
-                if (identity := process_identity(pid))
-            )
-        reasons.extend(name for name, count in counts.items() if count)
-        if broker_pid is not None:
-            counts["broker_helpers"] = sum(name != "ssh" for name in _children(broker_pid))
-            if counts["broker_helpers"]:
-                reasons.append("broker_helpers")
+            for name, query in (*worker_queries.items(), *inflight_queries.items()):
+                counts[name] = db.execute(query).fetchone()[0]
+            columns = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+            version_expr = "worker_version" if "worker_version" in columns else "NULL"
+            workers = db.execute(
+                f"SELECT worker_pid,worker_start,{version_expr} FROM sessions WHERE worker_pid IS NOT NULL"
+            ).fetchall()
+            live_versions = [
+                version
+                for pid, expected, version in workers
+                if (identity := process_identity(pid)) and (not expected or identity == expected)
+            ]
+            counts["live_workers"] = len(live_versions)
+        if not hot:
+            reasons.extend(name for name in ("open_queued_tasks", "active_tasks", "live_workers") if counts[name])
+        elif min_tuple is not None and live_versions:
+            incompatible = sum(1 for version in live_versions if _worker_version_tuple(version) < min_tuple)
+            if incompatible:
+                counts["incompatible_workers"] = incompatible
+                reasons.append("incompatible_workers")
+        if check_inflight:
+            reasons.extend(name for name in inflight_queries if counts[name])
+            if broker_pid is not None:
+                counts["broker_helpers"] = sum(name != "ssh" for name in _children(broker_pid))
+                if counts["broker_helpers"]:
+                    reasons.append("broker_helpers")
     except (OSError, ValueError, sqlite3.Error, RuntimeError):
         reasons.append("update_state_unknown")
-    return {"busy": bool(reasons), "reasons": reasons, "counts": counts}
+    return {"busy": bool(reasons), "reasons": reasons, "counts": counts, "hot": hot}
 
 
 def load_settings(state: Path):
@@ -338,7 +411,7 @@ class Updater:
                     ["uv", "pip", "install", "--python", str(target / "bin/python"), str(download / release["wheel"])],
                     timeout=300,
                 )
-            self.preflight(target, release["tag"])
+            compatibility = self.preflight(target, release["tag"])
             skill = Path(
                 _run(
                     [
@@ -352,7 +425,14 @@ class Updater:
             if not skill.is_dir() or not skill.resolve().is_relative_to(target.resolve()):
                 raise ValueError("Release wheel is missing its packaged skill")
             (target / "skill").symlink_to(skill.relative_to(target), target_is_directory=True)
-            _write(target / "release.json", {**release, "sha256": digest})
+            release_meta = {**release, "sha256": digest}
+            if isinstance(compatibility, dict):
+                if "requires_worker_drain" in compatibility:
+                    release_meta["requires_worker_drain"] = bool(compatibility["requires_worker_drain"])
+                if isinstance(compatibility.get("min_worker_version"), str):
+                    _parse_version(compatibility["min_worker_version"])
+                    release_meta["min_worker_version"] = compatibility["min_worker_version"]
+            _write(target / "release.json", release_meta)
             return target
         except BaseException:
             shutil.rmtree(target)
@@ -360,8 +440,16 @@ class Updater:
 
     def preflight(self, target: Path, tag: str):
         python = str(target / "bin/python")
-        code = "import importlib.metadata,sys; assert importlib.metadata.version('cli-agent-bridge')==sys.argv[1]"
-        _run([python, "-c", code, tag[1:]], timeout=15)
+        code = (
+            "import importlib.metadata, json, sys, agent_bridge; "
+            "assert importlib.metadata.version('cli-agent-bridge') == sys.argv[1]; "
+            "print(json.dumps({"
+            "'requires_worker_drain': bool(getattr(agent_bridge, 'REQUIRES_WORKER_DRAIN', False)), "
+            "'min_worker_version': getattr(agent_bridge, 'MIN_COMPATIBLE_WORKER_VERSION', None)"
+            "}))"
+        )
+        raw = _run([python, "-c", code, tag[1:]], timeout=15).strip()
+        compatibility = json.loads(raw) if raw else {}
         _run([python, "-m", "agent_bridge.cli", "--state", str(self.state), "doctor"], timeout=30)
         # No production database copy and no real hosts, credentials, sessions or inference.
         with tempfile.TemporaryDirectory(prefix="selftest-", dir=self.root) as name:
@@ -382,6 +470,7 @@ class Updater:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+        return compatibility
 
     @staticmethod
     async def _healthy(state: Path, expected_version=None, process=None):
@@ -438,11 +527,35 @@ class Updater:
         except (OSError, RuntimeError):
             return False
 
-    async def _activate(self, target: Path, config_digest: str):
+    async def _activate(
+        self,
+        target: Path,
+        config_digest: str,
+        *,
+        hot: bool = True,
+        drain_timeout: float = DEFAULT_DRAIN_TIMEOUT,
+    ):
         from .broker import request
 
+        release_path = target / "release.json"
+        target_meta = json.loads(release_path.read_text()) if release_path.exists() else {}
+        effective_hot = hot and not bool(target_meta.get("requires_worker_drain", False))
+        min_worker_version = target_meta.get("min_worker_version")
+        prepare_args = {}
+        if not effective_hot:
+            prepare_args["hot"] = False
+        if drain_timeout != DEFAULT_DRAIN_TIMEOUT:
+            prepare_args["drain_timeout"] = drain_timeout
+        if min_worker_version is not None and _parse_version(min_worker_version) > LEGACY_WORKER_VERSION:
+            prepare_args["min_worker_version"] = min_worker_version
+
         try:
-            lease = await request(self.state, "agent_update_prepare", {})
+            lease = await request(self.state, "agent_update_prepare", prepare_args)
+        except BridgeError as error:
+            if error.code == "invalid_request" and prepare_args:
+                lease = await request(self.state, "agent_update_prepare", {})
+            else:
+                raise
         except (OSError, TimeoutError):
             shutil.rmtree(target)
             return {"status": "deferred", "reason": "broker_unavailable"}
@@ -454,10 +567,15 @@ class Updater:
         try:
             if hashlib.sha256((self.state / "config.json").read_bytes()).hexdigest() != config_digest:
                 return {"status": "deferred", "reason": "config_changed"}
-            snapshot = busy_snapshot(self.state, broker_pid=lease.get("broker_pid"))
+            snapshot = busy_snapshot(
+                self.state,
+                broker_pid=lease.get("broker_pid"),
+                hot=effective_hot,
+                min_worker_version=min_worker_version,
+            )
             if snapshot["busy"]:
                 return {"status": "deferred", **snapshot}
-            target_version = json.loads((target / "release.json").read_text())["tag"][1:]
+            target_version = target_meta["tag"][1:]
             previous_version = json.loads((previous / "release.json").read_text())["tag"][1:] if previous else None
             self._record(
                 {
@@ -466,6 +584,7 @@ class Updater:
                     "previous_version": previous_version,
                     "candidate": str(target),
                     "previous": str(previous) if previous else None,
+                    "hot": effective_hot,
                 }
             )
             remove_candidate = False
@@ -484,7 +603,7 @@ class Updater:
                     raise UpdateUncertain("Rollback health could not be confirmed") from error
                 remove_candidate = True
                 return {"status": "rolled_back", "reason": "new_broker_failed_health_check"}
-            return {"status": "updated", "release": target.name}
+            return {"status": "updated", "release": target.name, "hot": effective_hot}
         finally:
             # A timed-out restart may still be running; leave its lease to expire rather than admitting new work.
             if sys.exc_info()[0] not in {UpdateUncertain, KeyboardInterrupt, SystemExit}:
@@ -497,8 +616,9 @@ class Updater:
             if remove_candidate:
                 shutil.rmtree(target)
 
-    def run(self):
+    def run(self, *, drain_workers: bool = False):
         try:
+            hot = not drain_workers
             with self._locked():
                 status_path = self.state / "update-status.json"
                 if status_path.exists():
@@ -522,13 +642,13 @@ class Updater:
                             }
                         )
                     return self._record({"status": "up_to_date", "version": check["installed"]["tag"]})
-                snapshot = busy_snapshot(self.state)
+                snapshot = busy_snapshot(self.state, hot=hot, check_inflight=not hot)
                 if snapshot["busy"]:
                     return self._record({"status": "deferred", **snapshot})
                 digest = hashlib.sha256((self.state / "config.json").read_bytes()).hexdigest()
                 target = self.stage(check["available"])
                 try:
-                    result = asyncio.run(self._activate(target, digest))
+                    result = asyncio.run(self._activate(target, digest, hot=hot))
                 except BridgeError as error:
                     shutil.rmtree(target)
                     if error.code in {"update_busy", "unknown_method", "method_not_found"}:
@@ -646,6 +766,11 @@ def main(argv=None):
     parser.add_argument("--interval", type=int, default=3600)
     parser.add_argument("--enable", action="store_true")
     parser.add_argument("--jitter", type=int, default=0)
+    parser.add_argument(
+        "--drain-workers",
+        action="store_true",
+        help="Wait until all live workers and active tasks stop before switching versions",
+    )
     parser.add_argument("action", choices=["check", "run", "install", "bootstrap"])
     args = parser.parse_args(argv)
     from .config import state_directory
@@ -660,6 +785,8 @@ def main(argv=None):
             result = install(
                 state, args.repository, args.service_kind, args.service_name, args.root, args.interval, args.enable
             )
+        elif args.action == "run":
+            result = Updater(state).run(drain_workers=args.drain_workers)
         else:
             updater = Updater(state)
             result = getattr(updater, args.action)()

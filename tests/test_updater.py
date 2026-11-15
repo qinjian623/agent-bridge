@@ -20,7 +20,7 @@ class UpdateFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        self.home = Path(self.temp.name).resolve()
         self.state = self.home / "state"
         self.root = self.home / "managed"
         self.state.mkdir(mode=0o700)
@@ -79,7 +79,7 @@ class BusySnapshotTests(UpdateFixture):
         with store.connection() as db:
             self.assertEqual(2, db.execute("SELECT COUNT(*) FROM tasks WHERE status='queued'").fetchone()[0])
 
-    def test_open_queue_and_active_task_in_paused_session_are_busy(self):
+    def test_open_queue_and_active_task_are_allowed_in_hot_mode_and_blocked_when_draining_workers(self):
         store = self.database()
         with store.connection(write=True) as db:
             db.execute(
@@ -89,26 +89,57 @@ class BusySnapshotTests(UpdateFixture):
             db.execute(
                 "INSERT INTO tasks(id,session_id,instruction,dependencies,reservation,created) VALUES('t','s','x','[]',0,0)"
             )
-        self.assertIn("open_queued_tasks", updater.busy_snapshot(self.state)["reasons"])
+        hot = updater.busy_snapshot(self.state)
+        self.assertFalse(hot["busy"], hot)
+        self.assertEqual(1, hot["counts"]["open_queued_tasks"])
+        self.assertIn("open_queued_tasks", updater.busy_snapshot(self.state, hot=False)["reasons"])
         with store.connection(write=True) as db:
             db.execute("UPDATE sessions SET desired='paused'")
             db.execute("UPDATE tasks SET status='running'")
-        self.assertIn("active_tasks", updater.busy_snapshot(self.state)["reasons"])
+        hot_active = updater.busy_snapshot(self.state)
+        self.assertFalse(hot_active["busy"], hot_active)
+        self.assertEqual(1, hot_active["counts"]["active_tasks"])
+        self.assertIn("active_tasks", updater.busy_snapshot(self.state, hot=False)["reasons"])
 
-    def test_live_worker_and_native_helper_are_busy_even_without_running_task(self):
+    def test_live_worker_is_allowed_in_hot_mode_while_native_helper_still_blocks(self):
         store = self.database()
         with store.connection(write=True) as db:
             db.execute(
-                "INSERT INTO sessions(id,profile,cwd,access,worker_pid,worker_start,created) VALUES('s','test',?,'read-only',123,'boot:1',0)",
+                "INSERT INTO sessions(id,profile,cwd,access,worker_pid,worker_start,worker_version,created) "
+                "VALUES('s','test',?,'read-only',123,'boot:1','0.2.8',0)",
                 (str(self.home),),
             )
         with (
             patch("agent_bridge.worker.process_identity", return_value="boot:1"),
             patch.object(updater, "_children", return_value=["ssh", "python"]),
         ):
-            result = updater.busy_snapshot(self.state, broker_pid=456)
-        self.assertIn("live_workers", result["reasons"])
-        self.assertIn("broker_helpers", result["reasons"])
+            drain_result = updater.busy_snapshot(self.state, broker_pid=456, hot=False)
+            hot_result = updater.busy_snapshot(self.state, broker_pid=456, hot=True)
+        self.assertIn("live_workers", drain_result["reasons"])
+        self.assertIn("broker_helpers", drain_result["reasons"])
+        self.assertNotIn("live_workers", hot_result["reasons"])
+        self.assertEqual(["broker_helpers"], hot_result["reasons"])
+
+    def test_incompatible_live_worker_blocks_hot_update_when_min_worker_version_increases(self):
+        store = self.database()
+        with store.connection(write=True) as db:
+            db.execute(
+                "INSERT INTO sessions(id,profile,cwd,access,worker_pid,worker_start,worker_version,created) "
+                "VALUES('old','test',?,'read-only',123,'boot:1',NULL,0)",
+                (str(self.home),),
+            )
+            db.execute(
+                "INSERT INTO sessions(id,profile,cwd,access,worker_pid,worker_start,worker_version,created) "
+                "VALUES('new','test',?,'read-only',124,'boot:2','0.2.9',0)",
+                (str(self.home),),
+            )
+        with patch("agent_bridge.worker.process_identity", side_effect=lambda pid: f"boot:{pid - 122}"):
+            compat_old = updater.busy_snapshot(self.state, min_worker_version="0.2.0")
+            blocked = updater.busy_snapshot(self.state, min_worker_version="0.2.9")
+        self.assertFalse(compat_old["busy"], compat_old)
+        self.assertTrue(blocked["busy"])
+        self.assertEqual(["incompatible_workers"], blocked["reasons"])
+        self.assertEqual(1, blocked["counts"]["incompatible_workers"])
 
     def test_reused_pid_and_ssh_relay_do_not_count_as_workers_or_helper(self):
         store = self.database()
@@ -429,6 +460,91 @@ class ActivationTests(UpdateFixture):
         ):
             self.assertEqual("broker_service_not_migrated", self.updater.run()["reason"])
         stage.assert_not_called()
+
+    def test_candidate_requires_worker_drain_forces_non_hot_activation(self):
+        (self.new / "release.json").write_text(
+            json.dumps({"tag": "v0.2.0", "requires_worker_drain": True, "min_worker_version": "0.2.5"})
+        )
+        seen = {}
+
+        def prepare(*args):
+            if args[1] == "agent_update_prepare":
+                seen["prepare_args"] = args[2]
+                return {"token": "only-in-memory", "expires_at": time.time() + 180}
+            return {"maintenance": False}
+
+        with (
+            patch("agent_bridge.broker.request", new=AsyncMock(side_effect=prepare)),
+            patch.object(updater, "busy_snapshot", return_value={"busy": False}) as snapshot,
+            patch.object(self.updater, "_restart"),
+            patch.object(self.updater, "_healthy", new=AsyncMock()),
+        ):
+            result = asyncio.run(self.updater._activate(self.new, self.digest))
+        self.assertEqual("updated", result["status"])
+        self.assertFalse(result["hot"])
+        self.assertEqual({"hot": False, "min_worker_version": "0.2.5"}, seen["prepare_args"])
+        self.assertFalse(snapshot.call_args.kwargs["hot"])
+        self.assertEqual("0.2.5", snapshot.call_args.kwargs["min_worker_version"])
+
+    def test_non_hot_prepare_falls_back_to_empty_args_on_legacy_broker(self):
+        from agent_bridge.errors import BridgeError
+
+        seen_prepare_args = []
+
+        def prepare(*args):
+            if args[1] == "agent_update_prepare":
+                seen_prepare_args.append(args[2])
+                if args[2]:
+                    raise BridgeError("invalid_request", "unexpected params")
+                return {"token": "only-in-memory", "expires_at": time.time() + 180}
+            return {"maintenance": False}
+
+        with (
+            patch("agent_bridge.broker.request", new=AsyncMock(side_effect=prepare)),
+            patch.object(updater, "busy_snapshot", return_value={"busy": False}),
+            patch.object(self.updater, "_restart"),
+            patch.object(self.updater, "_healthy", new=AsyncMock()),
+        ):
+            result = asyncio.run(self.updater._activate(self.new, self.digest, hot=False))
+        self.assertEqual("updated", result["status"])
+        self.assertEqual([{"hot": False}, {}], seen_prepare_args)
+
+    def test_run_drain_workers_flag_forwards_hot_false(self):
+        with patch.object(updater, "Updater") as mock_cls:
+            mock_cls.return_value.run.return_value = {"status": "up_to_date"}
+            updater.main(["--state", str(self.state), "--drain-workers", "run"])
+        mock_cls.return_value.run.assert_called_once_with(drain_workers=True)
+
+    def test_stage_persists_preflight_compatibility_metadata(self):
+        release = {"tag": "v0.2.0", "wheel": "cli_agent_bridge-0.2.0-py3-none-any.whl", "release_id": 1}
+        generated = {}
+
+        def command(argv, **_):
+            if argv[:3] == ["gh", "release", "download"]:
+                download = Path(argv[argv.index("--dir") + 1])
+                (download / release["wheel"]).write_bytes(b"test-wheel")
+                (download / "SHA256SUMS").write_text(
+                    hashlib.sha256(b"test-wheel").hexdigest() + "  " + release["wheel"] + "\n"
+                )
+            elif argv[:2] == ["uv", "venv"]:
+                generated["target"] = Path(argv[-1])
+                (generated["target"] / "bin").mkdir()
+            elif argv[0] == str(generated["target"] / "bin/python"):
+                skill = generated["target"] / "lib/python/site-packages/agent_bridge/skill"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("packaged skill")
+                return str(skill)
+            return ""
+
+        compat = {"requires_worker_drain": False, "min_worker_version": "0.2.5"}
+        with (
+            patch.object(updater, "_run", side_effect=command),
+            patch.object(self.updater, "preflight", return_value=compat),
+        ):
+            target = self.updater.stage(release)
+        saved = json.loads((target / "release.json").read_text())
+        self.assertFalse(saved["requires_worker_drain"])
+        self.assertEqual("0.2.5", saved["min_worker_version"])
 
     def test_bootstrap_only_stages_without_service_or_current_changes(self):
         with (

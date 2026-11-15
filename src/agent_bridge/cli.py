@@ -7,7 +7,6 @@ import os
 import socket
 import sys
 import uuid
-from pathlib import Path
 
 from .config import Config, state_directory
 from .errors import BridgeError
@@ -25,22 +24,9 @@ class _AsyncStdinReader:
 
 def _relay_release_changed(state):
     """Retire a managed relay between frames when its stable launcher changes release."""
-    if not (state / "update.json").exists():
-        return lambda: False
-    from .updater import load_settings
+    from .updater import release_change_detector
 
-    current = Path(load_settings(state)["root"]) / "current"
-    initial = current.resolve()
-    running = Path(sys.prefix).resolve()
-    expected = running if running.parent == (current.parent / "releases").resolve() else initial
-
-    def changed():
-        try:
-            return current.resolve(strict=True) != expected
-        except OSError:
-            return True
-
-    return changed
+    return release_change_detector(state)
 
 
 class _HostListAction(argparse.Action):

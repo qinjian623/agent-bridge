@@ -66,6 +66,21 @@ _HOST_BLOCKING_CODES = {
 }
 
 
+async def _wait_host_interval(
+    stopping: asyncio.Event, draining: asyncio.Event | None, interval: float, *, paused: bool, keep_going
+) -> None:
+    """Wait across a host loop interval while waking promptly once update draining ends."""
+    deadline = asyncio.get_running_loop().time() + (0.15 if paused else interval)
+    while not stopping.is_set() and keep_going():
+        if paused and (draining is None or not draining.is_set()):
+            return
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stopping.wait(), min(0.5, remaining))
+
+
 class DeliveryScheduler:
     """Two-layer ordered sender for coordinator `peer_outbox` rows (design 3.5).
 
@@ -74,11 +89,12 @@ class DeliveryScheduler:
     later sequence for that target and is never skipped. Network I/O happens outside the CAS transaction.
     """
 
-    def __init__(self, store, peer_factory=None, *, authority_ref=None, config=None):
+    def __init__(self, store, peer_factory=None, *, authority_ref=None, config=None, draining=None):
         self.store = store
         self.peer_factory = peer_factory
         self.authority_ref = authority_ref
         self.config = config
+        self._draining = draining
         self._stopping = asyncio.Event()
 
     def _decode(self, value):
@@ -376,15 +392,17 @@ class DeliveryScheduler:
 
     async def run(self):
         while not self._stopping.is_set():
+            paused = self._draining is not None and self._draining.is_set()
+            if not paused:
+                try:
+                    with update_guard.operation(self.store.state):
+                        await self.step()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
             try:
-                with update_guard.operation(self.store.state):
-                    await self.step()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            try:
-                await asyncio.wait_for(self._stopping.wait(), 0.5)
+                await asyncio.wait_for(self._stopping.wait(), 0.15 if paused else 0.5)
             except TimeoutError:
                 pass
 
@@ -398,11 +416,12 @@ class OutboxPuller:
     `pulled_request_receipts` and acknowledged so it never blocks later requests.
     """
 
-    def __init__(self, store, peer_factory, host_registry=None, config=None):
+    def __init__(self, store, peer_factory, host_registry=None, config=None, draining=None):
         self.store = store
         self.peer_factory = peer_factory
         self.host_registry = host_registry
         self.config = config
+        self._draining = draining
         self._temp_after: dict[str, int] = {}
         self._scan_upper: dict[str, int] = {}
         self._nodes: dict[str, NodeRef] = {}
@@ -648,22 +667,22 @@ class OutboxPuller:
 
     async def _host_loop(self, config):
         while not self._stopping.is_set() and self._host_config(config.host_id) == config:
-            try:
-                with update_guard.operation(self.store.state):
-                    await self.run_once(config.host_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            deadline = asyncio.get_running_loop().time() + config.pull_interval
-            while not self._stopping.is_set() and self._host_config(config.host_id) == config:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
+            paused = self._draining is not None and self._draining.is_set()
+            if not paused:
                 try:
-                    await asyncio.wait_for(self._stopping.wait(), min(0.5, remaining))
-                except TimeoutError:
+                    with update_guard.operation(self.store.state):
+                        await self.run_once(config.host_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
                     pass
+            await _wait_host_interval(
+                self._stopping,
+                self._draining,
+                config.pull_interval,
+                paused=paused,
+                keep_going=lambda: self._host_config(config.host_id) == config,
+            )
 
     async def run(self):
         tasks = {}
@@ -694,13 +713,14 @@ class EventMirror:
     mapped and its parent notification attempted; a transient notification failure is retried on the next poll.
     """
 
-    def __init__(self, store, peer_factory, host_registry=None, config=None, *, host_id="local", interval=2.0):
+    def __init__(self, store, peer_factory, host_registry=None, config=None, *, host_id="local", interval=2.0, draining=None):
         self.store = store
         self.peer_factory = peer_factory
         self.host_registry = host_registry
         self.config = config
         self.host_id = host_id
         self.interval = interval
+        self._draining = draining
         self._nodes: dict[str, NodeRef] = {}
         self._poll_locks: dict[str, asyncio.Lock] = {}
         self._paused: set[str] = set()
@@ -1010,23 +1030,23 @@ class EventMirror:
 
     async def _host_loop(self, config):
         while not self._stopping.is_set() and self._host_config(config.host_id) == config:
-            try:
-                with update_guard.operation(self.store.state):
-                    await self.run_once(config.host_id)
-                self._last_errors.pop(f"poll:{config.host_id}", None)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                self._note_error(f"poll:{config.host_id}", f"{config.host_id} poll", error)
-            deadline = asyncio.get_running_loop().time() + (config.pull_interval or self.interval)
-            while not self._stopping.is_set() and self._host_config(config.host_id) == config:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
+            paused = self._draining is not None and self._draining.is_set()
+            if not paused:
                 try:
-                    await asyncio.wait_for(self._stopping.wait(), min(0.5, remaining))
-                except TimeoutError:
-                    pass
+                    with update_guard.operation(self.store.state):
+                        await self.run_once(config.host_id)
+                    self._last_errors.pop(f"poll:{config.host_id}", None)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    self._note_error(f"poll:{config.host_id}", f"{config.host_id} poll", error)
+            await _wait_host_interval(
+                self._stopping,
+                self._draining,
+                config.pull_interval or self.interval,
+                paused=paused,
+                keep_going=lambda: self._host_config(config.host_id) == config,
+            )
 
     async def run(self):
         tasks = {}
@@ -1079,14 +1099,23 @@ class Broker:
                 token_file.write(secrets.token_urlsafe(32))
             token_path.chmod(0o600)
         self.launching = set()
+        self._native_tasks = set()
         self.stopping = asyncio.Event()
+        self.update_draining = asyncio.Event()
+        self._update_prepare_lock = asyncio.Lock()
         self.request_locks = {}
         self._monitor_collector = None
         self._monitor_lock = asyncio.Lock()
         self._monitor_inflight = None
-        self.delivery_scheduler = DeliveryScheduler(self.store, self.peer_factory, config=self.config)
-        self.outbox_puller = OutboxPuller(self.store, self.peer_factory, self.host_registry, self.config)
-        self.event_mirror = EventMirror(self.store, self.peer_factory, self.host_registry, self.config)
+        self.delivery_scheduler = DeliveryScheduler(
+            self.store, self.peer_factory, config=self.config, draining=self.update_draining
+        )
+        self.outbox_puller = OutboxPuller(
+            self.store, self.peer_factory, self.host_registry, self.config, draining=self.update_draining
+        )
+        self.event_mirror = EventMirror(
+            self.store, self.peer_factory, self.host_registry, self.config, draining=self.update_draining
+        )
         with self.store.connection(write=True) as db:
             db.execute(
                 "UPDATE deliveries SET status='uncertain',error='Broker restarted before queue acknowledgement' WHERE status='sending'"
@@ -1129,9 +1158,25 @@ class Broker:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self.stopping.wait(), seconds)
 
+    async def _sleep_step(self, seconds: float) -> bool:
+        """Sleep up to `seconds`, waking early when draining for update or shutting down."""
+        if self.stopping.is_set() or self.update_draining.is_set():
+            return False
+        waiters = [asyncio.create_task(self.stopping.wait()), asyncio.create_task(self.update_draining.wait())]
+        try:
+            done, _ = await asyncio.wait(waiters, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+            return not bool(done)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+
     async def mirror_backfill(self):
         """Incrementally backfill historical peer mirror origin columns without stalling startup."""
         while not self.stopping.is_set():
+            if self.update_draining.is_set():
+                await self._loop_wait(0.15)
+                continue
             delay = 0.05
             try:
                 updated = await asyncio.to_thread(self.store.migrate_peer_event_mirrors_batch)
@@ -1150,6 +1195,9 @@ class Broker:
         from .notifications import deliver
 
         while not self.stopping.is_set():
+            if self.update_draining.is_set():
+                await self._loop_wait(0.15)
+                continue
             delay = 2
             try:
                 with update_guard.operation(self.state):
@@ -1167,9 +1215,12 @@ class Broker:
             await self._loop_wait(delay)
 
     async def native_notifications(self):
-        running = set()
+        running = self._native_tasks
         try:
             while not self.stopping.is_set():
+                if self.update_draining.is_set():
+                    await self._loop_wait(0.15)
+                    continue
                 delay = 2
                 try:
                     with update_guard.operation(self.state):
@@ -1189,7 +1240,54 @@ class Broker:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
 
+    async def _wait_worker_released(self, session_id: str, timeout: float = 3.0) -> bool:
+        """Wait briefly for an exiting worker to finish releasing its lock and systemd unit."""
+        lock_path = self.state / f"{session_id}.lock"
+        unit = unit_name(self.state, session_id) if self.config.worker_launcher == "systemd" else None
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            lock_busy = False
+            if lock_path.exists():
+                try:
+                    descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                except FileNotFoundError:
+                    descriptor = None
+                except OSError:
+                    descriptor = None
+                    lock_busy = True
+                if descriptor is not None:
+                    try:
+                        try:
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            lock_busy = True
+                    finally:
+                        os.close(descriptor)
+            unit_busy = False
+            if not lock_busy and unit is not None:
+                proc = await asyncio.create_subprocess_exec(
+                    "systemctl", "--user", "show", "-p", "ActiveState", "--value", unit,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+                state = stdout.decode().strip() if proc.returncode == 0 else ""
+                if state in {"active", "activating", "deactivating", "reloading"}:
+                    unit_busy = True
+                elif state == "failed":
+                    reset = await asyncio.create_subprocess_exec(
+                        "systemctl", "--user", "reset-failed", unit,
+                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await reset.communicate()
+            if not lock_busy and not unit_busy:
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
     async def launch(self, session_id):
+        if not await self._wait_worker_released(session_id):
+            raise BridgeError("worker_busy", "Previous worker is still releasing session lock or unit")
         args = [sys.executable, "-m", "agent_bridge.cli", "--state", str(self.state), "worker", session_id]
         if self.config.worker_launcher == "systemd":
             cmd = [
@@ -1253,7 +1351,7 @@ class Broker:
             with update_guard.operation(self.state):
                 await self.launch(session_id)
         except BridgeError as error:
-            if error.code != "update_busy":
+            if error.code not in {"update_busy", "worker_busy"}:
                 self.store.worker_start_failed(session_id, safe_error(error))
         except Exception as error:
             self.store.worker_start_failed(session_id, safe_error(error) or type(error).__name__)
@@ -1264,6 +1362,9 @@ class Broker:
         pending = set()
         try:
             while not self.stopping.is_set():
+                if self.update_draining.is_set():
+                    await self._loop_wait(0.15)
+                    continue
                 delay = 0.15
                 try:
                     with update_guard.operation(self.state):
@@ -1418,13 +1519,14 @@ class Broker:
 
     async def watch_hosts(self):
         while not self.stopping.is_set():
+            if not self.update_draining.is_set():
+                try:
+                    with update_guard.operation(self.state):
+                        await self.reload_hosts()
+                except Exception:
+                    pass  # Keep the last valid registry; agent_hosts exposes the refresh error.
             try:
-                with update_guard.operation(self.state):
-                    await self.reload_hosts()
-            except Exception:
-                pass  # Keep the last valid registry; agent_hosts exposes the refresh error.
-            try:
-                await asyncio.wait_for(self.stopping.wait(), 0.5)
+                await asyncio.wait_for(self.stopping.wait(), 0.15 if self.update_draining.is_set() else 0.5)
             except TimeoutError:
                 pass
 
@@ -2264,8 +2366,8 @@ class Broker:
                     if outbox.get("result") is not None:
                         view["result"] = outbox["result"]
                     if outbox["status"] in {"pending", "pulled"} and asyncio.get_running_loop().time() < deadline:
-                        await asyncio.sleep(0.15)
-                        continue
+                        if await self._sleep_step(0.15):
+                            continue
                     return view
                 raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown operation: {operation_id}")
             params = operation.get("params") if isinstance(operation.get("params"), dict) else {}
@@ -2275,9 +2377,8 @@ class Broker:
                 operation = self.store.get_operation(operation_id)
             if operation["status"] not in {"pending", "running"}:
                 return self._operation_view(operation)
-            if asyncio.get_running_loop().time() >= deadline:
+            if asyncio.get_running_loop().time() >= deadline or not await self._sleep_step(0.15):
                 return self._operation_view(operation)
-            await asyncio.sleep(0.15)
 
     async def call(self, method, args):
         if method == "agent_hosts_reload":
@@ -2639,7 +2740,12 @@ class Broker:
             return await self._cancel(args)
         if method in {"agent_inspect", "agent_result"}:
             if not args.get("task_id") and not args.get("session_id"):
-                await asyncio.to_thread(self.store.refresh_parent_usage)
+                try:
+                    maint = update_guard.maintenance(self.state) is not None
+                except BridgeError:
+                    maint = True
+                if not self.update_draining.is_set() and not maint:
+                    await asyncio.to_thread(self.store.refresh_parent_usage)
             if args.get("parent_id"):
                 from .notifications import send
 
@@ -2691,14 +2797,85 @@ class Broker:
             deadline = asyncio.get_running_loop().time() + min(max(float(args.get("timeout", 20)), 0), 50)
             while True:
                 events = self.store.events(args.get("after", 0), args.get("session_id"), args.get("task_id"))
-                if events or asyncio.get_running_loop().time() >= deadline:
+                if events or asyncio.get_running_loop().time() >= deadline or not await self._sleep_step(0.15):
+                    if not events and (self.stopping.is_set() or self.update_draining.is_set()):
+                        events = self.store.events(args.get("after", 0), args.get("session_id"), args.get("task_id"))
                     return {
                         "events": events,
                         "cursor": events[-1]["seq"] if events else args.get("after", 0),
                         "timed_out": not bool(events),
                     }
-                await asyncio.sleep(0.15)
         raise BridgeError("unknown_method", method)
+
+    async def prepare_update(self, *, hot: bool = True, drain_timeout: float = 15.0, min_worker_version: str | None = None):
+        """Drain short in-flight broker work and acquire the update maintenance lease."""
+        from .updater import _parse_version, busy_snapshot
+
+        if type(hot) is not bool:
+            raise BridgeError("invalid_request", "hot must be a boolean")
+        if (
+            isinstance(drain_timeout, bool)
+            or not isinstance(drain_timeout, (int, float))
+            or not math.isfinite(drain_timeout)
+            or not 0 <= drain_timeout <= 60
+        ):
+            raise BridgeError("invalid_request", "drain_timeout must be between 0 and 60 seconds")
+        if min_worker_version is not None:
+            try:
+                _parse_version(min_worker_version)
+            except ValueError as error:
+                raise BridgeError("invalid_request", "min_worker_version must use X.Y.Z format") from error
+        if self.stopping.is_set():
+            raise BridgeError("update_busy", "Broker is shutting down")
+        async with self._update_prepare_lock:
+            if self.stopping.is_set():
+                raise BridgeError("update_busy", "Broker is shutting down")
+            self.update_draining.set()
+            await asyncio.sleep(0)
+            deadline = asyncio.get_running_loop().time() + float(drain_timeout)
+            acquired = False
+            try:
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if self._native_tasks:
+                        if remaining <= 0 or self.stopping.is_set():
+                            raise BridgeError("update_busy", "Native broadcast deliveries are still in flight")
+                        await asyncio.sleep(min(0.05, remaining))
+                        continue
+                    snapshots = []
+
+                    def capture_snapshot(state_dir, snapshots=snapshots):
+                        snap = busy_snapshot(
+                            state_dir,
+                            broker_pid=os.getpid(),
+                            hot=hot,
+                            min_worker_version=min_worker_version,
+                        )
+                        snapshots.append(snap)
+                        return snap
+
+                    try:
+                        lease = await asyncio.to_thread(update_guard.prepare, self.state, capture_snapshot)
+                        acquired = True
+                        return {**lease, "broker_pid": os.getpid(), "hot": hot}
+                    except BridgeError as error:
+                        if error.code != "update_busy" or self.stopping.is_set():
+                            raise
+                        if not snapshots and "Another update already holds maintenance" in str(error):
+                            raise
+                        if snapshots:
+                            non_drainable = {"update_state_unknown", "incompatible_workers"}
+                            if not hot:
+                                non_drainable.update({"open_queued_tasks", "active_tasks", "live_workers"})
+                            if any(reason in non_drainable for reason in snapshots[-1]["reasons"]):
+                                raise
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise
+                        await asyncio.sleep(min(0.05, remaining))
+            finally:
+                if not acquired:
+                    self.update_draining.clear()
 
     async def api_call(self, method, args):
         if method == "agent_update_status":
@@ -2707,17 +2884,26 @@ class Broker:
             return {"result": {"version": __version__, "pid": os.getpid(),
                                "maintenance": update_guard.maintenance(self.state) is not None}}
         if method == "agent_update_prepare":
-            if args:
-                raise BridgeError("invalid_request", "agent_update_prepare accepts no parameters")
-            from .updater import busy_snapshot
-
-            lease = update_guard.prepare(self.state, lambda state: busy_snapshot(state, broker_pid=os.getpid()))
-            return {"result": {**lease, "broker_pid": os.getpid()}}
+            if not isinstance(args, dict) or not set(args).issubset({"hot", "drain_timeout", "min_worker_version"}):
+                raise BridgeError(
+                    "invalid_request",
+                    "agent_update_prepare accepts only hot, drain_timeout, and min_worker_version",
+                )
+            lease = await self.prepare_update(
+                hot=args.get("hot", True),
+                drain_timeout=args.get("drain_timeout", 15.0),
+                min_worker_version=args.get("min_worker_version"),
+            )
+            return {"result": lease}
         if method == "agent_update_finish":
             if set(args) != {"token"}:
                 raise BridgeError("invalid_request", "agent_update_finish requires only token")
-            return {"result": update_guard.finish(self.state, args["token"])}
-        readonly = method in {"agent_hosts", "agent_monitor", "agent_capabilities"} or method == "agent_inspect" and not args.get("parent_id")
+            result = update_guard.finish(self.state, args["token"])
+            self.update_draining.clear()
+            return {"result": result}
+        readonly = _is_readonly_api_call(method, args)
+        if self.update_draining.is_set() and not readonly:
+            raise BridgeError("update_busy", "Bridge update is preparing; retry after maintenance")
         with update_guard.operation(self.state, readonly=readonly):
             return await self._api_call(method, args)
 
@@ -2865,14 +3051,68 @@ class Broker:
                 lock.close()
 
 
-async def request(state: Path, method, params):
-    if os.environ.get("AGENT_BRIDGE_ROLE") == "child":
-        raise BridgeError("forbidden", "Child runtimes may not administer parent or sibling sessions")
+_READONLY_RPC_METHODS = frozenset({
+    "agent_hosts",
+    "agent_monitor",
+    "agent_capabilities",
+    "agent_groups",
+    "agent_broadcast_status",
+    "agent_group_inbox",
+    "agent_operation",
+    "agent_inspect",
+    "agent_result",
+    "agent_wait",
+    "agent_catalog",
+})
+
+
+def _is_readonly_api_call(method: str, args) -> bool:
+    """Return True when an incoming API call performs no side effects and can run during drain."""
+    params = args if isinstance(args, dict) else {}
+    if method in {"agent_hosts", "agent_monitor", "agent_capabilities", "agent_groups", "agent_group_inbox", "agent_result"}:
+        return True
+    if method == "agent_inspect":
+        return not params.get("parent_id")
+    if method in {"agent_broadcast_status", "agent_catalog"}:
+        return not params.get("refresh", False)
+    if method == "agent_operation":
+        return params.get("wait") in (None, 0, 0.0)
+    if method == "agent_wait":
+        return params.get("timeout") in (0, 0.0)
+    return False
+
+
+def _update_in_progress(state: Path) -> bool:
+    """Return True while maintenance mode or release activation is active for `state`."""
+    try:
+        if update_guard.maintenance(state) is not None:
+            return True
+    except BridgeError:
+        pass
+    status_path = state / "update-status.json"
+    try:
+        if status_path.exists():
+            payload = json.loads(status_path.read_text())
+            checked_at = payload.get("checked_at")
+            if (
+                payload.get("status") == "activating"
+                and isinstance(checked_at, (int, float))
+                and not isinstance(checked_at, bool)
+                and -30 <= time.time() - float(checked_at) <= 180
+            ):
+                return True
+    except (OSError, ValueError, TypeError):
+        pass
+    return False
+
+
+async def _single_request(state: Path, method, params):
+    """Execute one request against the local broker socket without update retries."""
     reader, writer = await asyncio.open_unix_connection(str(state / "broker.sock"), limit=16 * 1024 * 1024)
     try:
         token = os.environ.get("AGENT_BRIDGE_TOKEN") or read_admin_token(state)
-        params = {key: value for key, value in params.items() if key != "state"}
-        writer.write((json.dumps({"version": 1, "token": token, "method": method, "params": params}) + "\n").encode())
+        clean_params = {key: value for key, value in params.items() if key != "state"}
+        writer.write((json.dumps({"version": 1, "token": token, "method": method, "params": clean_params}) + "\n").encode())
         await writer.drain()
         reply = json.loads(await asyncio.wait_for(reader.readline(), 65))
         if "error" in reply:
@@ -2881,3 +3121,37 @@ async def request(state: Path, method, params):
     finally:
         writer.close()
         await writer.wait_closed()
+
+
+async def request(state: Path, method, params, *, retry_timeout: float = 10.0):
+    """Send a local broker request, retrying transparently across hot-update restarts."""
+    if os.environ.get("AGENT_BRIDGE_ROLE") == "child":
+        raise BridgeError("forbidden", "Child runtimes may not administer parent or sibling sessions")
+    is_update_rpc = method.startswith("agent_update_")
+    retry_on_eof = (
+        not is_update_rpc
+        and (method in _READONLY_RPC_METHODS or isinstance(params, dict) and bool(params.get("request_id")))
+    )
+    deadline = asyncio.get_running_loop().time() + retry_timeout
+    while True:
+        try:
+            return await _single_request(state, method, params)
+        except (
+            FileNotFoundError,
+            ConnectionRefusedError,
+            ConnectionResetError,
+            BrokenPipeError,
+            EOFError,
+            json.JSONDecodeError,
+            BridgeError,
+        ) as error:
+            if isinstance(error, BridgeError):
+                retryable = error.code == "update_busy" and not is_update_rpc
+            elif isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
+                retryable = not is_update_rpc and _update_in_progress(state)
+            else:
+                retryable = retry_on_eof and _update_in_progress(state)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if not retryable or remaining <= 0:
+                raise
+            await asyncio.sleep(min(0.15, remaining))
