@@ -116,6 +116,28 @@ def build_parser():
     group_prune.add_argument(
         "--dry-run", action="store_true", help="Only report eligible and blocked groups; do not delete",
     )
+    mirrors = commands.add_parser("mirrors", help="Inspect and prune duplicated peer event mirror history")
+    mirrors_commands = mirrors.add_subparsers(dest="mirrors_command", required=True)
+    mirrors_prune = mirrors_commands.add_parser(
+        "prune", help="Deduplicate mirrored peer events while keeping deliveries, notifications, and cursors intact",
+    )
+    mirrors_prune.add_argument(
+        "--dry-run", action="store_true", help="Report mirror duplication and reclaimable space without modifying the database",
+    )
+    mirrors_prune.add_argument(
+        "--vacuum", action="store_true", help="Run SQLite VACUUM after pruning (requires the broker and workers to be stopped)",
+    )
+    mirrors_prune.add_argument(
+        "--keep-self-origins", action="store_true",
+        help="Keep one canonical copy of self-origin mirrored echoes instead of removing unreferenced echoes",
+    )
+    mirrors_prune.add_argument(
+        "--no-repair-origins", action="store_true",
+        help="Skip re-unwrapping stored origin metadata on existing mirror rows",
+    )
+    mirrors_prune.add_argument(
+        "--batch-size", type=int, default=500, help="Maximum rows processed per read/delete batch (default: 500)",
+    )
     name_cmd = commands.add_parser("name", help="Set human-friendly alias name for a session")
     name_cmd.add_argument("session_id", help="Session ID (prefix or full UUID)")
     name_cmd.add_argument("name", help="Human-readable alias name")
@@ -131,7 +153,19 @@ def main(argv: list[str] | None = None):
     args = parser.parse_args(argv)
     try:
         state = state_directory(args.state)
-        if args.command == "init":
+        if args.command == "mirrors":
+            if args.mirrors_command == "prune":
+                from .store import Store
+
+                result = Store(state).prune_duplicate_mirrors(
+                    dry_run=args.dry_run,
+                    batch_size=args.batch_size,
+                    prune_self_origins=not args.keep_self_origins,
+                    repair_origins=not args.no_repair_origins,
+                    vacuum=args.vacuum,
+                )
+                print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif args.command == "init":
             template = {
                 "profiles": {
                     "codex-sol": {

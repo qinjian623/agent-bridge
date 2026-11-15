@@ -443,8 +443,8 @@ class Store:
         self.path.chmod(0o600)
 
     @classmethod
-    def _origin_mirror_values(cls, row):
-        if row["origin_node_id"] is None:
+    def _origin_mirror_values(cls, row, *, force: bool = False):
+        if force or row["origin_node_id"] is None:
             data = cls._decode_json(row["data"])
             if isinstance(data, dict):
                 synthetic = {
@@ -2560,6 +2560,29 @@ class Store:
         with self.connection() as connection:
             row = connection.execute(query, (origin_node_id, origin_state_generation, origin_seq)).fetchone()
         return None if row is None else dict(row)
+
+    def prune_duplicate_mirrors(
+        self,
+        *,
+        dry_run: bool = True,
+        batch_size: int = 500,
+        prune_self_origins: bool = True,
+        repair_origins: bool = True,
+        vacuum: bool = False,
+        local_node_id: str | None = None,
+    ) -> dict:
+        """Inspect or prune duplicate peer event mirrors while keeping notifications, deliveries, and cursors intact."""
+        from .mirror_prune import prune_duplicate_mirrors
+
+        return prune_duplicate_mirrors(
+            self,
+            dry_run=dry_run,
+            batch_size=batch_size,
+            prune_self_origins=prune_self_origins,
+            repair_origins=repair_origins,
+            vacuum=vacuum,
+            local_node_id=local_node_id,
+        )
 
     @classmethod
     def _pulled_receipt(cls, row):
