@@ -384,6 +384,8 @@ class Store:
                 db.execute("ALTER TABLE sessions ADD COLUMN process_scope TEXT")
             if "worker_task_timeout" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
                 db.execute("ALTER TABLE sessions ADD COLUMN worker_task_timeout INTEGER NOT NULL DEFAULT 0")
+            if "worker_version" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
+                db.execute("ALTER TABLE sessions ADD COLUMN worker_version TEXT")
             if "resume_config_file" not in {row[1] for row in db.execute("PRAGMA table_info(parents)")}:
                 db.execute("ALTER TABLE parents ADD COLUMN resume_config_file TEXT")
             if "first_output" not in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}:
@@ -434,12 +436,13 @@ class Store:
             self._migrate_node_outbox(db)
             self._migrate_peer_inbox(db)
             self._migrate_native_send_queue(db)
-            self._migrate_peer_event_mirrors(db)
+            self._migrate_peer_event_mirrors_columns(db)
             self._migrate_workspace_tables(db)
             if "request_id" not in {row[1] for row in db.execute("PRAGMA table_info(peer_operations)")}:
                 db.execute("ALTER TABLE peer_operations ADD COLUMN request_id TEXT")
             db.execute("CREATE INDEX IF NOT EXISTS peer_operations_request ON peer_operations(request_id)")
             self._initialize_commit_log(db)
+        self._finish_peer_event_mirrors_migration()
         self.path.chmod(0o600)
 
     @classmethod
@@ -509,8 +512,8 @@ class Store:
         with self.connection(write=True) as db:
             return self._migrate_peer_event_mirrors_batch(db, limit=limit)
 
-    @classmethod
-    def _migrate_peer_event_mirrors(cls, db, limit: int | None = None):
+    @staticmethod
+    def _migrate_peer_event_mirrors_columns(db):
         columns = {row[1] for row in db.execute("PRAGMA table_info(peer_event_mirrors)")}
         additions = (
             ("origin_node_id", "TEXT"),
@@ -521,6 +524,53 @@ class Store:
         for name, sql_type in additions:
             if name not in columns:
                 db.execute(f"ALTER TABLE peer_event_mirrors ADD COLUMN {name} {sql_type}")
+
+    def _finish_peer_event_mirrors_migration(self, limit: int | None = None):
+        """Ensure peer mirror indexes and bounded startup backfill run in separate short transactions."""
+        indexes = {
+            "peer_event_mirrors_origin": (
+                "CREATE INDEX IF NOT EXISTS peer_event_mirrors_origin "
+                "ON peer_event_mirrors(origin_node_id,origin_state_generation,origin_seq)"
+            ),
+            "peer_event_mirrors_missing_origin": (
+                "CREATE INDEX IF NOT EXISTS peer_event_mirrors_missing_origin "
+                "ON peer_event_mirrors(local_seq DESC) "
+                "WHERE origin_node_id IS NULL OR ("
+                "origin_fingerprint IS NULL AND origin_node_id=node_id "
+                "AND origin_state_generation=state_generation AND origin_seq=remote_seq)"
+            ),
+        }
+        with self.connection() as db:
+            existing = {
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='peer_event_mirrors'"
+                )
+            }
+            has_pending = (
+                db.execute(
+                    "SELECT 1 FROM peer_event_mirrors WHERE origin_node_id IS NULL OR ("
+                    "origin_fingerprint IS NULL AND origin_node_id=node_id "
+                    "AND origin_state_generation=state_generation AND origin_seq=remote_seq) LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+        for name, ddl in indexes.items():
+            if name not in existing:
+                with self.connection(write=True, timeout=30) as db:
+                    db.execute(ddl)
+        if not has_pending:
+            return
+        remaining = self.PEER_MIRROR_MIGRATION_BATCH if limit is None else limit
+        while remaining > 0:
+            moved = self.migrate_peer_event_mirrors_batch(limit=min(50, remaining))
+            if not moved:
+                break
+            remaining -= moved
+
+    @classmethod
+    def _migrate_peer_event_mirrors(cls, db, limit: int | None = None):
+        cls._migrate_peer_event_mirrors_columns(db)
         db.execute(
             "CREATE INDEX IF NOT EXISTS peer_event_mirrors_origin "
             "ON peer_event_mirrors(origin_node_id,origin_state_generation,origin_seq)"
@@ -1278,18 +1328,18 @@ class Store:
                 db, request_id, fingerprint, {"task_id": task_id, "status": resolution, "revision": revision + 1}
             )
 
-    def worker_starting(self, session_id, generation, pid, start, process_scope=None):
+    def worker_starting(self, session_id, generation, pid, start, process_scope=None, *, worker_version=None):
         with self.connection(write=True) as db:
             session = self.required(db, "sessions", session_id)
             if session["desired"] != "open" or session["observed"] not in {"stopped", "starting"}:
                 return False
             db.execute(
-                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,process_scope=?,worker_task_timeout=0,observed='starting' WHERE id=?",
-                (generation, pid, start, process_scope, session_id),
+                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,process_scope=?,worker_task_timeout=0,worker_version=?,observed='starting' WHERE id=?",
+                (generation, pid, start, process_scope, worker_version, session_id),
             )
             return True
 
-    def worker_ready(self, session_id, generation, pid, start, native_id, *, task_timeout_supported=False):
+    def worker_ready(self, session_id, generation, pid, start, native_id, *, task_timeout_supported=False, worker_version=None):
         with self.connection(write=True) as db:
             session = self.required(db, "sessions", session_id)
             if session["generation"] not in {None, generation}:
@@ -1297,8 +1347,8 @@ class Store:
             if session["native_id"] and session["native_id"] != native_id:
                 raise BridgeError("session_mismatch", "Native session identity changed")
             db.execute(
-                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,native_id=?,worker_task_timeout=?,observed='idle',error=NULL WHERE id=?",
-                (generation, pid, start, native_id, int(task_timeout_supported), session_id),
+                "UPDATE sessions SET generation=?,worker_pid=?,worker_start=?,native_id=?,worker_task_timeout=?,worker_version=COALESCE(?,worker_version),observed='idle',error=NULL WHERE id=?",
+                (generation, pid, start, native_id, int(task_timeout_supported), worker_version, session_id),
             )
             self.event(db, "worker_ready", {}, session_id)
 
@@ -1428,7 +1478,7 @@ class Store:
             if observed == "recovery_needed" and session["observed"] != "recovery_needed":
                 self.notify_queued_failure(db, session, error or "Worker disappeared during execution")
             db.execute(
-                "UPDATE sessions SET observed=?,worker_pid=NULL,worker_task_timeout=0,error=?,desired=CASE WHEN desired='draining' THEN 'paused' ELSE desired END WHERE id=?",
+                "UPDATE sessions SET observed=?,worker_pid=NULL,worker_task_timeout=0,worker_version=NULL,error=?,desired=CASE WHEN desired='draining' THEN 'paused' ELSE desired END WHERE id=?",
                 (observed, error, session_id),
             )
             self.event(db, "worker_stopped", {"observed": observed, "error": error}, session_id)
