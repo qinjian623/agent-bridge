@@ -57,3 +57,24 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(result, self.store.quota_resume("shared", 0, "resume", "provider available"))
         self.assertIsNotNone(self.store.claim(self.config))
         self.assertIsNone(provider_limit("invalid model name"))
+
+    def test_provider_limit_avoids_bare_429_false_positives_and_keeps_structured_matches(self):
+        for benign in (
+            "SyntaxError at foo.py:429",
+            "request-429-timeout after 5s",
+            {"line": 429, "error": "unexpected token"},
+            "exit code 429 during build",
+        ):
+            with self.subTest(benign=benign):
+                self.assertIsNone(provider_limit(benign))
+
+        for positive in (
+            {"status": 429},
+            {"status_code": "429"},
+            {"error": {"code": 429}},
+            "HTTP/1.1 429 Too Many Requests",
+            "status=429 rate limit exceeded",
+            "429 Too Many Requests",
+        ):
+            with self.subTest(positive=positive):
+                self.assertIsNotNone(provider_limit(positive))

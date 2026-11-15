@@ -381,6 +381,100 @@ class EventMirrorTests(MirrorTestCase):
             self.assertEqual(2, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
             self.assertEqual(2, db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
 
+    async def test_wrapped_parent_route_resolves_by_node_when_host_alias_differs(self):
+        parent_ref = self.local_parent()
+        self.store.register_parent_route(HOST_A, NODE_A, GEN_A, "remote-task", parent_ref)
+        origin = event(host_id="alias-on-relay", node_id=NODE_A, generation=GEN_A, seq=18, local_id="remote-task")
+        wrapped = {
+            "seq": 5,
+            "type": origin["type"],
+            "ref": {"host_id": HOST_B, "node_id": NODE_B, "state_generation": GEN_B, "local_id": "relay-task"},
+            "payload": {
+                "source": origin["ref"],
+                "remote_seq": origin["seq"],
+                "type": origin["type"],
+                "payload": origin["payload"],
+                "created": origin["created"],
+            },
+            "created": 200.0,
+        }
+        client = FakeClient({"node_id": NODE_B, "state_generation": GEN_B}, [{"items": [wrapped], "cursor": 5, "has_more": False}])
+        mirror = self.mirror({HOST_B: client})
+
+        processed = await mirror.run_once(HOST_B)
+
+        self.assertEqual(1, processed)
+        with self.store.connection() as db:
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM mirrored_parent_notifications").fetchone()[0])
+
+    async def test_rotate_generation_ignores_own_previous_generation_events(self):
+        old_gen_event = event(host_id=HOST_A, node_id=self.local_node.node_id, generation="old-gen", seq=4)
+        client = FakeClient(
+            {"node_id": self.local_node.node_id, "state_generation": "old-gen"},
+            [{"items": [old_gen_event], "cursor": 4, "has_more": False}],
+        )
+        mirror = self.mirror({HOST_A: client})
+
+        processed = await mirror.run_once(HOST_A)
+
+        self.assertEqual(1, processed)
+        self.assertEqual(4, self.store.get_peer_event_cursor(HOST_A, self.local_node.node_id, "old-gen"))
+        with self.store.connection() as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
+
+    async def test_corrupt_wrapped_relay_before_direct_origin_pauses_relay_not_origin(self):
+        origin_tampered = event(payload={"status": "tampered"})
+        wrapped_bad = {
+            "seq": 9,
+            "type": origin_tampered["type"],
+            "ref": {"host_id": HOST_B, "node_id": NODE_B, "state_generation": GEN_B, "local_id": "relay-task"},
+            "payload": {
+                "source": origin_tampered["ref"],
+                "remote_seq": origin_tampered["seq"],
+                "type": origin_tampered["type"],
+                "payload": origin_tampered["payload"],
+                "created": origin_tampered["created"],
+            },
+            "created": 201.0,
+        }
+        direct_good = event(payload={"status": "completed"})
+        mirror = self.mirror({
+            HOST_B: FakeClient({"node_id": NODE_B, "state_generation": GEN_B}, [{"items": [wrapped_bad], "cursor": 9, "has_more": False}]),
+            HOST_A: FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [{"items": [direct_good], "cursor": 18, "has_more": False}]),
+        })
+
+        self.assertEqual(1, await mirror.run_once(HOST_B))
+        self.assertEqual(1, await mirror.run_once(HOST_A))
+
+        self.assertIn(HOST_B, mirror._paused)
+        self.assertNotIn(HOST_A, mirror._paused)
+        self.assertEqual(0, await mirror.run_once(HOST_B))
+        with self.store.connection() as db:
+            conflict = db.execute("SELECT data FROM events WHERE kind='peer_event_conflict'").fetchone()
+            self.assertIsNotNone(conflict)
+            direct_mirror = self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, 18)
+            self.assertIsNotNone(direct_mirror)
+            self.assertEqual(fingerprint(direct_good), direct_mirror["origin_fingerprint"])
+
+    async def test_migration_backfills_non_wrapped_origin_fingerprint(self):
+        with self.store.connection(write=True) as db:
+            local_seq = self.store.event(db, "task.completed", {"summary": "done"})
+            self.store.mirror_peer_event(
+                HOST_A, NODE_A, GEN_A, 18, "legacy-fp-1", local_seq,
+                origin_node_id=NODE_A, origin_state_generation=GEN_A, origin_seq=18, origin_fingerprint=None, db=db,
+            )
+            db.execute(
+                "UPDATE peer_event_mirrors SET origin_fingerprint=NULL WHERE host_id=? AND remote_seq=?",
+                (HOST_A, 18),
+            )
+
+        reopened = Store(self.root)
+        mirrored = reopened.get_mirrored_event(HOST_A, NODE_A, GEN_A, 18)
+        self.assertIsNotNone(mirrored)
+        self.assertEqual("legacy-fp-1", mirrored["origin_fingerprint"])
+
 
 class NotifyParentHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -523,6 +617,44 @@ class NotifyParentHandlerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+
+    async def test_wrapped_notify_parent_replays_operation_id_and_rejects_content_mismatch(self):
+        origin = event(host_id=HOST_A, node_id=NODE_A, generation=GEN_A, seq=18)
+        wrapped = {
+            "seq": 5,
+            "type": origin["type"],
+            "ref": {"host_id": HOST_B, "node_id": NODE_B, "state_generation": GEN_B, "local_id": "relay-task"},
+            "payload": {
+                "source": origin["ref"],
+                "remote_seq": origin["seq"],
+                "type": origin["type"],
+                "payload": origin["payload"],
+                "created": origin["created"],
+            },
+            "created": 200.0,
+        }
+        req = {"v": 1, "id": "w-1", "method": "peer.notify_parent", "params": self.params(
+            operation=self.operation("notify-wrapped"),
+            event=wrapped,
+        )}
+        first = await self.service.handle(req)
+        self.assertTrue(first["ok"], first)
+        self.assertFalse(first["result"]["duplicate"])
+
+        replay = await self.service.handle({**req, "id": "w-2"})
+        self.assertTrue(replay["ok"], replay)
+        self.assertTrue(replay["result"]["duplicate"])
+        self.assertEqual(first["result"]["mirror_seq"], replay["result"]["mirror_seq"])
+
+        tampered = {**wrapped, "payload": {**wrapped["payload"], "payload": {"status": "tampered"}}}
+        conflict = await self.service.handle(
+            {"v": 1, "id": "w-3", "method": "peer.notify_parent", "params": self.params(
+                operation=self.operation("notify-wrapped"),
+                event=tampered,
+            )}
+        )
+        self.assertFalse(conflict["ok"])
+        self.assertEqual(PeerErrorCode.OPERATION_CONFLICT, conflict["error"]["code"])
 
 
 if __name__ == "__main__":

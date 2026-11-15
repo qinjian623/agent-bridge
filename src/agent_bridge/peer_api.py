@@ -303,7 +303,7 @@ class DirectPeerService:
             elif spec.name == "peer.ack_request":
                 result = self._ack_request(params)
             elif spec.name == "peer.deliver":
-                result = self._deliver(params)
+                result = await self._deliver(params)
             elif spec.name == "peer.lookup_delivery":
                 result = await self._lookup_delivery(params)
             elif spec.name == "peer.cancel":
@@ -620,8 +620,30 @@ class DirectPeerService:
             )
             existing = db.execute(query + "WHERE m.operation_id=?", (operation["operation_id"],)).fetchone()
             if existing is not None:
-                source = self._notification_source(Store._decode_json(existing["event_data"]))
-                if existing["parent_ref"] != encoded_parent or source != (event["ref"], event["seq"]):
+                event_data = Store._decode_json(existing["event_data"])
+                source = self._notification_source(event_data)
+                receipt = Store._decode_json(existing["receipt"])
+                matches_source = source in (
+                    (event["ref"], event["seq"]),
+                    (origin_ref, origin_event["seq"]),
+                )
+                matches_event = isinstance(event_data, dict) and (
+                    "payload" not in event_data
+                    or (
+                        event_data.get("type") == origin_event["type"]
+                        and event_data.get("payload") == origin_event["payload"]
+                        and event_data.get("created") == origin_event["created"]
+                    )
+                )
+                matches_receipt = not (
+                    isinstance(receipt, dict)
+                    and "event" in receipt
+                    and (
+                        receipt["event"] != {"ref": event["ref"], "seq": event["seq"], "type": event["type"]}
+                        or receipt.get("result") != normalized.get("result")
+                    )
+                )
+                if existing["parent_ref"] != encoded_parent or not matches_source or not matches_event or not matches_receipt:
                     raise peer_error(
                         PeerErrorCode.OPERATION_CONFLICT,
                         "operation_id was already used for a different parent notification",
@@ -629,10 +651,20 @@ class DirectPeerService:
                 return {"mirror_seq": existing["local_seq"], "duplicate": True}
 
             for row in db.execute(query + "WHERE m.parent_ref=?", (encoded_parent,)).fetchall():
-                if self._notification_source(Store._decode_json(row["event_data"])) in (
+                row_data = Store._decode_json(row["event_data"])
+                if self._notification_source(row_data) in (
                     (event["ref"], event["seq"]),
                     (origin_ref, origin_event["seq"]),
                 ):
+                    if isinstance(row_data, dict) and "payload" in row_data and (
+                        row_data.get("type") != origin_event["type"]
+                        or row_data.get("payload") != origin_event["payload"]
+                        or row_data.get("created") != origin_event["created"]
+                    ):
+                        raise peer_error(
+                            PeerErrorCode.OPERATION_CONFLICT,
+                            "remote event was mirrored with different content",
+                        )
                     return {"mirror_seq": row["local_seq"], "duplicate": True}
 
             mirrored = db.execute(
@@ -1409,20 +1441,33 @@ class DirectPeerService:
                 })
         return compute_input_digest(entries)
 
-    def _profile_from_open(self, spec: dict[str, Any]) -> Profile:
+    async def _profile_from_open(self, spec: dict[str, Any]) -> Profile:
         raw = spec.get("profile")
+        model = spec.get("model")
+        if model is not None and (not isinstance(model, str) or not model):
+            raise BridgeError("invalid_catalog", "Model directory returned an invalid exact model ID")
         if isinstance(raw, dict):
             data = dict(raw)
             name = data.pop("name", None) or data.pop("profile", None)
             if not isinstance(name, str) or not name:
                 raise peer_error(PeerErrorCode.INVALID_PARAMS, "open.profile requires a profile name")
-            return Profile(name=name, **data).validate()
-        if isinstance(raw, str) and raw:
+            profile = Profile(name=name, **data).validate()
+        elif isinstance(raw, str) and raw:
             profiles = getattr(self._config, "profiles", None) if self._config is not None else None
             if isinstance(profiles, dict) and raw in profiles:
-                return profiles[raw]
-            raise BridgeError("unknown_profile", raw)
-        raise peer_error(PeerErrorCode.INVALID_PARAMS, "A bridge delivery without a session_id requires open.profile")
+                profile = profiles[raw]
+            else:
+                raise BridgeError("unknown_profile", raw)
+        else:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "A bridge delivery without a session_id requires open.profile")
+        if model is not None and model != profile.model:
+            if self._models is None:
+                raise BridgeError(
+                    "discovery_unavailable",
+                    "Cannot select a new model until its directory refresh succeeds",
+                )
+            profile = await self._models.resolve(profile, model)
+        return profile
 
     def _workspace_ref_metadata(self, db: Any, value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         if not isinstance(value, dict):
@@ -1470,7 +1515,7 @@ class DirectPeerService:
         }
         return transfer, metadata
 
-    def _deliver(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def _deliver(self, params: dict[str, Any]) -> dict[str, Any]:
         store = self._require_store(self._store)
         operation = self._operation_key(params)
         identity = self._ready_identity()
@@ -1531,6 +1576,23 @@ class DirectPeerService:
                 raise peer_error(PeerErrorCode.INVALID_PARAMS, "ordered delivery requires authority_ref")
 
         fingerprint = self._fingerprint("peer.deliver", params)
+        existing_operation = store.get_operation(operation["operation_id"])
+        if existing_operation is not None:
+            if existing_operation["fingerprint"] != fingerprint:
+                raise peer_error(
+                    PeerErrorCode.OPERATION_CONFLICT,
+                    "operation_id was already used with different delivery parameters",
+                )
+            return self._operation_outcome(existing_operation)
+        opened_profile: Profile | None = None
+        if seq_kind != "tombstone" and kind == "bridge" and not target_id:
+            open_spec = params.get("open")
+            if not isinstance(open_spec, dict):
+                raise peer_error(
+                    PeerErrorCode.INVALID_PARAMS,
+                    "A bridge delivery without a session_id requires open parameters (ADR-13)",
+                )
+            opened_profile = await self._profile_from_open(open_spec)
         accepted_at = time.time()
         with store.connection(write=True) as db:
             row = db.execute(
@@ -1649,7 +1711,7 @@ class DirectPeerService:
                             PeerErrorCode.INVALID_PARAMS,
                             "A bridge delivery without a session_id requires open parameters (ADR-13)",
                         )
-                    profile = self._profile_from_open(open_spec)
+                    profile = opened_profile or await self._profile_from_open(open_spec)
                     project_id = open_spec.get("project_id")
                     projects = getattr(self._config, "projects", {}) if self._config else {}
                     if project_id and projects:

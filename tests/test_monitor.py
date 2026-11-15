@@ -824,6 +824,77 @@ class MonitorTests(unittest.TestCase):
         finally:
             broker.close()
 
+    def test_metrics_exclude_duplicate_local_host_and_sessions_stay_local(self) -> None:
+        from types import SimpleNamespace
+
+        store = Store(self.state)
+        now = time.time()
+        with store.connection(write=True) as db:
+            db.execute(
+                "INSERT INTO sessions(id,profile,cwd,access,desired,observed,revision,created) VALUES(?,?,?,?,?,?,?,?)",
+                ("sess-local-1", "claude-sonnet", str(self.state), "read-only", "open", "idle", 1, now),
+            )
+            db.execute(
+                "INSERT INTO target_streams(stream_id,authority_ref,target_ref) VALUES(?,?,?)",
+                ("s-1", "{}", "{}"),
+            )
+            db.execute(
+                "INSERT INTO peer_outbox(delivery_id,stream_id,target_seq,host_id,node_id,state_generation,"
+                "target_kind,runtime,target_id,operation_id,payload,fingerprint,seq_kind,status,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("d-1", "s-1", 1, "gpu-1", "node-1", "gen-1", "bridge", "", "sess-local-1", "op-1", "{}", "fp-1", "message", "pending", now, now),
+            )
+
+        class _FakeRegistry:
+            def status(self):
+                return [
+                    SimpleNamespace(
+                        host_id="local", state="online", node=None, last_contact=now, protocol_version=1, detail=None
+                    ),
+                    SimpleNamespace(
+                        host_id="gpu-1", state="offline", node=None, last_contact=None, protocol_version=1, detail="down"
+                    ),
+                ]
+
+            def get(self, _host_id: str):
+                return SimpleNamespace(ssh_target="host.internal", remote_executable="agent-bridge", projects={})
+
+        snapshot = MonitorCollector(self.state, host_registry=_FakeRegistry()).collect(include_native=False)
+        self.assertEqual(2, snapshot["metrics"]["total_hosts"])
+        self.assertEqual(1, snapshot["metrics"]["online_hosts"])
+        local_rows = [s for s in snapshot["sessions"] if s["id"] == "sess-local-1"]
+        self.assertEqual(1, len(local_rows))
+        self.assertEqual("local", local_rows[0]["host_id"])
+
+    def test_task_watermark_survives_more_than_250_mutable_tasks_via_json_each(self) -> None:
+        store = Store(self.state)
+        now = time.time()
+        with store.connection(write=True) as db:
+            for idx in range(260):
+                db.execute(
+                    "INSERT INTO sessions(id,profile,cwd,access,desired,observed,revision,created) VALUES(?,?,?,?,?,?,?,?)",
+                    (f"sess-many-{idx}", "claude-sonnet", str(self.state), "read-only", "open", "idle", 1, now + idx),
+                )
+                db.execute(
+                    "INSERT INTO tasks(id,session_id,instruction,dependencies,status,validation,reservation,created) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (f"task-{idx}", f"sess-many-{idx}", "work", "[]", "running", "pending", 0, now + idx),
+                )
+
+        collector = MonitorCollector(self.state)
+        first = collector.collect(include_native=False)
+        self.assertEqual(260, first["metrics"]["running_tasks"])
+        self.assertGreater(collector._task_watermark, 0)
+        self.assertEqual(260, len(collector._mutable_task_rowids))
+
+        # Second incremental poll keeps watermark (>0) with >250 mutable tasks and picks up status change.
+        with store.connection(write=True) as db:
+            db.execute("UPDATE tasks SET status='completed' WHERE id='task-0'")
+        second = collector.collect(include_native=False)
+        self.assertEqual(259, second["metrics"]["running_tasks"])
+        self.assertGreater(collector._task_watermark, 0)
+        self.assertEqual(259, len(collector._mutable_task_rowids))
+
 
 if __name__ == "__main__":
     unittest.main()

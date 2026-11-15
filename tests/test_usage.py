@@ -9,7 +9,7 @@ from agent_bridge.errors import BridgeError
 from agent_bridge.parent_usage import meter_usage, refresh_meter, start_meter
 from agent_bridge.routing import task_samples
 from agent_bridge.store import Store
-from agent_bridge.usage import claude_usage, priced_usage, validate_price
+from agent_bridge.usage import claude_counters, claude_usage, priced_usage, validate_price
 
 
 class UsageTests(unittest.TestCase):
@@ -205,3 +205,66 @@ class UsageTests(unittest.TestCase):
         self.assertIsNone(priced_usage(usage, price)["catalog_estimate"]["usd"])
         with self.assertRaises(BridgeError):
             validate_price({**price, "per_million": {"input_tokens": float("nan"), "output_tokens": 1}})
+
+    def test_priced_usage_and_meter_usage_validate_invalid_price_before_model_check(self):
+        usage = {
+            "input_tokens": 1000,
+            "output_tokens": 100,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "complete": True,
+            "priced_models": ["other-model"],
+        }
+        for bad_price in ("not-a-dict", {}):
+            with self.subTest(price=bad_price), self.assertRaises(BridgeError) as err:
+                priced_usage(usage, bad_price)
+            self.assertEqual("invalid_price", err.exception.code)
+
+        self.usage(100, 10)
+        meter = start_meter(str(self.path), "native")
+        self.usage(150, 20)
+        meter = refresh_meter(meter)
+        meter["price"] = "bad-price"
+        with self.assertRaises(BridgeError) as err:
+            meter_usage(meter)
+        self.assertEqual("invalid_price", err.exception.code)
+
+    def test_claude_counters_and_cost_usd_validation(self):
+        self.assertIsNone(claude_counters({}))
+        self.assertEqual({}, claude_counters({}, {}))
+        self.assertIsNone(claude_counters(None, {}))
+
+        base = {
+            "m": {
+                "inputTokens": 10,
+                "outputTokens": 5,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+            }
+        }
+        after = {
+            "m": {
+                "inputTokens": 20,
+                "outputTokens": 10,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+                "costUSD": 0.5,
+            }
+        }
+        # Missing costUSD in before must omit catalog_estimate rather than counting lifetime cost.
+        res_missing = claude_usage(base, after, {}, 0.5)
+        self.assertTrue(res_missing["complete"])
+        self.assertNotIn("catalog_estimate", res_missing)
+
+        # Decreasing per-model costUSD must omit catalog_estimate even if another model raises total cost.
+        before_dec = {
+            "m": {**base["m"], "costUSD": 0.8},
+            "aux": {**base["m"], "costUSD": 0.1},
+        }
+        after_dec = {
+            "m": {**after["m"], "costUSD": 0.5},
+            "aux": {**after["m"], "costUSD": 1.0},
+        }
+        res_dec = claude_usage(before_dec, after_dec, {}, 1.5)
+        self.assertTrue(res_dec["complete"])
+        self.assertNotIn("catalog_estimate", res_dec)

@@ -11,6 +11,7 @@ import os
 import secrets
 import signal
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -705,6 +706,7 @@ class EventMirror:
         self._paused: set[str] = set()
         self._stopping = asyncio.Event()
         self._local_identity: tuple[str, str] | None = None
+        self._last_errors: dict[str, str] = {}
 
     def _local_node_key(self) -> tuple[str, str]:
         if self._local_identity is None:
@@ -857,7 +859,7 @@ class EventMirror:
             return None
         return clean
 
-    def _record_conflict(self, event, existing, fingerprint):
+    def _record_conflict(self, event, existing, fingerprint, *, stored_fingerprint=None):
         with self.store.connection(write=True) as db:
             self.store.event(
                 db,
@@ -865,7 +867,7 @@ class EventMirror:
                 {
                     "source": event.get("ref"),
                     "remote_seq": event.get("seq"),
-                    "stored_fingerprint": existing.get("fingerprint"),
+                    "stored_fingerprint": stored_fingerprint or existing.get("fingerprint"),
                     "received_fingerprint": fingerprint,
                 },
             )
@@ -873,6 +875,12 @@ class EventMirror:
     async def run_once(self, host_id: str) -> int:
         async with self._poll_locks.setdefault(host_id, asyncio.Lock()):
             return await self._run_once(host_id)
+
+    def _note_error(self, key: str, context: str, error: BaseException) -> None:
+        summary = f"{type(error).__name__}: {safe_error(error)}"
+        if self._last_errors.get(key) != summary:
+            self._last_errors[key] = summary
+            print(f"[event_mirror] {context}: {summary}", file=sys.stderr, flush=True)
 
     async def _run_once(self, host_id: str) -> int:
         if host_id in self._paused:
@@ -897,8 +905,8 @@ class EventMirror:
             origin_ref = origin_event["ref"]
             origin_seq = origin_event["seq"]
             if (
-                (origin_ref["node_id"], origin_ref["state_generation"]) == local_key
-                or (source["node_id"], source["state_generation"]) == local_key
+                origin_ref["node_id"] == local_key[0]
+                or source["node_id"] == local_key[0]
             ):
                 last_seq = remote_seq
                 processed += 1
@@ -916,14 +924,36 @@ class EventMirror:
                 existing_origin = self.store.get_mirrored_event_by_origin(
                     origin_ref["node_id"], origin_ref["state_generation"], origin_seq
                 )
+                is_direct = (
+                    not wrapped
+                    and node.node_id == origin_ref["node_id"]
+                    and node.state_generation == origin_ref["state_generation"]
+                    and remote_seq == origin_seq
+                )
                 if existing_origin is not None:
+                    existing_is_direct = (
+                        existing_origin["node_id"] == existing_origin["origin_node_id"]
+                        and existing_origin["state_generation"] == existing_origin["origin_state_generation"]
+                        and existing_origin["remote_seq"] == existing_origin["origin_seq"]
+                    )
                     if (
                         existing_origin.get("origin_fingerprint")
                         and existing_origin["origin_fingerprint"] != origin_fingerprint
                     ):
-                        self._record_conflict(origin_event, existing_origin, origin_fingerprint)
-                        self._paused.add(host_id)
-                        break
+                        self._record_conflict(
+                            origin_event,
+                            existing_origin,
+                            origin_fingerprint,
+                            stored_fingerprint=existing_origin.get("origin_fingerprint") or existing_origin.get("fingerprint"),
+                        )
+                        if is_direct and not existing_is_direct:
+                            # Direct origin is authoritative over an earlier wrapped hop; pause the conflicting relay instead.
+                            self._paused.add(existing_origin["host_id"])
+                            existing_origin = None
+                        else:
+                            self._paused.add(host_id)
+                            break
+                if existing_origin is not None:
                     local_seq = existing_origin["local_seq"]
                 else:
                     data = {
@@ -955,6 +985,10 @@ class EventMirror:
                 route = self.store.lookup_parent_route(
                     origin_ref["host_id"], origin_ref["node_id"], origin_ref["state_generation"], origin_ref["local_id"],
                 )
+                if route is None:
+                    route = self.store.lookup_parent_route_by_node(
+                        origin_ref["node_id"], origin_ref["state_generation"], origin_ref["local_id"],
+                    )
             if route is not None:
                 parent_ref = route["parent_ref"]
                 try:
@@ -964,8 +998,10 @@ class EventMirror:
                         await self._notify_remote(origin_event, parent_ref, local_seq, origin_fingerprint)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as error:
+                    self._note_error(f"notify:{host_id}", f"{host_id} notify seq {remote_seq}", error)
                     break
+            self._last_errors.pop(f"notify:{host_id}", None)
             last_seq = remote_seq
             processed += 1
         if last_seq is not None:
@@ -977,10 +1013,11 @@ class EventMirror:
             try:
                 with update_guard.operation(self.store.state):
                     await self.run_once(config.host_id)
+                self._last_errors.pop(f"poll:{config.host_id}", None)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
+            except Exception as error:
+                self._note_error(f"poll:{config.host_id}", f"{config.host_id} poll", error)
             deadline = asyncio.get_running_loop().time() + (config.pull_interval or self.interval)
             while not self._stopping.is_set() and self._host_config(config.host_id) == config:
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -1080,36 +1117,56 @@ class Broker:
                 "WHERE status='sending'"
             )
 
+    def _log_loop_error(self, name, error):
+        summary = f"{type(error).__name__}: {safe_error(error)}"
+        if getattr(self, "_loop_errors", None) is None:
+            self._loop_errors = {}
+        if self._loop_errors.get(name) != summary:
+            self._loop_errors[name] = summary
+            print(f"[{name}] {summary}", file=sys.stderr, flush=True)
+
+    async def _loop_wait(self, seconds):
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self.stopping.wait(), seconds)
+
     async def notifications(self):
         from .notifications import deliver
 
         while not self.stopping.is_set():
+            delay = 2
             try:
                 with update_guard.operation(self.state):
                     await asyncio.to_thread(self.store.refresh_parent_usage)
                     await deliver(self.store, self.config)
+                getattr(self, "_loop_errors", {}).pop("notifications", None)
             except BridgeError as error:
                 if error.code != "update_busy":
-                    raise
-            try:
-                await asyncio.wait_for(self.stopping.wait(), 2)
-            except TimeoutError:
-                pass
+                    self._log_loop_error("notifications", error)
+            except sqlite3.OperationalError as error:
+                self._log_loop_error("notifications", error)
+                delay = 0.5
+            except Exception as error:
+                self._log_loop_error("notifications", error)
+            await self._loop_wait(delay)
 
     async def native_notifications(self):
         running = set()
         try:
             while not self.stopping.is_set():
+                delay = 2
                 try:
                     with update_guard.operation(self.state):
                         await native_broadcast.deliver(self.store, self.config, tasks=running)
+                    getattr(self, "_loop_errors", {}).pop("native_notifications", None)
                 except BridgeError as error:
                     if error.code != "update_busy":
-                        raise
-                try:
-                    await asyncio.wait_for(self.stopping.wait(), 2)
-                except TimeoutError:
-                    pass
+                        self._log_loop_error("native_notifications", error)
+                except sqlite3.OperationalError as error:
+                    self._log_loop_error("native_notifications", error)
+                    delay = 0.5
+                except Exception as error:
+                    self._log_loop_error("native_notifications", error)
+                await self._loop_wait(delay)
         finally:
             for task in running:
                 task.cancel()
@@ -1190,6 +1247,7 @@ class Broker:
         pending = set()
         try:
             while not self.stopping.is_set():
+                delay = 0.15
                 try:
                     with update_guard.operation(self.state):
                         for session in self.store.sessions():
@@ -1206,10 +1264,16 @@ class Broker:
                                 task.add_done_callback(pending.discard)
                         while self.store.claim(self.config):
                             pass
+                    getattr(self, "_loop_errors", {}).pop("scheduler", None)
                 except BridgeError as error:
                     if error.code != "update_busy":
-                        raise
-                await asyncio.sleep(0.15)
+                        self._log_loop_error("scheduler", error)
+                except sqlite3.OperationalError as error:
+                    self._log_loop_error("scheduler", error)
+                    delay = 0.5
+                except Exception as error:
+                    self._log_loop_error("scheduler", error)
+                await self._loop_wait(delay)
         finally:
             await asyncio.gather(*pending, return_exceptions=True)
 
@@ -1401,9 +1465,16 @@ class Broker:
         return resolved
 
     @staticmethod
-    def _stable_operation_id(host_id, method, request_id, params):
+    def _stable_operation_id(host_id, node_id, state_generation, method, request_id, params):
         material = encode(
-            {"host_id": host_id, "method": method, "request_id": request_id, "params": params}
+            {
+                "host_id": host_id,
+                "node_id": node_id,
+                "state_generation": state_generation,
+                "method": method,
+                "request_id": request_id,
+                "params": params,
+            }
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -1543,7 +1614,9 @@ class Broker:
 
     @staticmethod
     def _workspace_operation(host_id, node, request_id, payload):
-        operation_id = Broker._stable_operation_id(host_id, "peer.workspace", request_id, payload)
+        operation_id = Broker._stable_operation_id(
+            host_id, node.node_id, node.state_generation, "peer.workspace", request_id, payload
+        )
         return {
             "node_id": node.node_id,
             "state_generation": node.state_generation,
@@ -1825,6 +1898,35 @@ class Broker:
             )
         raise BridgeError(PeerErrorCode.OPERATION_PENDING, "The cross-host operation has no result yet")
 
+    async def _resolve_existing_operation(self, host_id, existing):
+        """Refresh a non-terminal remote operation on retry before mapping it to a response."""
+        operation_id = existing["operation_id"]
+        if existing["status"] in {"pending", "running", "uncertain"}:
+            found = None
+            with contextlib.suppress(BridgeError):
+                found = await self._refresh_operation(existing, host_id)
+            existing = self.store.get_operation(operation_id)
+            if existing is None:
+                raise BridgeError(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown operation: {operation_id}")
+            if found is False and existing["status"] in {"pending", "uncertain"}:
+                return None
+        return self._operation_response(existing)
+
+    def _recover_api_request(self, db, key):
+        """Recover a persisted local or cross-host outcome for `request_id`, or return a peer operation if still inflight."""
+        inner = db.execute("SELECT result FROM requests WHERE id=?", (key,)).fetchone()
+        if inner:
+            return {"result": json.loads(inner["result"])}, None
+        peer_op = db.execute(
+            "SELECT * FROM peer_operations WHERE request_id=? ORDER BY updated DESC LIMIT 1", (key,)
+        ).fetchone()
+        if peer_op is not None:
+            op = self.store._peer_operation(peer_op)
+            if op["status"] == "completed" and isinstance(op.get("result"), dict):
+                return {"result": self._operation_response(op)}, op
+            return None, op
+        return None, None
+
     async def _remote_deliver(self, host_id, method, args, *, instruction=None, open_only=False):
         # Omitted and explicit name=None must produce the same stable operation id (pre-upgrade retries).
         if args.get("name") is None:
@@ -1835,7 +1937,7 @@ class Broker:
         if self._remote_workspace_requested(method, args, target_id):
             args = await self._prepare_remote_workspace(host_id, client, node, args)
         operation_id = self._stable_operation_id(
-            host_id, method, str(args.get("request_id") or ""), args
+            host_id, node.node_id, node.state_generation, method, str(args.get("request_id") or ""), args
         )
         target_seq = self._target_seq(operation_id)
         parent_ref = args.get("parent_ref")
@@ -1899,16 +2001,20 @@ class Broker:
                             self.store.register_parent_route(
                                 host_id, node.node_id, node.state_generation, child_id, stored_parent,
                             )
-            return self._operation_response(existing)
-        self.store.record_operation(
-            operation_id,
-            node.node_id,
-            node.state_generation,
-            fingerprint,
-            method,
-            parameters,
-            status="pending",
-        )
+            resolved = await self._resolve_existing_operation(host_id, existing)
+            if resolved is not None:
+                return resolved
+        if existing is None:
+            self.store.record_operation(
+                operation_id,
+                node.node_id,
+                node.state_generation,
+                fingerprint,
+                method,
+                parameters,
+                status="pending",
+                request_id=args.get("request_id"),
+            )
         if parent_ref is not None and target_id:
             self.store.register_parent_route(host_id, node.node_id, node.state_generation, target_id, parent_ref)
         try:
@@ -1976,7 +2082,9 @@ class Broker:
         if host_id is not None:
             client = self.peer_factory.client(host_id)
             node = await self._peer_node(host_id, client)
-            operation_id = self._stable_operation_id(host_id, "agent_cancel", str(request_id or ""), args)
+            operation_id = self._stable_operation_id(
+                host_id, node.node_id, node.state_generation, "agent_cancel", str(request_id or ""), args
+            )
             parameters = {
                 "operation": {
                     "node_id": node.node_id,
@@ -1994,16 +2102,20 @@ class Broker:
                         PeerErrorCode.OPERATION_CONFLICT,
                         "operation_id was already used with different cancel parameters",
                     )
-                return self._operation_response(existing)
-            self.store.record_operation(
-                operation_id,
-                node.node_id,
-                node.state_generation,
-                fingerprint,
-                "agent_cancel",
-                parameters,
-                status="pending",
-            )
+                resolved = await self._resolve_existing_operation(host_id, existing)
+                if resolved is not None:
+                    return resolved
+            if existing is None:
+                self.store.record_operation(
+                    operation_id,
+                    node.node_id,
+                    node.state_generation,
+                    fingerprint,
+                    "agent_cancel",
+                    parameters,
+                    status="pending",
+                    request_id=request_id,
+                )
             try:
                 result = await client.cancel(parameters)  # type: ignore[arg-type]
             except BridgeError as error:
@@ -2075,7 +2187,7 @@ class Broker:
             }
         )
         if not isinstance(lookup, dict) or not lookup.get("found"):
-            return
+            return False if isinstance(lookup, dict) else None
         status = lookup.get("operation_status")
         delivery = lookup.get("delivery")
         if not isinstance(status, str) and isinstance(delivery, dict):
@@ -2100,6 +2212,7 @@ class Broker:
             updates["result"] = {**base, **delivery}
         if updates:
             self.store.update_operation(operation["operation_id"], **updates)
+        return True
 
     async def _operation(self, args):
         operation_id = args.get("operation_id")
@@ -2604,6 +2717,7 @@ class Broker:
             raise BridgeError("invalid_request_id", "A request_id of at most 200 characters is required")
         fingerprint = hashlib.sha256(encode({"method": method, "params": args}).encode()).hexdigest()
         lock = self.request_locks.setdefault(key, asyncio.Lock())
+        transient_codes = {"update_busy", "discovery_unavailable", "peer_host_offline", "operation_pending"}
         async with lock:
             with self.store.connection(write=True) as db:
                 old = db.execute("SELECT * FROM api_requests WHERE id=?", (key,)).fetchone()
@@ -2612,26 +2726,40 @@ class Broker:
                         raise BridgeError("request_conflict", "request_id already represents different API parameters")
                     if old["response"]:
                         return json.loads(old["response"])
-                    inner = db.execute("SELECT result FROM requests WHERE id=?", (key,)).fetchone()
-                    if inner:
-                        recovered = {"result": json.loads(inner["result"])}
+                    recovered, peer_op = self._recover_api_request(db, key)
+                    if recovered is not None:
                         db.execute("UPDATE api_requests SET response=? WHERE id=?", (encode(recovered), key))
                         return recovered
+                    if peer_op is not None:
+                        raise BridgeError(
+                            "request_uncertain",
+                            f"A previous broker stopped during cross-host operation {peer_op['operation_id']}; inspect with agent_operation before retrying",
+                        )
                     raise BridgeError(
                         "request_uncertain",
                         "A previous broker stopped during this operation; inspect its session/task before submitting new work",
                     )
                 db.execute("INSERT INTO api_requests(id,fingerprint) VALUES(?,?)", (key, fingerprint))
+            transient = False
             try:
                 response = {"result": await self.call(method, args)}
             except BridgeError as error:
                 response = {"error": error.as_dict()}
+                transient = error.code in transient_codes
             except (ValueError, TypeError, KeyError, OSError) as error:
                 response = {"error": {"code": "invalid_request", "message": safe_error(error)}}
             except Exception as error:
                 response = {"error": {"code": "request_uncertain", "message": "Result not confirmed; inspect before retrying: " + safe_error(error)}}
             with self.store.connection(write=True) as db:
-                db.execute("UPDATE api_requests SET response=? WHERE id=?", (encode(response), key))
+                if transient:
+                    recovered, _ = self._recover_api_request(db, key)
+                    if recovered is not None:
+                        response = recovered
+                        db.execute("UPDATE api_requests SET response=? WHERE id=?", (encode(response), key))
+                    else:
+                        db.execute("DELETE FROM api_requests WHERE id=? AND response IS NULL", (key,))
+                else:
+                    db.execute("UPDATE api_requests SET response=? WHERE id=?", (encode(response), key))
             return response
 
     @property
@@ -2684,16 +2812,26 @@ class Broker:
         outbox_puller = asyncio.create_task(self.outbox_puller.run())
         event_mirror = asyncio.create_task(self.event_mirror.run())
         host_watcher = asyncio.create_task(self.watch_hosts())
+        tasks = (
+            scheduler,
+            notifications,
+            native_notifications,
+            delivery_scheduler,
+            outbox_puller,
+            event_mirror,
+            host_watcher,
+        )
         try:
             async with server:
                 await self.stopping.wait()
         finally:
-            await scheduler
-            await notifications
-            await native_notifications
+            self.stopping.set()
             for task in (delivery_scheduler, outbox_puller, event_mirror, host_watcher):
                 task.cancel()
-            await asyncio.gather(delivery_scheduler, outbox_puller, event_mirror, host_watcher, return_exceptions=True)
+            _, pending = await asyncio.wait(tasks, timeout=5)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             if self._monitor_inflight is not None and not self._monitor_inflight.done():
                 try:
                     await asyncio.shield(self._monitor_inflight)

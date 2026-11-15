@@ -32,11 +32,11 @@ def validate_price(price):
 def priced_usage(usage, price):
     result = dict(usage or {})
     result["actual_billed_usd"] = None
-    if price and result.get("priced_models") and set(result["priced_models"]) != {price.get("model")}:
-        price = None
-    if not price or result.get("pricing_supported") is False:
+    if price is None or result.get("pricing_supported") is False:
         return result
     validate_price(price)
+    if result.get("priced_models") and set(result["priced_models"]) != {price.get("model")}:
+        return result
     tokens = {key: result.get(key) for key in TOKEN_FIELDS}
     if result.get("input_includes_cache") and tokens["input_tokens"] is not None:
         tokens["input_tokens"] -= (tokens["cache_read_tokens"] or 0) + (tokens["cache_write_tokens"] or 0)
@@ -55,15 +55,24 @@ def priced_usage(usage, price):
 
 
 def claude_counters(value, previous=None):
-    value = value if isinstance(value, dict) else {}
+    if not isinstance(value, dict) and not previous:
+        return None
+    is_dict = isinstance(value, dict)
+    value = value if is_dict else {}
     models = value.keys() | (previous or {}).keys()
     # Retain missing model names as unknown so their history is not counted as new later.
-    return {
+    counters = {
         model: counts if isinstance(counts := value.get(model), dict) and all(
             type(counts.get(field)) is int and counts[field] >= 0 for field in CLAUDE_TOKEN_FIELDS
         ) else None
         for model in models
-    } or None
+    }
+    return counters or ({} if is_dict and isinstance(previous, dict) else None)
+
+
+def _valid_cost_usd(entry):
+    value = entry.get("costUSD") if isinstance(entry, dict) else None
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
 def claude_usage(before, after, fallback, reported_cost):
@@ -102,8 +111,13 @@ def claude_usage(before, after, fallback, reported_cost):
     }
     if not valid:
         result["reason"] = "Missing or reset cumulative per-model counters; main-loop usage is partial"
-    if valid and all("costUSD" in value for value in after.values()):
-        old_cost = sum(value.get("costUSD", 0) for value in before.values())
+    if (
+        valid
+        and all(_valid_cost_usd(value) for value in after.values())
+        and all(_valid_cost_usd(value) for value in before.values())
+        and all(after[model]["costUSD"] >= before[model]["costUSD"] for model in before.keys() & after.keys())
+    ):
+        old_cost = sum(value["costUSD"] for value in before.values())
         cost = sum(value["costUSD"] for value in after.values()) - old_cost
         result["catalog_estimate"] = {
             "usd": cost if cost >= 0 else None,

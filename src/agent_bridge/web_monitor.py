@@ -2522,6 +2522,7 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                         break
                     if not stream_authorized():
                         break
+                    prev_last_seq = last_seq
                     if pending_initial is not None:
                         snap, events_truncated_before_filter = pending_initial
                         pending_initial = None
@@ -2646,13 +2647,14 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                             break
                     if snap_legacy:
                         break
-                    if (
-                        not hit_max_events
-                        and not events_truncated_before_filter
-                        and len(raw_events) < filters["limit"]
-                    ):
+                    if not hit_max_events and not events_truncated_before_filter:
                         raw_max_seq = max((int(ev.get("seq", 0)) for ev in raw_events), default=last_seq)
-                        last_seq = max(last_seq, raw_max_seq, latest_db_seq)
+                        if len(raw_events) < filters["limit"]:
+                            last_seq = max(last_seq, raw_max_seq, latest_db_seq)
+                        elif not events and raw_events:
+                            raw_min_seq = min(int(ev.get("seq", 0)) for ev in raw_events)
+                            if raw_min_seq > prev_last_seq and raw_max_seq > last_seq:
+                                last_seq = raw_max_seq
                     has_cursor = True
                     if (
                         not hit_max_events
@@ -2668,7 +2670,7 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                             hit_max_events = True
                     if once or events_truncated_before_filter or hit_max_events or (max_events and emitted >= max_events):
                         break
-                    if len(raw_events) >= filters["limit"]:
+                    if len(raw_events) >= filters["limit"] and last_seq > prev_last_seq:
                         continue
                     now = time.monotonic()
                     if now - last_write_at >= SSE_KEEPALIVE_SECONDS:
