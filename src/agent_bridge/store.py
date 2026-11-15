@@ -364,11 +364,13 @@ CREATE TABLE IF NOT EXISTS member_bindings (
 
 
 class Store:
+    PEER_MIRROR_MIGRATION_BATCH = 500
+
     def __init__(self, state: Path):
         self.state = state
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = state / "bridge.sqlite"
-        with self.connection() as db:
+        with self.connection(timeout=30) as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
             db.execute("BEGIN IMMEDIATE")
@@ -441,31 +443,8 @@ class Store:
         self.path.chmod(0o600)
 
     @classmethod
-    def _migrate_peer_event_mirrors(cls, db):
-        columns = {row[1] for row in db.execute("PRAGMA table_info(peer_event_mirrors)")}
-        additions = (
-            ("origin_node_id", "TEXT"),
-            ("origin_state_generation", "TEXT"),
-            ("origin_seq", "INTEGER"),
-            ("origin_fingerprint", "TEXT"),
-        )
-        for name, sql_type in additions:
-            if name not in columns:
-                db.execute(f"ALTER TABLE peer_event_mirrors ADD COLUMN {name} {sql_type}")
-        db.execute(
-            "CREATE INDEX IF NOT EXISTS peer_event_mirrors_origin "
-            "ON peer_event_mirrors(origin_node_id,origin_state_generation,origin_seq)"
-        )
-        pending = db.execute(
-            "SELECT m.host_id,m.node_id,m.state_generation,m.remote_seq,m.local_seq,e.kind,e.data,e.created "
-            "FROM peer_event_mirrors m LEFT JOIN events e ON e.seq=m.local_seq "
-            "WHERE m.origin_node_id IS NULL"
-        ).fetchall()
-        for row in pending:
-            origin_node_id = row["node_id"]
-            origin_gen = row["state_generation"]
-            origin_seq = row["remote_seq"]
-            origin_fp = None
+    def _origin_mirror_values(cls, row):
+        if row["origin_node_id"] is None:
             data = cls._decode_json(row["data"])
             if isinstance(data, dict):
                 synthetic = {
@@ -482,25 +461,78 @@ class Store:
                 }
                 origin_event, wrapped = unwrap_peer_event(synthetic)
                 if wrapped:
-                    origin_node_id = origin_event["ref"]["node_id"]
-                    origin_gen = origin_event["ref"]["state_generation"]
-                    origin_seq = origin_event["seq"]
-                    origin_fp = hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest()
-                else:
-                    origin_fp = row["fingerprint"]
-            db.execute(
-                "UPDATE peer_event_mirrors SET origin_node_id=?,origin_state_generation=?,origin_seq=?,origin_fingerprint=? "
-                "WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
-                (
-                    origin_node_id, origin_gen, origin_seq, origin_fp,
-                    row["host_id"], row["node_id"], row["state_generation"], row["remote_seq"],
-                ),
+                    return (
+                        origin_event["ref"]["node_id"],
+                        origin_event["ref"]["state_generation"],
+                        origin_event["seq"],
+                        hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest(),
+                    )
+        return (row["node_id"], row["state_generation"], row["remote_seq"], row["fingerprint"])
+
+    @classmethod
+    def _migrate_peer_event_mirrors_batch(cls, db, limit: int | None = None) -> int:
+        """Backfill up to `limit` legacy mirror rows without loading large event logs into memory."""
+        batch_limit = cls.PEER_MIRROR_MIGRATION_BATCH if limit is None else limit
+        if batch_limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        pending = db.execute(
+            "SELECT m.host_id,m.node_id,m.state_generation,m.remote_seq,m.local_seq,"
+            "m.fingerprint,m.origin_node_id,e.kind,e.data,e.created "
+            "FROM peer_event_mirrors m LEFT JOIN events e ON e.seq=m.local_seq "
+            "WHERE m.origin_node_id IS NULL OR ("
+            "m.origin_fingerprint IS NULL AND m.origin_node_id=m.node_id "
+            "AND m.origin_state_generation=m.state_generation AND m.origin_seq=m.remote_seq"
+            ") ORDER BY m.local_seq DESC LIMIT ?",
+            (batch_limit,),
+        ).fetchall()
+        if not pending:
+            return 0
+        updates = [
+            (
+                *cls._origin_mirror_values(row),
+                row["host_id"],
+                row["node_id"],
+                row["state_generation"],
+                row["remote_seq"],
             )
-        db.execute(
-            "UPDATE peer_event_mirrors SET origin_fingerprint=fingerprint "
-            "WHERE origin_node_id=node_id AND origin_state_generation=state_generation "
-            "AND origin_seq=remote_seq AND origin_fingerprint IS NULL"
+            for row in pending
+        ]
+        db.executemany(
+            "UPDATE peer_event_mirrors SET origin_node_id=?,origin_state_generation=?,origin_seq=?,origin_fingerprint=? "
+            "WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
+            updates,
         )
+        return len(updates)
+
+    def migrate_peer_event_mirrors_batch(self, limit: int | None = None) -> int:
+        """Backfill one bounded batch of legacy mirror origin columns in its own transaction."""
+        with self.connection(write=True) as db:
+            return self._migrate_peer_event_mirrors_batch(db, limit=limit)
+
+    @classmethod
+    def _migrate_peer_event_mirrors(cls, db, limit: int | None = None):
+        columns = {row[1] for row in db.execute("PRAGMA table_info(peer_event_mirrors)")}
+        additions = (
+            ("origin_node_id", "TEXT"),
+            ("origin_state_generation", "TEXT"),
+            ("origin_seq", "INTEGER"),
+            ("origin_fingerprint", "TEXT"),
+        )
+        for name, sql_type in additions:
+            if name not in columns:
+                db.execute(f"ALTER TABLE peer_event_mirrors ADD COLUMN {name} {sql_type}")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS peer_event_mirrors_origin "
+            "ON peer_event_mirrors(origin_node_id,origin_state_generation,origin_seq)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS peer_event_mirrors_missing_origin "
+            "ON peer_event_mirrors(local_seq DESC) "
+            "WHERE origin_node_id IS NULL OR ("
+            "origin_fingerprint IS NULL AND origin_node_id=node_id "
+            "AND origin_state_generation=state_generation AND origin_seq=remote_seq)"
+        )
+        cls._migrate_peer_event_mirrors_batch(db, limit=limit)
 
     @staticmethod
     def _migrate_workspace_tables(db):
@@ -736,8 +768,8 @@ class Store:
             own.execute(sql, args)
 
     @contextmanager
-    def connection(self, *, write=False):
-        db = sqlite3.connect(self.path, timeout=10)
+    def connection(self, *, write=False, timeout=10):
+        db = sqlite3.connect(self.path, timeout=timeout)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         try:

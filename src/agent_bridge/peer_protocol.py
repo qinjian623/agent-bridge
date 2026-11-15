@@ -683,7 +683,7 @@ def unwrap_peer_event(event: PeerEvent) -> tuple[PeerEvent, bool]:
     """Return the innermost origin PeerEvent and whether `event` was a mirrored wrapper."""
     current = event
     wrapped = False
-    for _ in range(32):
+    for _ in range(256):
         payload = current.get("payload")
         if not isinstance(payload, dict):
             break
