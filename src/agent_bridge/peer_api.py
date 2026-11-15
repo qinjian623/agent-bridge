@@ -57,6 +57,7 @@ from .peer_protocol import (
     ok,
     peer_error,
     require_method,
+    unwrap_peer_event,
     validate_manifest_path,
     validate_object_ref,
 )
@@ -598,7 +599,10 @@ class DirectPeerService:
         local_id = parent_ref["local_id"]
         encoded_parent = encode(parent_ref)
         source_ref = event["ref"]
+        origin_event, _ = unwrap_peer_event(event)
+        origin_ref = origin_event["ref"]
         fingerprint = hashlib.sha256(encode(event).encode("utf-8")).hexdigest()
+        origin_fingerprint = hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest()
         with store.connection(write=True) as db:
             parent = db.execute("SELECT * FROM parents WHERE id=?", (local_id,)).fetchone()
             session = None
@@ -625,7 +629,10 @@ class DirectPeerService:
                 return {"mirror_seq": existing["local_seq"], "duplicate": True}
 
             for row in db.execute(query + "WHERE m.parent_ref=?", (encoded_parent,)).fetchall():
-                if self._notification_source(Store._decode_json(row["event_data"])) == (event["ref"], event["seq"]):
+                if self._notification_source(Store._decode_json(row["event_data"])) in (
+                    (event["ref"], event["seq"]),
+                    (origin_ref, origin_event["seq"]),
+                ):
                     return {"mirror_seq": row["local_seq"], "duplicate": True}
 
             mirrored = db.execute(
@@ -641,38 +648,55 @@ class DirectPeerService:
                     )
                 mirror_seq = mirrored["local_seq"]
             else:
-                data: dict[str, Any] = {
-                    "source": source_ref,
-                    "remote_seq": event["seq"],
-                    "type": event["type"],
-                    "payload": event["payload"],
-                    "created": event["created"],
-                }
-                if "result" in normalized:
-                    data["result"] = normalized["result"]
-                mirror_seq = store.event(
-                    db,
-                    event["type"],
-                    data,
-                    session=None if parent is not None else local_id,
+                mirrored_origin = store.get_mirrored_event_by_origin(
+                    origin_ref["node_id"], origin_ref["state_generation"], origin_event["seq"], db=db
                 )
-                store.mirror_peer_event(
-                    source_ref["host_id"],
-                    source_ref["node_id"],
-                    source_ref["state_generation"],
-                    event["seq"],
-                    fingerprint,
-                    mirror_seq,
-                    db=db,
-                )
+                if mirrored_origin is not None:
+                    if mirrored_origin.get("origin_fingerprint") and mirrored_origin["origin_fingerprint"] != origin_fingerprint:
+                        raise peer_error(
+                            PeerErrorCode.OPERATION_CONFLICT,
+                            "remote event was mirrored with different content",
+                        )
+                    mirror_seq = mirrored_origin["local_seq"]
+                else:
+                    data: dict[str, Any] = {
+                        "source": origin_ref,
+                        "remote_seq": origin_event["seq"],
+                        "type": origin_event["type"],
+                        "payload": origin_event["payload"],
+                        "created": origin_event["created"],
+                    }
+                    if "result" in normalized:
+                        data["result"] = normalized["result"]
+                    mirror_seq = store.event(
+                        db,
+                        origin_event["type"],
+                        data,
+                        session=None if parent is not None else local_id,
+                    )
+                    store.mirror_peer_event(
+                        source_ref["host_id"],
+                        source_ref["node_id"],
+                        source_ref["state_generation"],
+                        event["seq"],
+                        fingerprint,
+                        mirror_seq,
+                        origin_node_id=origin_ref["node_id"],
+                        origin_state_generation=origin_ref["state_generation"],
+                        origin_seq=origin_event["seq"],
+                        origin_fingerprint=origin_fingerprint,
+                        db=db,
+                    )
             occupied = db.execute(
                 "SELECT parent_ref FROM mirrored_parent_notifications WHERE local_seq=?", (mirror_seq,)
             ).fetchone()
-            if occupied is not None and occupied["parent_ref"] != encoded_parent:
-                raise peer_error(
-                    PeerErrorCode.PARENT_ROUTE_CONFLICT,
-                    "this event is already routed to a different parent",
-                )
+            if occupied is not None:
+                if occupied["parent_ref"] != encoded_parent:
+                    raise peer_error(
+                        PeerErrorCode.PARENT_ROUTE_CONFLICT,
+                        "this event is already routed to a different parent",
+                    )
+                return {"mirror_seq": mirror_seq, "duplicate": True}
             receipt: dict[str, Any] = {
                 "event": {"ref": event["ref"], "seq": event["seq"], "type": event["type"]},
                 "status": "received",
@@ -2098,7 +2122,7 @@ class DirectPeerService:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "limit must be a positive integer")
         limit = min(limit, MAX_PAGE_LIMIT)
-        rows = store.events(after, limit=limit + 1)
+        rows = store.events(after, limit=limit + 1, exclude_mirrored=True)
         has_more = len(rows) > limit
         rows = rows[:limit]
         identity = self._identity.load_or_create()

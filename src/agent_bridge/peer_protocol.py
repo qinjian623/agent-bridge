@@ -667,6 +667,50 @@ def _normalize_peer_event(value: Any) -> PeerEvent:
     }
 
 
+def _mirrored_envelope_ref(value: Any) -> ObjectRef | None:
+    if not isinstance(value, dict):
+        return None
+    clean: dict[str, str] = {}
+    for key in ("host_id", "node_id", "state_generation", "local_id"):
+        item = value.get(key)
+        if not isinstance(item, str) or not item:
+            return None
+        clean[key] = item
+    return clean  # type: ignore[return-value]
+
+
+def unwrap_peer_event(event: PeerEvent) -> tuple[PeerEvent, bool]:
+    """Return the innermost origin PeerEvent and whether `event` was a mirrored wrapper."""
+    current = event
+    wrapped = False
+    for _ in range(32):
+        payload = current.get("payload")
+        if not isinstance(payload, dict):
+            break
+        source = _mirrored_envelope_ref(payload.get("source"))
+        remote_seq = payload.get("remote_seq")
+        inner_type = payload.get("type")
+        inner_payload = payload.get("payload")
+        inner_created = payload.get("created")
+        if (
+            source is None
+            or isinstance(remote_seq, bool) or not isinstance(remote_seq, int) or remote_seq < 0
+            or not isinstance(inner_type, str) or not inner_type
+            or not isinstance(inner_payload, dict)
+            or isinstance(inner_created, bool) or not isinstance(inner_created, (int, float))
+        ):
+            break
+        current = {
+            "seq": remote_seq,
+            "type": inner_type,
+            "ref": source,
+            "payload": inner_payload,
+            "created": float(inner_created),
+        }
+        wrapped = True
+    return current, wrapped
+
+
 def normalize_notify_parent_params(data: dict[str, Any]) -> NotifyParentParams:
     data = _object(data, "params")
     params: NotifyParentParams = {

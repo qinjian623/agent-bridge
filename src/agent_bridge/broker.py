@@ -31,6 +31,7 @@ from .peer_protocol import (
     PeerErrorCode,
     canonical_operation_id,
     compute_manifest_digest,
+    unwrap_peer_event,
 )
 from .peer_transport import DefaultPeerClientFactory
 from .routing import choose
@@ -703,6 +704,15 @@ class EventMirror:
         self._poll_locks: dict[str, asyncio.Lock] = {}
         self._paused: set[str] = set()
         self._stopping = asyncio.Event()
+        self._local_identity: tuple[str, str] | None = None
+
+    def _local_node_key(self) -> tuple[str, str]:
+        if self._local_identity is None:
+            from .node_identity import FileNodeIdentityStore
+
+            identity = FileNodeIdentityStore(self.store.state).load_or_create()
+            self._local_identity = (identity.node_id, identity.state_generation)
+        return self._local_identity
 
     def _client(self, host_id):
         if hasattr(self.peer_factory, "client"):
@@ -876,13 +886,25 @@ class EventMirror:
             items = []
         processed = 0
         last_seq = None
+        local_key = self._local_node_key()
         for raw_event in items:
             event = self._canonical_event(raw_event)
             if event is None:
                 break
             source = event["ref"]
             remote_seq = event["seq"]
+            origin_event, wrapped = unwrap_peer_event(event)
+            origin_ref = origin_event["ref"]
+            origin_seq = origin_event["seq"]
+            if (
+                (origin_ref["node_id"], origin_ref["state_generation"]) == local_key
+                or (source["node_id"], source["state_generation"]) == local_key
+            ):
+                last_seq = remote_seq
+                processed += 1
+                continue
             fingerprint = hashlib.sha256(encode(event).encode("utf-8")).hexdigest()
+            origin_fingerprint = hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest()
             existing = self.store.get_mirrored_event(host_id, node.node_id, node.state_generation, remote_seq)
             if existing is not None and existing["fingerprint"] != fingerprint:
                 self._record_conflict(event, existing, fingerprint)
@@ -891,28 +913,55 @@ class EventMirror:
             if existing is not None:
                 local_seq = existing["local_seq"]
             else:
-                data = {
-                    "source": source,
-                    "remote_seq": remote_seq,
-                    "type": event.get("type"),
-                    "payload": event.get("payload"),
-                    "created": event.get("created"),
-                }
-                with self.store.connection(write=True) as db:
-                    local_seq = self.store.event(db, str(event.get("type", "")), data)
-                    self.store.mirror_peer_event(
-                        host_id, node.node_id, node.state_generation, remote_seq, fingerprint, local_seq, db=db,
-                    )
+                existing_origin = self.store.get_mirrored_event_by_origin(
+                    origin_ref["node_id"], origin_ref["state_generation"], origin_seq
+                )
+                if existing_origin is not None:
+                    if (
+                        existing_origin.get("origin_fingerprint")
+                        and existing_origin["origin_fingerprint"] != origin_fingerprint
+                    ):
+                        self._record_conflict(origin_event, existing_origin, origin_fingerprint)
+                        self._paused.add(host_id)
+                        break
+                    local_seq = existing_origin["local_seq"]
+                else:
+                    data = {
+                        "source": origin_ref,
+                        "remote_seq": origin_seq,
+                        "type": origin_event.get("type"),
+                        "payload": origin_event.get("payload"),
+                        "created": origin_event.get("created"),
+                    }
+                    with self.store.connection(write=True) as db:
+                        local_seq = self.store.event(db, str(origin_event.get("type", "")), data)
+                        self.store.mirror_peer_event(
+                            host_id,
+                            node.node_id,
+                            node.state_generation,
+                            remote_seq,
+                            fingerprint,
+                            local_seq,
+                            origin_node_id=origin_ref["node_id"],
+                            origin_state_generation=origin_ref["state_generation"],
+                            origin_seq=origin_seq,
+                            origin_fingerprint=origin_fingerprint,
+                            db=db,
+                        )
             route = self.store.lookup_parent_route(
                 host_id, node.node_id, node.state_generation, source["local_id"],
             )
+            if route is None and wrapped:
+                route = self.store.lookup_parent_route(
+                    origin_ref["host_id"], origin_ref["node_id"], origin_ref["state_generation"], origin_ref["local_id"],
+                )
             if route is not None:
                 parent_ref = route["parent_ref"]
                 try:
                     if self._parent_is_local(parent_ref):
-                        self._notify_local(parent_ref, event)
+                        self._notify_local(parent_ref, origin_event)
                     else:
-                        await self._notify_remote(event, parent_ref, local_seq, fingerprint)
+                        await self._notify_remote(origin_event, parent_ref, local_seq, origin_fingerprint)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
