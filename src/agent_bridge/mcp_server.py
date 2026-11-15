@@ -32,6 +32,7 @@ def server(state):
         status: str | None = None,
         session_limit: int | None = None,
         include_native: bool = True,
+        after_seq: int | None = None,
     ) -> dict:
         """Overall multi-agent monitor snapshot across pi, claude, agy (antigravity), and codex: cluster hosts, runtime summary, bridge sessions, live native processes, pending approvals, broadcasts, and events."""
         params: dict = {"limit": limit, "include_events": include_events}
@@ -45,6 +46,8 @@ def server(state):
             params["session_limit"] = session_limit
         if not include_native:
             params["include_native"] = False
+        if after_seq is not None:
+            params["after_seq"] = after_seq
         return await request(state, "agent_monitor", params)
 
     @mcp.tool(annotations=read_only)
