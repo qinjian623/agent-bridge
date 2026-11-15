@@ -13,7 +13,6 @@ from .config import Config, Profile, safe_error
 from .errors import BridgeError
 from .runtimes import runtime
 from .store import Store, identifier, validate_task_timeout
-from .telegram_guard import register_child
 from .usage import priced_usage
 from .workspace import capture_patch
 
@@ -304,7 +303,6 @@ class Worker:
                     raise TimeoutError(
                         f"Native startup timed out during connect after {self.config.task_timeout:g}s; no task was dispatched"
                     ) from error
-                register_child(self.config.telegram_database, profile.runtime, self.agent.native_id)
                 self.store.worker_ready(
                     self.session_id, self.generation, pid, start, self.agent.native_id, task_timeout_supported=True,
                 )

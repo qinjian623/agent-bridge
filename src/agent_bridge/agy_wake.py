@@ -16,7 +16,6 @@ from contextlib import closing
 from pathlib import Path
 
 from .agy_presence import inactive_reason
-from .telegram_guard import delivery_status
 
 
 def native_baseline(home, native_id):
@@ -38,19 +37,14 @@ def wake(job, emit):
     executable = job.get("executable", "agy")
     locks = Path(job["async_state"]) / "antigravity-locks"
     locks.mkdir(mode=0o700, parents=True, exist_ok=True)
-    external_id = "antigravity:" + native_id
-
     def blocked(exclude_pid=None):
-        external = delivery_status(job.get("telegram_database"), external_id)
-        if external != "open":
-            return "Telegram delivery state: " + external
         return inactive_reason(native_id, executable, native_home=home, exclude_pid=exclude_pid)
 
     with (locks / (native_id + ".lock")).open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return {"status": "deferred", "error": "Original session already has a bridge/Telegram worker"}
+            return {"status": "deferred", "error": "Original session already has an active bridge worker"}
         reason = blocked()
         if reason:
             return {"status": "deferred", "error": reason}

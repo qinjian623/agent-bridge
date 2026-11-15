@@ -75,17 +75,10 @@ def advance(client, job):
 
 
 def main():
-    from telegram_guard import delivery_status
-
     job = json.load(sys.stdin)
     if job["runtime"] != "codex":
         print(json.dumps({"status": "failed", "error": "No verified queue transport for this runtime"}))
         return
-    if not job.get("inspect"):
-        external = delivery_status(job.get("telegram_database"), job["native_id"])
-        if external != "open":
-            print(json.dumps({"status": "deferred", "error": "Telegram delivery state: " + external}))
-            return
     with ExitStack() as stack:
         try:
             from codex_async.app_server import CodexAppServer

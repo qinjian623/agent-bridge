@@ -60,7 +60,7 @@ async def send(config, delivery, *, inspect=False):
     except OSError as error:
         return {"status": "deferred", "error": "Queue helper did not start: " + safe_error(error)}
     try:
-        payload = {**delivery, "inspect": inspect, "telegram_database": config.telegram_database}
+        payload = {**delivery, "inspect": inspect}
         stdout, stderr = await asyncio.wait_for(process.communicate(encode(payload).encode()), 45)
         if process.returncode:
             raise RuntimeError("Queue helper failed: " + safe_error(stderr.decode(errors="replace")))
@@ -73,9 +73,7 @@ async def send(config, delivery, *, inspect=False):
 
 async def send_agy(store, config, row, *, queue_id=None):
     item_id = queue_id or row["id"]
-    payload = {**row, "telegram_database": config.telegram_database,
-               "async_state": str(Path(config.telegram_database).parent if config.telegram_database else Path.home() / ".local/state/codex-async"),
-               "timeout": config.task_timeout}
+    payload = {**row, "async_state": str(store.state), "timeout": config.task_timeout}
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "agent_bridge.agy_wake", stdin=asyncio.subprocess.PIPE,
