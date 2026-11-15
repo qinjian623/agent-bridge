@@ -16,7 +16,7 @@ from .codex_parent import read_resume_config
 from .config import Config, Profile
 from .errors import BridgeError
 from .parent_usage import meter_usage, refresh_meter, start_meter
-from .peer_protocol import MAX_FRAME_BYTES, DeliverySource, PeerErrorCode, compute_stream_id
+from .peer_protocol import MAX_FRAME_BYTES, DeliverySource, PeerErrorCode, compute_stream_id, unwrap_peer_event
 
 
 def encode(value):
@@ -333,6 +333,7 @@ CREATE TABLE IF NOT EXISTS peer_event_mirrors (
  host_id TEXT NOT NULL, node_id TEXT NOT NULL, state_generation TEXT NOT NULL,
  remote_seq INTEGER NOT NULL, local_seq INTEGER NOT NULL UNIQUE REFERENCES events(seq),
  fingerprint TEXT NOT NULL, created REAL NOT NULL,
+ origin_node_id TEXT, origin_state_generation TEXT, origin_seq INTEGER, origin_fingerprint TEXT,
  PRIMARY KEY(host_id,node_id,state_generation,remote_seq)
 );
 CREATE TABLE IF NOT EXISTS peer_event_cursors (
@@ -429,9 +430,65 @@ class Store:
             self._migrate_node_outbox(db)
             self._migrate_peer_inbox(db)
             self._migrate_native_send_queue(db)
+            self._migrate_peer_event_mirrors(db)
             self._migrate_workspace_tables(db)
             self._initialize_commit_log(db)
         self.path.chmod(0o600)
+
+    @classmethod
+    def _migrate_peer_event_mirrors(cls, db):
+        columns = {row[1] for row in db.execute("PRAGMA table_info(peer_event_mirrors)")}
+        additions = (
+            ("origin_node_id", "TEXT"),
+            ("origin_state_generation", "TEXT"),
+            ("origin_seq", "INTEGER"),
+            ("origin_fingerprint", "TEXT"),
+        )
+        for name, sql_type in additions:
+            if name not in columns:
+                db.execute(f"ALTER TABLE peer_event_mirrors ADD COLUMN {name} {sql_type}")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS peer_event_mirrors_origin "
+            "ON peer_event_mirrors(origin_node_id,origin_state_generation,origin_seq)"
+        )
+        pending = db.execute(
+            "SELECT m.host_id,m.node_id,m.state_generation,m.remote_seq,m.local_seq,e.kind,e.data,e.created "
+            "FROM peer_event_mirrors m LEFT JOIN events e ON e.seq=m.local_seq "
+            "WHERE m.origin_node_id IS NULL"
+        ).fetchall()
+        for row in pending:
+            origin_node_id = row["node_id"]
+            origin_gen = row["state_generation"]
+            origin_seq = row["remote_seq"]
+            origin_fp = None
+            data = cls._decode_json(row["data"])
+            if isinstance(data, dict):
+                synthetic = {
+                    "seq": row["remote_seq"],
+                    "type": row["kind"] or "event",
+                    "ref": {
+                        "host_id": row["host_id"],
+                        "node_id": row["node_id"],
+                        "state_generation": row["state_generation"],
+                        "local_id": str(row["remote_seq"]),
+                    },
+                    "payload": data,
+                    "created": float(row["created"] or 0.0),
+                }
+                origin_event, wrapped = unwrap_peer_event(synthetic)
+                if wrapped:
+                    origin_node_id = origin_event["ref"]["node_id"]
+                    origin_gen = origin_event["ref"]["state_generation"]
+                    origin_seq = origin_event["seq"]
+                    origin_fp = hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest()
+            db.execute(
+                "UPDATE peer_event_mirrors SET origin_node_id=?,origin_state_generation=?,origin_seq=?,origin_fingerprint=? "
+                "WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
+                (
+                    origin_node_id, origin_gen, origin_seq, origin_fp,
+                    row["host_id"], row["node_id"], row["state_generation"], row["remote_seq"],
+                ),
+            )
 
     @staticmethod
     def _migrate_workspace_tables(db):
@@ -1767,7 +1824,7 @@ class Store:
             )
             return self.remember(db, request_id, fingerprint, {"question_id": question_id, "revision": revision + 1})
 
-    def events(self, after=0, session_id=None, task_id=None, limit=100):
+    def events(self, after=0, session_id=None, task_id=None, limit=100, *, exclude_mirrored=False):
         if not isinstance(after, int) or after < 0:
             raise BridgeError("invalid_cursor", "Event cursor must be a nonnegative integer")
         clauses, values = ["seq>?"], [after]
@@ -1775,6 +1832,12 @@ class Store:
             if value:
                 clauses.append(key + "=?")
                 values.append(value)
+        if exclude_mirrored:
+            clauses.extend([
+                "NOT EXISTS (SELECT 1 FROM peer_event_mirrors m WHERE m.local_seq=events.seq)",
+                "NOT EXISTS (SELECT 1 FROM mirrored_parent_notifications n WHERE n.local_seq=events.seq)",
+                "kind!='peer_event_conflict'",
+            ])
         with self.connection() as db:
             rows = db.execute(
                 "SELECT * FROM events WHERE " + " AND ".join(clauses) + " ORDER BY seq LIMIT ?",
@@ -2255,11 +2318,18 @@ class Store:
     # ---------------------------------------------------------------- multi-machine phase C event mirror
 
     @staticmethod
-    def _peer_identity(host_id, node_id, state_generation):
-        for name, value in (("host_id", host_id), ("node_id", node_id), ("state_generation", state_generation)):
-            if not isinstance(value, str) or not value:
-                raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{name} must be a non-empty string")
-        return (host_id, node_id, state_generation)
+    def _non_empty_text(value, name):
+        if not isinstance(value, str) or not value:
+            raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"{name} must be a non-empty string")
+        return value
+
+    @classmethod
+    def _peer_identity(cls, host_id, node_id, state_generation):
+        return (
+            cls._non_empty_text(host_id, "host_id"),
+            cls._non_empty_text(node_id, "node_id"),
+            cls._non_empty_text(state_generation, "state_generation"),
+        )
 
     @staticmethod
     def _seq_value(value, name, minimum=0):
@@ -2342,20 +2412,39 @@ class Store:
             identity,
         ).fetchone()["after_seq"]
 
-    def mirror_peer_event(self, host_id, node_id, state_generation, remote_seq, fingerprint, local_seq, *, db=None):
+    def mirror_peer_event(
+        self,
+        host_id,
+        node_id,
+        state_generation,
+        remote_seq,
+        fingerprint,
+        local_seq,
+        *,
+        db=None,
+        origin_node_id=None,
+        origin_state_generation=None,
+        origin_seq=None,
+        origin_fingerprint=None,
+    ):
         """Map a remote event seq to a local events.seq. Same fingerprint is a duplicate; different is a conflict."""
         identity = self._peer_identity(host_id, node_id, state_generation)
         remote_seq = self._seq_value(remote_seq, "remote_seq")
         local_seq = self._seq_value(local_seq, "local_seq", 1)
         if not isinstance(fingerprint, str) or not fingerprint:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "fingerprint must be a non-empty string")
+        resolved_origin_node = self._non_empty_text(origin_node_id or identity[1], "origin_node_id")
+        resolved_origin_gen = self._non_empty_text(origin_state_generation or identity[2], "origin_state_generation")
+        resolved_origin_seq = self._seq_value(remote_seq if origin_seq is None else origin_seq, "origin_seq")
+        resolved_origin_fp = origin_fingerprint if origin_node_id is not None else fingerprint
+        origin = (resolved_origin_node, resolved_origin_gen, resolved_origin_seq, resolved_origin_fp)
         if db is not None:
-            return self._mirror_peer_event(db, identity, remote_seq, fingerprint, local_seq)
+            return self._mirror_peer_event(db, identity, remote_seq, fingerprint, local_seq, origin)
         with self.connection(write=True) as connection:
-            return self._mirror_peer_event(connection, identity, remote_seq, fingerprint, local_seq)
+            return self._mirror_peer_event(connection, identity, remote_seq, fingerprint, local_seq, origin)
 
     @staticmethod
-    def _mirror_peer_event(db, identity, remote_seq, fingerprint, local_seq):
+    def _mirror_peer_event(db, identity, remote_seq, fingerprint, local_seq, origin):
         row = db.execute(
             "SELECT * FROM peer_event_mirrors WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
             (*identity, remote_seq),
@@ -2365,9 +2454,9 @@ class Store:
                 raise BridgeError(PeerErrorCode.OPERATION_CONFLICT, "remote event seq was mirrored with different content")
             return dict(row)
         db.execute(
-            "INSERT INTO peer_event_mirrors(host_id,node_id,state_generation,remote_seq,local_seq,fingerprint,created) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (*identity, remote_seq, local_seq, fingerprint, time.time()),
+            "INSERT INTO peer_event_mirrors(host_id,node_id,state_generation,remote_seq,local_seq,fingerprint,created,"
+            "origin_node_id,origin_state_generation,origin_seq,origin_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (*identity, remote_seq, local_seq, fingerprint, time.time(), *origin),
         )
         return dict(
             db.execute(
@@ -2385,6 +2474,21 @@ class Store:
                 "SELECT * FROM peer_event_mirrors WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
                 (*identity, remote_seq),
             ).fetchone()
+        return None if row is None else dict(row)
+
+    def get_mirrored_event_by_origin(self, origin_node_id, origin_state_generation, origin_seq, *, db=None):
+        origin_node_id = self._non_empty_text(origin_node_id, "origin_node_id")
+        origin_state_generation = self._non_empty_text(origin_state_generation, "origin_state_generation")
+        origin_seq = self._seq_value(origin_seq, "origin_seq")
+        query = (
+            "SELECT * FROM peer_event_mirrors WHERE origin_node_id=? AND origin_state_generation=? "
+            "AND origin_seq=? ORDER BY local_seq LIMIT 1"
+        )
+        if db is not None:
+            row = db.execute(query, (origin_node_id, origin_state_generation, origin_seq)).fetchone()
+            return None if row is None else dict(row)
+        with self.connection() as connection:
+            row = connection.execute(query, (origin_node_id, origin_state_generation, origin_seq)).fetchone()
         return None if row is None else dict(row)
 
     @classmethod

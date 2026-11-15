@@ -736,6 +736,29 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
             PeerErrorCode.INVALID_PARAMS,
         )
 
+    async def test_events_excludes_mirrored_and_conflict_events_without_stalling_cursor(self):
+        with self.store.connection(write=True) as db:
+            first_local = self.store.event(db, "local_one", {"n": 1})
+            mirrored_a = self.store.event(db, "remote_event", {"source": {"host_id": "h"}, "remote_seq": 10})
+            self.store.mirror_peer_event("h", "node-h", "gen-h", 10, "fp-1", mirrored_a, db=db)
+            conflict_seq = self.store.event(db, "peer_event_conflict", {"remote_seq": 10})
+            second_local = self.store.event(db, "local_two", {"n": 2})
+            mirrored_b = self.store.event(db, "remote_event", {"source": {"host_id": "h"}, "remote_seq": 11})
+            self.store.mirror_peer_event("h", "node-h", "gen-h", 11, "fp-2", mirrored_b, db=db)
+        self.assertGreater(conflict_seq, mirrored_a)
+        page1 = await self.peer("peer.events", {"after": 0, "limit": 1})
+        self.assertTrue(page1["ok"], page1)
+        self.assertEqual([first_local], [item["seq"] for item in page1["result"]["items"]])
+        self.assertTrue(page1["result"]["has_more"])
+        page2 = await self.peer("peer.events", {"after": page1["result"]["cursor"], "limit": 10})
+        self.assertTrue(page2["ok"], page2)
+        self.assertEqual([second_local], [item["seq"] for item in page2["result"]["items"]])
+        self.assertFalse(page2["result"]["has_more"])
+        self.assertEqual(second_local, page2["result"]["cursor"])
+        tail = await self.peer("peer.events", {"after": page2["result"]["cursor"], "limit": 10})
+        self.assertEqual([], tail["result"]["items"])
+        self.assertFalse(tail["result"]["has_more"])
+
 
 class FakePeerClient:
     def __init__(self):
