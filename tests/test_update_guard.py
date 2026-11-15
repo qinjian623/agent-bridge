@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -164,3 +165,91 @@ class BrokerUpdateGuardTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(BridgeError):
                 await self.broker.api_call("agent_inspect", {"parent_id": "synthetic-parent"})
             helper.assert_not_called()
+
+    async def test_broker_loops_survive_transient_sqlite_locked_error(self):
+        from agent_bridge import notifications as notify_mod
+
+        notif_calls = 0
+
+        def flaky_refresh():
+            nonlocal notif_calls
+            notif_calls += 1
+            if notif_calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+
+        notif_waits = 0
+
+        async def notif_wait(_delay):
+            nonlocal notif_waits
+            notif_waits += 1
+            if notif_waits >= 2:
+                self.broker.stopping.set()
+
+        with (
+            patch.object(self.broker.store, "refresh_parent_usage", side_effect=flaky_refresh),
+            patch.object(notify_mod, "deliver", new_callable=AsyncMock),
+            patch.object(self.broker, "_loop_wait", side_effect=notif_wait),
+        ):
+            await self.broker.notifications()
+        self.assertEqual(2, notif_calls)
+        self.assertEqual({}, getattr(self.broker, "_loop_errors", {}))
+
+        self.broker.stopping.clear()
+        sched_calls = 0
+
+        def flaky_sessions():
+            nonlocal sched_calls
+            sched_calls += 1
+            if sched_calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return []
+
+        sched_waits = 0
+
+        async def sched_wait(_delay):
+            nonlocal sched_waits
+            sched_waits += 1
+            if sched_waits >= 2:
+                self.broker.stopping.set()
+
+        with (
+            patch.object(self.broker.store, "sessions", side_effect=flaky_sessions),
+            patch.object(self.broker, "_loop_wait", side_effect=sched_wait),
+        ):
+            await self.broker.scheduler()
+        self.assertEqual(2, sched_calls)
+        self.assertEqual({}, getattr(self.broker, "_loop_errors", {}))
+
+    async def test_broker_serve_finally_closes_peer_factory_and_unlinks_socket(self):
+        self.broker.peer_factory = type(
+            "FakePeers", (), {"close": AsyncMock()}
+        )()
+
+        async def crashing_scheduler():
+            await asyncio.sleep(0)
+            raise RuntimeError("boom")
+
+        async def noop_loop():
+            await self.broker.stopping.wait()
+
+        async def trigger_stop():
+            await asyncio.sleep(0.05)
+            self.broker.stopping.set()
+
+        stopper = asyncio.create_task(trigger_stop())
+        try:
+            with (
+                patch.object(self.broker, "scheduler", side_effect=crashing_scheduler),
+                patch.object(self.broker, "notifications", side_effect=noop_loop),
+                patch.object(self.broker, "native_notifications", side_effect=noop_loop),
+                patch.object(self.broker, "watch_hosts", side_effect=noop_loop),
+                patch.object(self.broker.delivery_scheduler, "run", side_effect=noop_loop),
+                patch.object(self.broker.outbox_puller, "run", side_effect=noop_loop),
+                patch.object(self.broker.event_mirror, "run", side_effect=noop_loop),
+            ):
+                await self.broker.serve()
+        finally:
+            await stopper
+
+        self.broker.peer_factory.close.assert_awaited_once()
+        self.assertFalse((self.state / "broker.sock").exists())

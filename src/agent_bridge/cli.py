@@ -32,7 +32,7 @@ def _relay_release_changed(state):
     current = Path(load_settings(state)["root"]) / "current"
     initial = current.resolve()
     running = Path(sys.prefix).resolve()
-    expected = running if running.parent == current.parent / "releases" else initial
+    expected = running if running.parent == (current.parent / "releases").resolve() else initial
 
     def changed():
         try:

@@ -399,6 +399,13 @@ class MonitorCollector:
         return cur.fetchone() is not None
 
     @staticmethod
+    def _frozen_task_filter(rowids: set[int]) -> tuple[str, tuple[str, ...]]:
+        """Exclude mutable task rowids in one bound JSON parameter without SQLite variable-count cliffs."""
+        if not rowids:
+            return "", ()
+        return " AND rowid NOT IN (SELECT value FROM json_each(?))", (json.dumps(sorted(rowids), separators=(",", ":")),)
+
+    @staticmethod
     def _is_valid_broker_snapshot_reply(data: Any) -> bool:
         """Verify that a broker IPC snapshot payload has valid schema, nested elements, and types."""
         def _is_str(val: Any) -> bool:
@@ -885,9 +892,12 @@ class MonitorCollector:
         session_runtime_map: dict[str, str] = {}
         live_worker_pids: set[int] = set()
         live_bridge_native_ids: set[tuple[str, str]] = set()
+        remote_hosts = [h for h in hosts if h.get("host_id") != "local"]
+        local_host_entry = next((h for h in hosts if h.get("host_id") == "local"), None)
+        local_online = 1 if (local_host_entry is None or local_host_entry.get("state") == "online") else 0
         metrics: dict[str, Any] = {
-            "total_hosts": len(hosts) + 1,
-            "online_hosts": sum(1 for h in hosts if h.get("state") == "online") + 1,
+            "total_hosts": len(remote_hosts) + 1,
+            "online_hosts": sum(1 for h in remote_hosts if h.get("state") == "online") + local_online,
             "total_sessions": 0,
             "active_sessions": 0,
             "running_tasks": 0,
@@ -967,18 +977,6 @@ class MonitorCollector:
                                 rt_norm = normalize_runtime(r[0]) or str(r[0] or "")
                                 native_group_labels[(rt_norm, r[1])] = r[2]
 
-                    session_hosts: dict[str, str] = {}
-                    if self._has_table(db, "peer_outbox"):
-                        for r in db.execute(
-                            "SELECT host_id, target_id FROM peer_outbox WHERE target_kind='bridge' AND target_id IS NOT NULL"
-                        ).fetchall():
-                            session_hosts[r["target_id"]] = r["host_id"]
-                    if self._has_table(db, "remote_group_members"):
-                        for r in db.execute(
-                            "SELECT host_id, target_id FROM remote_group_members WHERE target_kind='bridge' AND target_id IS NOT NULL"
-                        ).fetchall():
-                            session_hosts[r["target_id"]] = r["host_id"]
-
                     session_names_map: dict[str, str] = {}
                     session_runtime_map: dict[str, str] = {}
                     live_worker_pids: set[int] = set()
@@ -990,16 +988,15 @@ class MonitorCollector:
                     has_events_table = self._has_table(db, "events")
                     if self._has_table(db, "tasks"):
                         t_wm = self._task_watermark
-                        if t_wm > 0 and len(self._mutable_task_rowids) <= 250:
-                            m_list = sorted(self._mutable_task_rowids)
-                            frozen_clause = f" AND rowid NOT IN ({','.join('?' for _ in m_list)})" if m_list else ""
+                        if t_wm > 0:
+                            frozen_clause, m_params = self._frozen_task_filter(self._mutable_task_rowids)
                             t_count_row = db.execute(
                                 "SELECT COUNT(*), COALESCE(MAX(rowid), 0), "
                                 "       (SELECT COUNT(*) FROM tasks WHERE rowid <= ?), "
                                 "       (SELECT id FROM tasks WHERE rowid = ?), "
                                 f"      (SELECT {_TASK_FP_EXPR} FROM tasks WHERE rowid <= ?{frozen_clause}) "
                                 "FROM tasks",
-                                (t_wm, t_wm, t_wm, *m_list),
+                                (t_wm, t_wm, t_wm, *m_params),
                             ).fetchone()
                             cur_task_count = int(t_count_row[0]) if t_count_row else 0
                             cur_task_max_rowid = int(t_count_row[1]) if t_count_row else 0
@@ -1018,12 +1015,11 @@ class MonitorCollector:
                             ev_row = db.execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()
                             cur_ev_max = int(ev_row[0]) if ev_row else 0
 
-                        # Fall back to cold scan if DB shrank/VACUUMed/replaced below watermark, events reset, or mutable set grew large.
+                        # Fall back to cold scan if DB shrank/VACUUMed/replaced below watermark or events reset.
                         if (
                             t_wm > 0
                             and (
-                                len(self._mutable_task_rowids) > 250
-                                or cur_task_count < self._task_total_count
+                                cur_task_count < self._task_total_count
                                 or cur_task_le_wm != self._task_total_count
                                 or cur_task_max_rowid < t_wm
                                 or cur_task_wm_id != self._task_watermark_id
@@ -1181,14 +1177,13 @@ class MonitorCollector:
                         new_t_wm_fp = ""
                         new_t_wm_count = cur_task_count
                         if new_t_wm > 0:
-                            end_m_list = sorted(mutable_rowids) if len(mutable_rowids) <= 250 else []
-                            end_frozen_clause = f" AND rowid NOT IN ({','.join('?' for _ in end_m_list)})" if end_m_list else ""
+                            end_frozen_clause, end_m_params = self._frozen_task_filter(mutable_rowids)
                             wm_row = db.execute(
                                 "SELECT (SELECT id FROM tasks WHERE rowid = ?), "
                                 "       (SELECT COUNT(*) FROM tasks WHERE rowid <= ?), "
                                 f"      {_TASK_FP_EXPR} "
                                 f"FROM tasks WHERE rowid <= ?{end_frozen_clause}",
-                                (new_t_wm, new_t_wm, new_t_wm, *end_m_list),
+                                (new_t_wm, new_t_wm, new_t_wm, *end_m_params),
                             ).fetchone()
                             new_t_wm_id = wm_row[0] if wm_row else None
                             new_t_wm_count = int(wm_row[1] or 0) if wm_row else 0
@@ -1734,7 +1729,7 @@ class MonitorCollector:
                                     "source": "bridge",
                                     "managed": True,
                                     "name": s_name,
-                                    "host_id": session_hosts.get(sid, "local"),
+                                    "host_id": "local",
                                     "profile": profile_name,
                                     "model": model_name,
                                     "runtime": session_rt,

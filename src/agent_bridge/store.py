@@ -346,6 +346,8 @@ CREATE TABLE IF NOT EXISTS peer_parent_routes (
  child_id TEXT NOT NULL, parent_ref TEXT NOT NULL, created REAL NOT NULL,
  PRIMARY KEY(host_id,node_id,state_generation,child_id)
 );
+CREATE INDEX IF NOT EXISTS peer_parent_routes_node
+ ON peer_parent_routes(node_id,state_generation,child_id);
 CREATE TABLE IF NOT EXISTS mirrored_parent_notifications (
  local_seq INTEGER PRIMARY KEY REFERENCES events(seq), parent_ref TEXT NOT NULL,
  operation_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
@@ -432,6 +434,9 @@ class Store:
             self._migrate_native_send_queue(db)
             self._migrate_peer_event_mirrors(db)
             self._migrate_workspace_tables(db)
+            if "request_id" not in {row[1] for row in db.execute("PRAGMA table_info(peer_operations)")}:
+                db.execute("ALTER TABLE peer_operations ADD COLUMN request_id TEXT")
+            db.execute("CREATE INDEX IF NOT EXISTS peer_operations_request ON peer_operations(request_id)")
             self._initialize_commit_log(db)
         self.path.chmod(0o600)
 
@@ -481,6 +486,8 @@ class Store:
                     origin_gen = origin_event["ref"]["state_generation"]
                     origin_seq = origin_event["seq"]
                     origin_fp = hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest()
+                else:
+                    origin_fp = row["fingerprint"]
             db.execute(
                 "UPDATE peer_event_mirrors SET origin_node_id=?,origin_state_generation=?,origin_seq=?,origin_fingerprint=? "
                 "WHERE host_id=? AND node_id=? AND state_generation=? AND remote_seq=?",
@@ -489,6 +496,11 @@ class Store:
                     row["host_id"], row["node_id"], row["state_generation"], row["remote_seq"],
                 ),
             )
+        db.execute(
+            "UPDATE peer_event_mirrors SET origin_fingerprint=fingerprint "
+            "WHERE origin_node_id=node_id AND origin_state_generation=state_generation "
+            "AND origin_seq=remote_seq AND origin_fingerprint IS NULL"
+        )
 
     @staticmethod
     def _migrate_workspace_tables(db):
@@ -2026,6 +2038,7 @@ class Store:
         status="pending",
         result=None,
         error=None,
+        request_id=None,
     ):
         """Persist one idempotency record for `(node_id, state_generation, operation_id)` (ADR-04).
 
@@ -2038,6 +2051,7 @@ class Store:
         encoded_params = encode(params if params is not None else {})
         encoded_result = encode(result) if result is not None else None
         encoded_error = None if error is None else (error if isinstance(error, str) else encode(error))
+        stored_request_id = request_id if isinstance(request_id, str) and request_id else None
         with self.connection(write=True) as db:
             existing = db.execute(
                 "SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)
@@ -2048,10 +2062,18 @@ class Store:
                         PeerErrorCode.OPERATION_CONFLICT,
                         "operation_id was already used for different parameters",
                     )
+                if stored_request_id is not None and not existing["request_id"]:
+                    db.execute(
+                        "UPDATE peer_operations SET request_id=? WHERE operation_id=?",
+                        (stored_request_id, operation_id),
+                    )
+                    existing = db.execute(
+                        "SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)
+                    ).fetchone()
                 return self._peer_operation(existing)
             db.execute(
-                "INSERT INTO peer_operations(operation_id,node_id,state_generation,fingerprint,method,params,status,result,error,created,updated) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO peer_operations(operation_id,node_id,state_generation,fingerprint,method,params,status,result,error,created,updated,request_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     operation_id,
                     node_id or "",
@@ -2064,6 +2086,7 @@ class Store:
                     encoded_error,
                     now,
                     now,
+                    stored_request_id,
                 ),
             )
             row = db.execute("SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)).fetchone()
@@ -2382,6 +2405,19 @@ class Store:
             ).fetchone()
         return None if row is None else self._parent_route(row)
 
+    def lookup_parent_route_by_node(self, node_id, state_generation, child_id):
+        node_id = self._non_empty_text(node_id, "node_id")
+        state_generation = self._non_empty_text(state_generation, "state_generation")
+        if not isinstance(child_id, str) or not child_id:
+            return None
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT * FROM peer_parent_routes WHERE node_id=? AND state_generation=? AND child_id=? "
+                "ORDER BY created, host_id LIMIT 1",
+                (node_id, state_generation, child_id),
+            ).fetchone()
+        return None if row is None else self._parent_route(row)
+
     def get_peer_event_cursor(self, host_id, node_id, state_generation) -> int:
         identity = self._peer_identity(host_id, node_id, state_generation)
         with self.connection() as db:
@@ -2482,7 +2518,9 @@ class Store:
         origin_seq = self._seq_value(origin_seq, "origin_seq")
         query = (
             "SELECT * FROM peer_event_mirrors WHERE origin_node_id=? AND origin_state_generation=? "
-            "AND origin_seq=? ORDER BY local_seq LIMIT 1"
+            "AND origin_seq=? ORDER BY CASE WHEN node_id=origin_node_id "
+            "AND state_generation=origin_state_generation AND remote_seq=origin_seq THEN 0 ELSE 1 END, "
+            "local_seq LIMIT 1"
         )
         if db is not None:
             row = db.execute(query, (origin_node_id, origin_state_generation, origin_seq)).fetchone()

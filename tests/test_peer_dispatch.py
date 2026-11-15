@@ -1,10 +1,12 @@
+import hashlib
 import json
 import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from agent_bridge.broker import Broker
 from agent_bridge.config import Config, Profile
@@ -12,7 +14,7 @@ from agent_bridge.errors import BridgeError
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.peer_api import DirectPeerService
 from agent_bridge.peer_protocol import INLINE_RESULT_BYTES, PeerErrorCode
-from agent_bridge.store import Store
+from agent_bridge.store import Store, encode
 
 
 class PeerStoreTests(unittest.TestCase):
@@ -759,6 +761,48 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], tail["result"]["items"])
         self.assertFalse(tail["result"]["has_more"])
 
+    async def test_deliver_applies_open_model_via_model_directory_and_rejects_unknown_model_cleanly(self):
+        resolved_profile = Profile(
+            name="worker",
+            runtime=self.profile.runtime,
+            model="exact-model-2026",
+            executable=sys.executable,
+            verified=True,
+        )
+        models = SimpleNamespace(
+            resolve=AsyncMock(side_effect=[resolved_profile, BridgeError("unknown_model", "Unknown model")]),
+        )
+        service = DirectPeerService(
+            self.identity,
+            host_id="gpu-a",
+            store=self.store,
+            config=self.config,
+            model_directory=models,
+        )
+        ok_params = self.deliver_params(
+            operation=self.operation("op-model-ok"),
+            delivery_id="delivery-model-ok",
+            target_seq=1,
+        )
+        ok_params["open"]["model"] = "exact-model-2026"
+        ok_resp = await service.handle({"v": 1, "id": "m-1", "method": "peer.deliver", "params": ok_params})
+        self.assertTrue(ok_resp["ok"], ok_resp)
+        session = self.store.get_session(ok_resp["result"]["session_id"])
+        self.assertEqual("exact-model-2026", session["profile"]["model"])
+
+        bad_params = self.deliver_params(
+            operation=self.operation("op-model-bad"),
+            delivery_id="delivery-model-bad",
+            target_seq=2,
+        )
+        bad_params["open"]["model"] = "nonexistent-model"
+        bad_resp = await service.handle({"v": 1, "id": "m-2", "method": "peer.deliver", "params": bad_params})
+        self.assert_error(bad_resp, "unknown_model")
+        self.assertIsNone(self.store.get_operation("op-model-bad"))
+        with self.store.connection() as db:
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM peer_inbox").fetchone()[0])
+
 
 class FakePeerClient:
     def __init__(self):
@@ -1131,6 +1175,83 @@ class CoordinatorRoutingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BridgeError) as caught:
             await self.broker.call("agent_operation", {"operation_id": "remote-op", "wait": -1})
         self.assertEqual("invalid_request", caught.exception.code)
+
+    async def test_stable_operation_id_rotates_on_peer_state_generation(self):
+        op1 = Broker._stable_operation_id("gpu-a", "node-a", "gen-1", "peer.deliver", "req-1", {"k": "v"})
+        op2 = Broker._stable_operation_id("gpu-a", "node-a", "gen-2", "peer.deliver", "req-1", {"k": "v"})
+        self.assertNotEqual(op1, op2)
+
+    async def test_transient_errors_allow_retry_with_same_request_id(self):
+        success = {
+            "delivery_id": "d-1",
+            "status": "accepted_remote",
+            "session_id": "remote-sess",
+            "task_id": "remote-task",
+        }
+        scenarios = (
+            ("peer_host_offline", {"found": False}),
+            ("update_busy", {"found": False}),
+            ("peer_host_offline", {"found": True, "operation_status": "accepted_remote", "delivery": success}),
+        )
+        for idx, (code, lookup_reply) in enumerate(scenarios):
+            req_id = f"retry-{code}-{idx}"
+            args = {
+                "host_id": "gpu-a",
+                "profile": "fixed",
+                "cwd": str(self.state),
+                "instruction": "work",
+                "request_id": req_id,
+            }
+            with self.subTest(code=code, lookup_found=lookup_reply["found"]):
+                self.client.deliver_results.clear()
+                self.client.lookup_results.clear()
+                deliver_calls = 0
+
+                async def fake_deliver(_params, err=code):
+                    nonlocal deliver_calls
+                    deliver_calls += 1
+                    if deliver_calls == 1:
+                        raise BridgeError(err, "transient")
+                    return success
+
+                self.client.lookup_results.append(lookup_reply)
+                with patch.object(self.client, "deliver", side_effect=fake_deliver):
+                    first = await self.broker.api_call("agent_dispatch", args)
+                    self.assertEqual(code, first["error"]["code"])
+                    second = await self.broker.api_call("agent_dispatch", args)
+                    self.assertEqual("remote-task", second["result"]["task_id"])
+                    self.assertEqual(1 if lookup_reply["found"] else 2, deliver_calls)
+
+    async def test_api_call_recovers_completed_peer_operation_when_api_request_response_is_null(self):
+        args = {
+            "host_id": "gpu-a",
+            "profile": "fixed",
+            "cwd": str(self.state),
+            "instruction": "recover me",
+            "request_id": "recover-req-1",
+        }
+        fingerprint = hashlib.sha256(encode({"method": "agent_dispatch", "params": args}).encode()).hexdigest()
+        completed_result = {"session_id": "rs-1", "task_id": "rt-1", "status": "accepted_remote"}
+        expected_result = {"operation_id": "op-recover-1", "host_id": "gpu-a", **completed_result}
+        with self.broker.store.connection(write=True) as db:
+            db.execute("INSERT INTO api_requests(id,fingerprint) VALUES(?,?)", ("recover-req-1", fingerprint))
+        self.broker.store.record_operation(
+            "op-recover-1",
+            node_id="node-a",
+            state_generation="generation-a",
+            fingerprint="op-fp",
+            method="peer.deliver",
+            params={"host_id": "gpu-a", "message": "recover me"},
+            status="completed",
+            result=completed_result,
+            request_id="recover-req-1",
+        )
+
+        response = await self.broker.api_call("agent_dispatch", args)
+        self.assertEqual({"result": expected_result}, response)
+        with self.broker.store.connection() as db:
+            row = db.execute("SELECT response FROM api_requests WHERE id=?", ("recover-req-1",)).fetchone()
+            self.assertEqual({"result": expected_result}, json.loads(row["response"]))
 
 
 if __name__ == "__main__":

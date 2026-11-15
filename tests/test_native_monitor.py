@@ -3889,6 +3889,153 @@ class NativeAndApiMonitorTests(unittest.TestCase):
                 cli_main(["monitor", "--web", "--runtime", "agy"])
         self.assertEqual(2, ctx.exception.code)
 
+    def test_sse_filtered_full_page_advances_cursor_and_stagnant_compat_sleeps(self) -> None:
+        self._seed_store()
+        sse_state = self.root / "sse-spin-state"
+        sse_state.mkdir()
+        (sse_state / "admin.token").write_text(TOKEN)
+        (sse_state / "admin.token").chmod(0o600)
+        store = Store(sse_state)
+        now = time.time()
+        with store.connection(write=True) as db:
+            db.execute(
+                "INSERT INTO sessions(id,profile,cwd,access,desired,observed,revision,created) VALUES(?,?,?,?,?,?,?,?)",
+                ("s-codex", json.dumps({"runtime": "codex", "model": "gpt-6.1"}), "/repo", "read-only", "open", "running", 1, now),
+            )
+            db.execute(
+                "INSERT INTO sessions(id,profile,cwd,access,desired,observed,revision,created) VALUES(?,?,?,?,?,?,?,?)",
+                ("s-agy", json.dumps({"runtime": "agy", "model": "claude-sonnet-5"}), "/repo", "read-only", "open", "running", 1, now),
+            )
+
+        real_coll = MonitorCollector(sse_state, proc_root=self.proc_root, native_home=self.home)
+        template = real_coll.collect(limit=10, include_native=False)
+        calls: list[int | None] = []
+        base_sessions = [s for s in template.get("sessions", []) if s["id"] == "s-agy"]
+
+        class _PagedCollector:
+            proc_root = self.proc_root
+            native_home = self.home
+
+            def collect(self, **kwargs: Any) -> dict[str, Any]:
+                after = kwargs.get("after_seq")
+                calls.append(after)
+                base = {
+                    **template,
+                    "collector_version": 3,
+                    "events_truncated": False,
+                    "sessions": list(base_sessions),
+                    "metrics": {**template["metrics"], "latest_event_seq": 10},
+                }
+                if (after or 0) == 0:
+                    # Normalized "agy" passes filter_snapshot_dict ("antigravity") into raw_events
+                    # then fails line-188 raw equality check, exercising full-page empty-events cursor advance.
+                    base["events"] = [
+                        {
+                            "seq": 1,
+                            "session_id": "s-codex",
+                            "session_name": "agy #s-codex",
+                            "runtime": "agy",
+                            "task_id": "t1",
+                            "kind": "tool_completed",
+                            "summary": "e1",
+                            "created": now,
+                            "created_rel": "1s ago",
+                        },
+                        {
+                            "seq": 2,
+                            "session_id": "s-codex",
+                            "session_name": "agy #s-codex",
+                            "runtime": "agy",
+                            "task_id": "t2",
+                            "kind": "tool_completed",
+                            "summary": "e2",
+                            "created": now + 1,
+                            "created_rel": "1s ago",
+                        },
+                    ]
+                elif after == 2:
+                    base["events"] = [
+                        {
+                            "seq": 3,
+                            "session_id": "s-agy",
+                            "session_name": "agy #s-agy",
+                            "runtime": "antigravity",
+                            "task_id": "t3",
+                            "kind": "tool_completed",
+                            "summary": "e3",
+                            "created": now + 2,
+                            "created_rel": "1s ago",
+                        }
+                    ]
+                else:
+                    base["events"] = []
+                return base
+
+        status, _, wire = self._dispatch(
+            _PagedCollector(),
+            "GET",
+            "/api/v1/stream?runtime=agy&limit=2&interval=0.1&max_seconds=0.35&max_events=5",
+            extra_headers={"Last-Event-ID": "0"},
+            state=sse_state,
+        )
+        self.assertEqual(200, status)
+        # First poll hits full filtered-out page (seq 1..2), advances cursor immediately to seq 2 (not latest=10), and emits seq 3.
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(0, calls[0])
+        self.assertEqual(2, calls[1])
+        self.assertIn("id: 3\nevent: event\n", wire)
+
+        # Compat collector whose page ignores after_seq and never advances must sleep rather than busy-spin.
+        stagnant_calls = 0
+
+        class _StagnantCompatCollector:
+            proc_root = self.proc_root
+            native_home = self.home
+
+            def collect(self, **kwargs: Any) -> dict[str, Any]:
+                nonlocal stagnant_calls
+                stagnant_calls += 1
+                base = real_coll.collect(limit=10, include_native=False)
+                base["collector_version"] = 3
+                base["events_truncated"] = False
+                base["sessions"] = list(base_sessions)
+                base["metrics"]["latest_event_seq"] = 10
+                base["events"] = [
+                    {
+                        "seq": 1,
+                        "session_id": "s-codex",
+                        "session_name": "codex #s-codex",
+                        "runtime": "codex",
+                        "task_id": "t1",
+                        "kind": "tool_completed",
+                        "summary": "ignored",
+                        "created": now,
+                        "created_rel": "1s ago",
+                    },
+                    {
+                        "seq": 2,
+                        "session_id": "s-codex",
+                        "session_name": "codex #s-codex",
+                        "runtime": "codex",
+                        "task_id": "t2",
+                        "kind": "tool_completed",
+                        "summary": "ignored",
+                        "created": now,
+                        "created_rel": "1s ago",
+                    },
+                ]
+                return base
+
+        st2, _, _ = self._dispatch(
+            _StagnantCompatCollector(),
+            "GET",
+            "/api/v1/stream?runtime=claude&limit=2&interval=0.1&max_seconds=0.3&max_events=5",
+            extra_headers={"Last-Event-ID": "0"},
+            state=sse_state,
+        )
+        self.assertEqual(200, st2)
+        self.assertLessEqual(stagnant_calls, 5)
+
 
 if __name__ == "__main__":
     unittest.main()

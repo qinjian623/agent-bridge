@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .errors import BridgeError
-from .usage import TOKEN_FIELDS, priced_usage
+from .usage import TOKEN_FIELDS, priced_usage, validate_price
 
 FIELDS = {
     "input_tokens": "input_tokens",
@@ -125,8 +125,10 @@ def meter_usage(meter):
         for key in (*TOKEN_FIELDS, "reasoning_tokens", "total_tokens")
     }
     price = meter["price"]
-    if price and set(meter["models"]) - {price.get("model")}:
-        price = None
+    if price is not None:
+        validate_price(price)
+        if set(meter["models"]) - {price.get("model")}:
+            price = None
     return priced_usage(
         {
             **totals,
