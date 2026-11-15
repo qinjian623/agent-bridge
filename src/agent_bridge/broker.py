@@ -2463,10 +2463,8 @@ class Broker:
                 await asyncio.to_thread(self.store.refresh_parent_usage)
             if args.get("parent_id"):
                 from .notifications import send
-                from .telegram_guard import delivery_status
 
                 parent = self.store.get_parent(args["parent_id"])
-                parent["telegram_state"] = delivery_status(self.config.telegram_database, parent["native_id"])
                 try:
                     parent["native"] = await send(self.config, parent, "", 0, inspect=True)
                 except Exception as error:

@@ -233,17 +233,15 @@ class NativeGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"received": 1, "enqueued": 1, "uncertain": 1, "pending": 1}, current["counts"])
         self.assertEqual(result, self.broadcast())
 
-    async def test_real_helper_process_uses_existing_daemon_and_never_starts_a_session(self):
-        self.create()
-        self.broadcast()
-        self.skip_agy_fixture_delivery()
+    def install_fake_codex_async(self):
         module = self.root / "codex_async"
-        module.mkdir()
+        module.mkdir(exist_ok=True)
         (module / "__init__.py").touch()
-        calls = self.root / "calls.jsonl"
         (module / "app_server.py").write_text('''
 import json
 from pathlib import Path
+class ThreadBusyError(Exception):
+    pass
 class CodexAppServer:
     def __init__(self, cwd, *, timeout, sandbox, daemon, start_daemon):
         assert daemon is True and start_daemon is False and sandbox is None
@@ -258,6 +256,13 @@ class CodexAppServer:
             f.write(json.dumps({"native_id": native_id, "client_id": client_id}) + "\\n")
         return "receipt-" + native_id
 ''')
+        return self.root / "calls.jsonl"
+
+    async def test_real_helper_process_uses_existing_daemon_and_never_starts_a_session(self):
+        self.create()
+        self.broadcast()
+        self.skip_agy_fixture_delivery()
+        calls = self.install_fake_codex_async()
         self.config.codex_async_python = sys.executable
         with patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
             await native_broadcast.deliver(self.store, self.config)
@@ -268,7 +273,7 @@ class CodexAppServer:
         self.assertEqual(3, len({r["client_id"] for r in lines}))
         self.assertEqual(3, sum(r["status"] == "enqueued" for r in self.rows()))
 
-    async def test_native_delivery_preserves_telegram_pause_and_removal(self):
+    async def test_native_delivery_ignores_telegram_pause_and_removal(self):
         self.create()
         self.broadcast()
         self.skip_agy_fixture_delivery()
@@ -280,14 +285,13 @@ class CodexAppServer:
             db.execute("INSERT INTO inbox(thread_id,status) VALUES(?,'stopped')", (self.members[0]["native_id"],))
             db.execute("INSERT INTO removed_topics(thread_id) VALUES(?)", (self.members[1]["native_id"],))
             db.execute("INSERT INTO inbox(thread_id,status) VALUES(?,'uncertain')", (self.members[2]["native_id"],))
+        self.install_fake_codex_async()
         self.config.telegram_database = str(guard)
         self.config.codex_async_python = sys.executable
-        await native_broadcast.deliver(self.store, self.config)
-        errors = {r["native_id"]: r["error"] for r in self.rows()}
-        self.assertIn("paused", errors[self.members[0]["native_id"]])
-        self.assertIn("closed", errors[self.members[1]["native_id"]])
-        self.assertIn("paused", errors[self.members[2]["native_id"]])
-        self.assertEqual(3, sum(r["status"] == "pending" for r in self.rows()))
+        with patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
+            await native_broadcast.deliver(self.store, self.config)
+        self.assertEqual(3, sum(r["status"] == "enqueued" for r in self.rows()))
+        self.assertTrue(all(r["error"] is None for r in self.rows()[:3]))
 
     async def test_restart_recovers_api_snapshot_but_never_repeats_inflight_send(self):
         (self.root / "config.json").write_text(json.dumps({"profiles": {}, "telegram_database": None}))

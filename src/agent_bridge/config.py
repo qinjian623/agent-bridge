@@ -110,9 +110,6 @@ class Config:
     @classmethod
     def load(cls, path: Path):
         data = json.loads(path.read_text())
-        telegram_db = Path.home() / ".local/state/codex-async/telegram.sqlite"
-        if "telegram_database" not in data and telegram_db.is_file():
-            data["telegram_database"] = str(telegram_db)
         profiles = {name: Profile(name=name, **value).validate() for name, value in data.pop("profiles").items()}
         hosts = parse_hosts(data.pop("hosts", {}))
         config = cls(profiles=profiles, hosts=hosts, **data)

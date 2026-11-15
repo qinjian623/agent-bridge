@@ -8,7 +8,6 @@ from pathlib import Path
 
 from .config import safe_error
 from .peer_protocol import DeliverySource
-from .telegram_guard import delivery_status
 
 
 async def send(config, parent, message, event_seq, receipt=None, inspect=False, retract=False, cleanup_check_only=False):
@@ -21,7 +20,6 @@ async def send(config, parent, message, event_seq, receipt=None, inspect=False, 
         "message": message,
         "event_id": str(event_seq),
         "receipt": receipt,
-        "telegram_database": config.telegram_database,
         "inspect": inspect,
         "retract": retract,
         "cleanup_check_only": cleanup_check_only,
@@ -134,16 +132,6 @@ async def deliver(store, config, sender=send, retractor=retract):
                 (time.time(), delivery["event_seq"], delivery["status"]),
             ).rowcount:
                 continue
-        external = delivery_status(config.telegram_database, parent["native_id"])
-        if external != "open":
-            with store.connection(write=True) as db:
-                db.execute(
-                    "UPDATE deliveries SET error=? WHERE event_seq=?",
-                    ("Telegram delivery state: " + external, delivery["event_seq"]),
-                )
-                if external == "closed":
-                    db.execute("UPDATE parents SET desired='closed',revision=revision+1 WHERE id=?", (parent["id"],))
-            continue
         seq = delivery["event_seq"]
         if delivery["status"] != "pending" and not delivery["receipt"]:
             with store.connection(write=True) as db:

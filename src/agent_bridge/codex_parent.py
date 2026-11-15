@@ -110,14 +110,7 @@ def advance(client, job, busy_error):
 
 
 def main():
-    from telegram_guard import delivery_status
-
     job = json.load(sys.stdin)
-    if not job.get("inspect") and not job.get("retract"):
-        external = delivery_status(job.get("telegram_database"), job["thread_id"])
-        if external != "open":
-            print(json.dumps({"deferred": "Telegram delivery state: " + external}))
-            return
     with ExitStack() as stack:
         try:
             from codex_async.app_server import CodexAppServer, ThreadBusyError

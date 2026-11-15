@@ -382,11 +382,10 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append(parent["id"])
             return {"deferred": "busy"} if parent["id"] == "parent" else {"ready": True, "receipt": "sent", "native_status": "received", "native_turn_id": "turn-1"}
 
-        with patch("agent_bridge.notifications.delivery_status", side_effect=lambda db, native: "paused" if mode == "telegram" and native == "native-parent" else "open"):
-            await deliver(self.store, self.config, sender)
-            self.assertNotIn("other", self.calls)
-            # A new Store uses the persisted ordering, as after a broker restart.
-            await deliver(Store(self.store.state), self.config, sender)
+        await deliver(self.store, self.config, sender)
+        self.assertNotIn("other", self.calls)
+        # A new Store uses the persisted ordering, as after a broker restart.
+        await deliver(Store(self.store.state), self.config, sender)
         self.assertEqual(1, self.calls.count("other"))
         self.assertEqual("accepted", self.store.get_parent("other")["deliveries"][0]["status"])
 
@@ -395,9 +394,6 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wake_pending_does_not_starve_other_parents(self):
         await self.check_delivery_fairness("wake")
-
-    async def test_telegram_paused_parent_does_not_starve_other_parents(self):
-        await self.check_delivery_fairness("telegram")
 
     async def test_notification_action_uses_the_event_status_even_after_retry(self):
         statuses = {}
@@ -447,7 +443,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         upgraded = Store(self.store.state)
         self.assertEqual(before, upgraded.get_parent("parent")["deliveries"])
 
-    async def test_telegram_pause_continue_and_deletion_are_checked_read_only(self):
+    async def test_telegram_database_state_is_ignored_during_delivery(self):
         path = Path(self.temp.name) / "telegram.sqlite"
         with closing(sqlite3.connect(path)) as db, db:
             db.executescript(
@@ -455,20 +451,11 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
             db.execute("INSERT INTO topics VALUES('native-parent',10)")
             db.execute("INSERT INTO inbox VALUES('native-parent',10,'stop_pending')")
-        self.config.telegram_database = str(path)
-        self.assertEqual("paused", delivery_status(path, "native-parent"))
-        await deliver(self.store, self.config, self.sender)
-        self.assertEqual([], self.calls)
-        with closing(sqlite3.connect(path)) as db, db:
-            db.execute("UPDATE inbox SET status='cancelled'")
-        self.assertEqual("open", delivery_status(path, "native-parent"))
-        await deliver(self.store, self.config, self.sender)
-        self.assertEqual(1, len(self.calls))
-        with closing(sqlite3.connect(path)) as db, db:
             db.execute("INSERT INTO removed_topics VALUES('native-parent',10)")
+        self.config.telegram_database = str(path)
         await deliver(self.store, self.config, self.sender)
         self.assertEqual(1, len(self.calls))
-        self.assertEqual("closed", self.store.get_parent("parent")["desired"])
+        self.assertEqual("open", self.store.get_parent("parent")["desired"])
 
     def test_unreadable_telegram_state_does_not_enable_delivery(self):
         self.assertEqual("unavailable", delivery_status(Path(self.temp.name) / "missing.sqlite", "native"))
@@ -491,3 +478,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 {"native", "claude:claude-native"},
                 {r[0] for r in db.execute("SELECT thread_id FROM external_children")},
             )
+
+    def test_config_load_does_not_autodiscover_telegram_database(self):
+        home = Path(self.temp.name) / "home"
+        db = home / ".local/state/codex-async/telegram.sqlite"
+        db.parent.mkdir(parents=True)
+        db.write_text("placeholder")
+        config_path = Path(self.temp.name) / "config.json"
+        config_path.write_text(json.dumps({"profiles": {}}))
+        with patch("pathlib.Path.home", return_value=home):
+            loaded = Config.load(config_path)
+        self.assertIsNone(loaded.telegram_database)

@@ -328,3 +328,21 @@ class ParentTests(unittest.TestCase):
         self.assertFalse(constructor.call_args.kwargs["start_daemon"])
         self.assertIsNone(constructor.call_args.kwargs["sandbox"])
         self.assertTrue(all(c.args[0] in {"thread/queue/list", "thread/queue/delete"} for c in client.request.call_args_list))
+
+    def test_main_ignores_paused_telegram_and_proceeds(self):
+        client = Mock()
+        client.request.return_value = {"thread": {"status": {"type": "idle"}}}
+        client.enqueue.return_value = "receipt"
+        constructor = MagicMock()
+        constructor.return_value.__enter__.return_value = client
+        app_server = types.ModuleType("codex_async.app_server")
+        app_server.CodexAppServer, app_server.ThreadBusyError = constructor, Busy
+        job = {"thread_id": "parent", "cwd": "/tmp", "message": "hello", "event_id": "7", "telegram_database": "/tmp/tg.sqlite"}
+        output = io.StringIO()
+        modules = {"codex_async": types.ModuleType("codex_async"), "codex_async.app_server": app_server,
+                   "telegram_guard": telegram_guard}
+        with patch.dict(sys.modules, modules), patch("sys.stdin", io.StringIO(json.dumps(job))), \
+                patch("sys.stdout", output), patch.object(telegram_guard, "delivery_status", return_value="paused") as external:
+            main()
+        external.assert_not_called()
+        self.assertEqual("receipt", json.loads(output.getvalue())["receipt"])
