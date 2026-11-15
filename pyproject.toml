@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-bridge"
-version = "0.2.7"
+version = "0.2.8"
 description = "Local sessions and tasks across Codex, Claude Code, Pi and Antigravity"
 requires-python = ">=3.11"
 dependencies = ["mcp==1.30.0", "claude-agent-sdk==0.2.172"]
