@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_bridge.errors import BridgeError
 from agent_bridge.store import encode
@@ -114,11 +115,59 @@ class WorkspaceTests(unittest.TestCase):
         destination, _ = worktree(self.state, self.source, "two", snapshot_files=["tracked.txt"])
         (Path(directory) / "tracked.txt").write_text("output\n")
         (Path(directory) / "new.bin").write_bytes(b"\x00\xfe\x02")
+        (Path(directory) / "new.txt").write_text("new text\n")
+        expected = git(directory, "diff", "--binary", metadata["snapshot_tree"])
+        names = git(directory, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")[:-1]
+        for name in names:
+            diff = subprocess.run(
+                ["git", "diff", "--no-index", "--binary", "--", "/dev/null", name],
+                cwd=directory, capture_output=True, timeout=60,
+            )
+            self.assertEqual(1, diff.returncode)
+            expected += diff.stdout
         result = capture_patch(directory, self.state / "changes.patch", metadata)
+        self.assertEqual(expected, Path(result["patch"]).read_bytes())
+        self.assertEqual(0o600, Path(result["patch"]).stat().st_mode & 0o777)
         subprocess.run(["git", "-C", destination, "apply", result["patch"]], check=True)
         self.assertEqual("output\n", (Path(destination) / "tracked.txt").read_text())
         self.assertEqual(b"\x00\xfe\x02", (Path(destination) / "new.bin").read_bytes())
+        self.assertEqual("new text\n", (Path(destination) / "new.txt").read_text())
         self.assertEqual("input snapshot\n", (self.source / "tracked.txt").read_text())
+
+    def test_capture_failure_keeps_previous_patch_and_removes_partial_file(self):
+        directory, metadata = worktree(self.state, self.source, "failed-capture")
+        (Path(directory) / "tracked.txt").write_text("output\n")
+        for name in ("first.txt", "second.txt"):
+            (Path(directory) / name).write_text("new file\n")
+        destination = self.state / "existing.patch"
+        destination.write_bytes(b"previous complete patch\n")
+        destination.chmod(0o640)
+        original_run = subprocess.run
+        for failure in ("git_error", "timeout"):
+            with self.subTest(failure=failure):
+                files_before = set(self.state.iterdir())
+                calls = 0
+
+                def run(argv, failure=failure, **kwargs):
+                    nonlocal calls
+                    if "--no-index" in argv:
+                        calls += 1
+                        stream = kwargs["stdout"]
+                        self.assertEqual(0o600, os.fstat(stream.fileno()).st_mode & 0o777)
+                        if calls == 2:
+                            os.write(stream.fileno(), b"partial second diff\n")
+                            if failure == "timeout":
+                                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                            return subprocess.CompletedProcess(argv, 2, stderr=b"git failed")
+                    return original_run(argv, **kwargs)
+
+                with patch("agent_bridge.workspace.subprocess.run", side_effect=run):
+                    with self.assertRaises(BridgeError if failure == "git_error" else subprocess.TimeoutExpired):
+                        capture_patch(directory, destination, metadata)
+                self.assertEqual(2, calls)
+                self.assertEqual(b"previous complete patch\n", destination.read_bytes())
+                self.assertEqual(0o640, destination.stat().st_mode & 0o777)
+                self.assertEqual(files_before, set(self.state.iterdir()))
 
     def test_capture_preserves_raw_git_paths_contents_and_symlink_targets(self):
         git(self.source, "config", "core.quotePath", "false")
