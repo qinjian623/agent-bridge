@@ -87,10 +87,25 @@ def _children(pid):
                     continue
                 pending.append(child)
         return rows
+    with subprocess.Popen(
+        ["ps", "-ww", "-axo", "pid=,ppid=,stat=,comm="],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    ) as sampler:
+        try:
+            output, _ = sampler.communicate(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            sampler.kill()
+            sampler.communicate()
+            raise UpdateUncertain("Command timed out; its outcome must be checked before retrying") from error
+        except BaseException:
+            sampler.kill()
+            raise
+        if sampler.returncode:
+            raise RuntimeError(f"ps command failed (exit {sampler.returncode})")
     rows = {}
-    for line in _run(["ps", "-ww", "-axo", "pid=,ppid=,stat=,comm="], timeout=5).splitlines():
+    for line in output.splitlines():
         child, parent, status, command = line.strip().split(None, 3)
-        if status.startswith("Z"):
+        if int(child) == sampler.pid or status.startswith("Z"):
             continue
         rows.setdefault(int(parent), []).append((int(child), Path(command).name))
     pending, names = [pid], []

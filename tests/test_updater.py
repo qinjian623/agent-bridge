@@ -10,7 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 from agent_bridge import updater
 from agent_bridge.store import Store
@@ -129,6 +129,35 @@ class BusySnapshotTests(UpdateFixture):
             db.execute("INSERT INTO api_requests VALUES('r','f',NULL)")
         self.assertIn("api_inflight", updater.busy_snapshot(self.state)["reasons"])
 
+    def test_macos_process_sampling_failures_keep_update_state_unknown(self):
+        self.database()
+        for failure in ("exit", "timeout", "read"):
+            with self.subTest(failure=failure):
+                process = MagicMock(pid=123, returncode=2 if failure == "exit" else 0)
+                process.__enter__.return_value = process
+                process.communicate.return_value = ("", None)
+                if failure == "timeout":
+                    process.communicate.side_effect = [
+                        subprocess.TimeoutExpired("ps", 5, output="private-output", stderr="private-stderr"),
+                        ("", None),
+                    ]
+                elif failure == "read":
+                    process.communicate.side_effect = OSError("private-stderr")
+                with (
+                    patch.object(updater.sys, "platform", "darwin"),
+                    patch.object(updater.subprocess, "Popen", return_value=process),
+                ):
+                    result = updater.busy_snapshot(self.state, broker_pid=os.getpid())
+                self.assertTrue(result["busy"])
+                self.assertEqual(["update_state_unknown"], result["reasons"])
+                self.assertNotIn("broker_helpers", result["counts"])
+                self.assertNotIn("private-", json.dumps(result))
+                if failure != "exit":
+                    process.kill.assert_called_once_with()
+                if failure == "timeout":
+                    self.assertEqual([call(timeout=5), call()], process.communicate.call_args_list)
+                process.__exit__.assert_called_once()
+
 
 class ChildProcessTests(unittest.TestCase):
     def test_linux_ignores_zombies_and_disappeared_processes_but_keeps_live_descendants(self):
@@ -170,15 +199,34 @@ class ChildProcessTests(unittest.TestCase):
                 "14 12 Z /opt/homebrew/bin/python3",
                 "15 12 S /opt/homebrew/bin/python3",
                 "16 999 S /opt/homebrew/bin/unrelated",
+                "17 10 S /bin/ps",
+                "18 10 S /bin/ps",
             )
         )
+        process = MagicMock(pid=18, returncode=0)
+        process.__enter__.return_value = process
+        process.communicate.return_value = (processes, None)
         with (
             patch.object(updater.sys, "platform", "darwin"),
-            patch.object(updater, "_run", return_value=processes) as run,
+            patch.object(updater.subprocess, "Popen", return_value=process) as popen,
         ):
             names = updater._children(10)
-        self.assertEqual(["ssh", "antigravity-real", "python3"], names)
-        run.assert_called_once_with(["ps", "-ww", "-axo", "pid=,ppid=,stat=,comm="], timeout=5)
+        self.assertEqual(["ssh", "antigravity-real", "ps", "python3"], names)
+        popen.assert_called_once_with(
+            ["ps", "-ww", "-axo", "pid=,ppid=,stat=,comm="],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        process.communicate.assert_called_once_with(timeout=5)
+
+    def test_macos_current_process_with_only_sampler_has_no_children(self):
+        process = MagicMock(pid=123, returncode=0)
+        process.__enter__.return_value = process
+        process.communicate.return_value = (f"123 {os.getpid()} S /bin/ps\n", None)
+        with (
+            patch.object(updater.sys, "platform", "darwin"),
+            patch.object(updater.subprocess, "Popen", return_value=process),
+        ):
+            self.assertEqual([], updater._children(os.getpid()))
 
 
 class ReleaseValidationTests(UpdateFixture):
