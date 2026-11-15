@@ -3,14 +3,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from agent_bridge.broker import EventMirror
+from agent_bridge.broker import Broker, EventMirror
 from agent_bridge.config import Config
 from agent_bridge.hosts import HostConfig
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.notifications import deliver
 from agent_bridge.peer_api import DirectPeerService
-from agent_bridge.peer_protocol import PeerErrorCode
+from agent_bridge.peer_protocol import PeerErrorCode, unwrap_peer_event
 from agent_bridge.store import Store, encode
 
 HOST_A = "gpu-a"
@@ -474,6 +475,81 @@ class EventMirrorTests(MirrorTestCase):
         mirrored = reopened.get_mirrored_event(HOST_A, NODE_A, GEN_A, 18)
         self.assertIsNotNone(mirrored)
         self.assertEqual("legacy-fp-1", mirrored["origin_fingerprint"])
+
+    async def test_migration_backfills_non_wrapped_legacy_row_with_null_origin_columns(self):
+        with self.store.connection(write=True) as db:
+            local_seq = self.store.event(db, "task_completed", {"summary": "done"})
+            db.execute(
+                "INSERT INTO peer_event_mirrors("
+                "host_id,node_id,state_generation,remote_seq,local_seq,fingerprint,created"
+                ") VALUES(?,?,?,?,?,?,?)",
+                (HOST_A, NODE_A, GEN_A, 19, local_seq, "legacy-fp-direct", 5.0),
+            )
+
+        reopened = Store(self.root)
+        mirrored = reopened.get_mirrored_event_by_origin(NODE_A, GEN_A, 19)
+        self.assertIsNotNone(mirrored)
+        self.assertEqual("legacy-fp-direct", mirrored["origin_fingerprint"])
+
+    async def test_migration_runs_bounded_batches_and_finishes_in_broker_backfill(self):
+        with self.store.connection(write=True) as db:
+            seqs = []
+            for remote_seq in range(1, 8):
+                local_seq = self.store.event(db, "task_completed", {"summary": f"item-{remote_seq}"})
+                db.execute(
+                    "INSERT INTO peer_event_mirrors("
+                    "host_id,node_id,state_generation,remote_seq,local_seq,fingerprint,created"
+                    ") VALUES(?,?,?,?,?,?,?)",
+                    (HOST_A, NODE_A, GEN_A, remote_seq, local_seq, f"fp-{remote_seq}", float(remote_seq)),
+                )
+                seqs.append(remote_seq)
+
+        (self.root / "config.json").write_text('{"profiles": {}}\n')
+        with patch.object(Store, "PEER_MIRROR_MIGRATION_BATCH", 3):
+            reopened = Store(self.root)
+            with reopened.connection() as db:
+                done = db.execute(
+                    "SELECT remote_seq FROM peer_event_mirrors WHERE origin_node_id IS NOT NULL ORDER BY remote_seq"
+                ).fetchall()
+                pending = db.execute(
+                    "SELECT COUNT(*) FROM peer_event_mirrors WHERE origin_node_id IS NULL"
+                ).fetchone()[0]
+            self.assertEqual([5, 6, 7], [row[0] for row in done])
+            self.assertEqual(4, pending)
+
+            broker = Broker(self.root)
+            await broker.mirror_backfill()
+            with broker.store.connection() as db:
+                remaining = db.execute(
+                    "SELECT COUNT(*) FROM peer_event_mirrors WHERE origin_node_id IS NULL OR origin_fingerprint IS NULL"
+                ).fetchone()[0]
+            self.assertEqual(0, remaining)
+            for remote_seq in seqs:
+                mirrored = broker.store.get_mirrored_event_by_origin(NODE_A, GEN_A, remote_seq)
+                self.assertIsNotNone(mirrored)
+                self.assertEqual(f"fp-{remote_seq}", mirrored["origin_fingerprint"])
+
+    async def test_unwrap_peer_event_handles_deep_historical_envelopes(self):
+        current = event(host_id=HOST_A, node_id=NODE_A, generation=GEN_A, seq=18, payload={"status": "origin"})
+        for hop in range(1, 46):
+            current = {
+                "seq": 100 + hop,
+                "type": current["type"],
+                "ref": {"host_id": f"relay-{hop}", "node_id": f"node-{hop}", "state_generation": "gen-r", "local_id": str(hop)},
+                "payload": {
+                    "source": current["ref"],
+                    "remote_seq": current["seq"],
+                    "type": current["type"],
+                    "payload": current["payload"],
+                    "created": current["created"],
+                },
+                "created": 100.0 + hop,
+            }
+        origin_event, wrapped = unwrap_peer_event(current)
+        self.assertTrue(wrapped)
+        self.assertEqual(18, origin_event["seq"])
+        self.assertEqual(NODE_A, origin_event["ref"]["node_id"])
+        self.assertEqual({"status": "origin"}, origin_event["payload"])
 
 
 class NotifyParentHandlerTests(unittest.IsolatedAsyncioTestCase):

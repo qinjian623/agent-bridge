@@ -1129,6 +1129,23 @@ class Broker:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self.stopping.wait(), seconds)
 
+    async def mirror_backfill(self):
+        """Incrementally backfill historical peer mirror origin columns without stalling startup."""
+        while not self.stopping.is_set():
+            delay = 0.05
+            try:
+                updated = await asyncio.to_thread(self.store.migrate_peer_event_mirrors_batch)
+                if updated == 0:
+                    return
+                getattr(self, "_loop_errors", {}).pop("mirror_backfill", None)
+            except sqlite3.OperationalError as error:
+                self._log_loop_error("mirror_backfill", error)
+                delay = 0.5
+            except Exception as error:
+                self._log_loop_error("mirror_backfill", error)
+                delay = 2
+            await self._loop_wait(delay)
+
     async def notifications(self):
         from .notifications import deliver
 
@@ -2812,6 +2829,7 @@ class Broker:
         outbox_puller = asyncio.create_task(self.outbox_puller.run())
         event_mirror = asyncio.create_task(self.event_mirror.run())
         host_watcher = asyncio.create_task(self.watch_hosts())
+        mirror_backfill = asyncio.create_task(self.mirror_backfill())
         tasks = (
             scheduler,
             notifications,
@@ -2820,13 +2838,14 @@ class Broker:
             outbox_puller,
             event_mirror,
             host_watcher,
+            mirror_backfill,
         )
         try:
             async with server:
                 await self.stopping.wait()
         finally:
             self.stopping.set()
-            for task in (delivery_scheduler, outbox_puller, event_mirror, host_watcher):
+            for task in (delivery_scheduler, outbox_puller, event_mirror, host_watcher, mirror_backfill):
                 task.cancel()
             _, pending = await asyncio.wait(tasks, timeout=5)
             for task in pending:
