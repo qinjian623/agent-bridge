@@ -25,9 +25,9 @@ MAX_WORKSPACE_FILES = 100_000
 MAX_WORKSPACE_MANIFEST_BYTES = 32 * 1024 * 1024
 
 
-def git(directory, *args):
+def git(directory, *args, stdout=subprocess.PIPE):
     result = subprocess.run(
-        ["git", "-C", str(directory), "--literal-pathspecs", *args], capture_output=True, timeout=60
+        ["git", "-C", str(directory), "--literal-pathspecs", *args], stdout=stdout, stderr=subprocess.PIPE, timeout=60
     )
     if result.returncode:
         raise BridgeError("git_error", result.stderr.decode(errors="replace")[-2000:])
@@ -469,20 +469,25 @@ def capture_patch(directory, destination, workspace=None):
         if result["changed_files"] != names:
             result["changed_files_raw_hex"] = [os.fsencode(name).hex() for name in names]
         return result
-    patch = git(directory, "diff", "--binary", (workspace or {}).get("snapshot_tree", "HEAD"))
-    raw_status = git(directory, "status", "--porcelain=v1")
-    status = raw_status.decode("utf-8", "backslashreplace")
-    untracked = [name for name in git(directory, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0") if name]
-    for name in untracked:
-        diff = subprocess.run(
-            ["git", "diff", "--no-index", "--binary", "--", "/dev/null", name],
-            cwd=directory, capture_output=True, timeout=60,
-        )
-        if diff.returncode not in {0, 1}:
-            raise BridgeError("git_error", "Could not capture an untracked file")
-        patch += diff.stdout
-    destination.write_bytes(patch)
-    destination.chmod(0o600)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            git(directory, "diff", "--binary", (workspace or {}).get("snapshot_tree", "HEAD"), stdout=stream)
+            raw_status = git(directory, "status", "--porcelain=v1")
+            status = raw_status.decode("utf-8", "backslashreplace")
+            untracked = [name for name in git(directory, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0") if name]
+            for name in untracked:
+                diff = subprocess.run(
+                    ["git", "diff", "--no-index", "--binary", "--", "/dev/null", name],
+                    cwd=directory, stdout=stream, stderr=subprocess.PIPE, timeout=60,
+                )
+                if diff.returncode not in {0, 1}:
+                    raise BridgeError("git_error", "Could not capture an untracked file")
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     result = {
         "patch": str(destination),
         "status": status,
