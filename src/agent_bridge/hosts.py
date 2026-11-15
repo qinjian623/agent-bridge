@@ -6,6 +6,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -189,6 +190,7 @@ class ConfigHostRegistry:
             state_dir = hosts
             hosts = None
         self._state_dir = Path(state_dir).expanduser() if state_dir is not None else None
+        self._lock = threading.RLock()
         configured = dict(hosts) if hosts is not None else self._load_configured_hosts()
         self._hosts = self._apply_persisted_pins(configured)
         self._statuses = {
@@ -203,76 +205,90 @@ class ConfigHostRegistry:
         }
 
     def get(self, host_id: str) -> HostConfig:
-        try:
-            return self._hosts[host_id]
-        except KeyError:
-            raise BridgeError(PeerErrorCode.HOST_UNKNOWN, f"Unknown host: {host_id!r}") from None
+        with self._lock:
+            try:
+                return self._hosts[host_id]
+            except KeyError:
+                raise BridgeError(PeerErrorCode.HOST_UNKNOWN, f"Unknown host: {host_id!r}") from None
 
     def list(self) -> list[HostConfig]:
-        return [self._hosts[host_id] for host_id in sorted(self._hosts)]
+        with self._lock:
+            return [self._hosts[host_id] for host_id in sorted(self._hosts)]
 
     def read_configured_hosts(self) -> dict[str, HostConfig]:
         """Validate a fresh disk snapshot without changing the live registry."""
-        if self._state_dir is None:
-            return dict(self._hosts)
-        return self._apply_persisted_pins(self._load_configured_hosts(required=True))
+        with self._lock:
+            if self._state_dir is None:
+                return dict(self._hosts)
+            return self._apply_persisted_pins(self._load_configured_hosts(required=True))
 
     def replace_hosts(self, hosts: Mapping[str, HostConfig]) -> None:
         configured = dict(hosts)
-        statuses = {}
-        for host_id, config in configured.items():
-            previous = self._hosts.get(host_id)
-            current = self._statuses.get(host_id)
-            repinned = current is not None and config.pinned is not None and config.pinned != current.node
-            if previous == config or (current is not None and current.state in STICKY_HOST_STATES and not repinned):
-                statuses[host_id] = current
-            else:
-                statuses[host_id] = HostStatus(host_id, HostState.OFFLINE, config.pinned, None, None)
-        self._hosts.clear()
-        self._hosts.update(configured)
-        self._statuses.clear()
-        self._statuses.update(statuses)
+        with self._lock:
+            statuses = {}
+            for host_id, config in configured.items():
+                previous = self._hosts.get(host_id)
+                current = self._statuses.get(host_id)
+                repinned = current is not None and config.pinned is not None and config.pinned != current.node
+                if previous == config or (current is not None and current.state in STICKY_HOST_STATES and not repinned):
+                    statuses[host_id] = current
+                else:
+                    statuses[host_id] = HostStatus(host_id, HostState.OFFLINE, config.pinned, None, None)
+            self._hosts = configured
+            self._statuses = statuses
 
     def status(self, host_id: str | None = None) -> list[HostStatus]:
-        if host_id is not None:
-            self.get(host_id)
-            return [self._statuses[host_id]]
-        return [self._statuses[key] for key in sorted(self._statuses)]
+        with self._lock:
+            if host_id is not None:
+                self.get(host_id)
+                return [self._statuses[host_id]]
+            return [self._statuses[key] for key in sorted(self._statuses)]
+
+    def snapshot(self) -> list[tuple[HostConfig, HostStatus]]:
+        """Return a consistent sorted snapshot of (config, status) pairs."""
+        with self._lock:
+            return [
+                (self._hosts[host_id], self._statuses[host_id])
+                for host_id in sorted(self._statuses)
+                if host_id in self._hosts
+            ]
 
     def pin(self, host_id: str, node: NodeRef) -> None:
         if not isinstance(node, NodeRef):
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "pin requires a NodeRef")
-        config = self.get(host_id)
-        self._hosts[host_id] = replace(config, pinned=node)
-        current = self._statuses[host_id]
-        # A fresh admin-confirmed pin is the documented way to clear a sticky identity/corruption lock.
-        self._statuses[host_id] = HostStatus(
-            host_id=host_id,
-            state=HostState.OFFLINE,
-            node=node,
-            last_contact=current.last_contact,
-            protocol_version=current.protocol_version,
-            detail=None,
-        )
-        self._save_pins()
+        with self._lock:
+            config = self.get(host_id)
+            self._hosts[host_id] = replace(config, pinned=node)
+            current = self._statuses[host_id]
+            # A fresh admin-confirmed pin is the documented way to clear a sticky identity/corruption lock.
+            self._statuses[host_id] = HostStatus(
+                host_id=host_id,
+                state=HostState.OFFLINE,
+                node=node,
+                last_contact=current.last_contact,
+                protocol_version=current.protocol_version,
+                detail=None,
+            )
+            self._save_pins()
 
     def mark(self, host_id: str, state: HostState, detail: str | None = None) -> None:
-        self.get(host_id)
-        try:
-            state = HostState(state)
-        except (TypeError, ValueError):
-            raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"Unknown host state: {state!r}") from None
-        current = self._statuses[host_id]
-        if current.state in STICKY_HOST_STATES and state not in STICKY_HOST_STATES:
-            return
-        self._statuses[host_id] = HostStatus(
-            host_id=host_id,
-            state=state,
-            node=current.node,
-            last_contact=time.time() if state is HostState.ONLINE else current.last_contact,
-            protocol_version=PROTOCOL_VERSION if state is HostState.ONLINE else current.protocol_version,
-            detail=detail,
-        )
+        with self._lock:
+            self.get(host_id)
+            try:
+                state = HostState(state)
+            except (TypeError, ValueError):
+                raise BridgeError(PeerErrorCode.INVALID_PARAMS, f"Unknown host state: {state!r}") from None
+            current = self._statuses[host_id]
+            if current.state in STICKY_HOST_STATES and state not in STICKY_HOST_STATES:
+                return
+            self._statuses[host_id] = HostStatus(
+                host_id=host_id,
+                state=state,
+                node=current.node,
+                last_contact=time.time() if state is HostState.ONLINE else current.last_contact,
+                protocol_version=PROTOCOL_VERSION if state is HostState.ONLINE else current.protocol_version,
+                detail=detail,
+            )
 
     # ---------------------------------------------------------------- internals
 

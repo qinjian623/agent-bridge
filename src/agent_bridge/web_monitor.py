@@ -34,7 +34,13 @@ from .native_monitor import (
     MONITORED_RUNTIMES,
     collect_native_sessions,
     display_runtime,
+    filter_snapshot_dict,
+    is_event_window_truncated,
+    matches_bridge_status,
     normalize_runtime,
+    normalize_status_filter,
+    parse_runtime_filter,
+    should_widen_events,
     summarize_runtimes,
     unified_sessions,
 )
@@ -46,6 +52,12 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_BROKER_RESPONSE_BYTES = 16 * 1024 * 1024
 BROKER_TIMEOUT_SECONDS = 30.0
 SESSION_COOKIE = "bridge_session"
+MAX_SSE_CLIENTS = 16
+SSE_KEEPALIVE_SECONDS = 15.0
+SSE_MAX_LIFETIME_SECONDS = 1800.0
+SSE_SOCKET_TIMEOUT_SECONDS = 10.0
+_SSE_CLIENTS_LOCK = threading.Lock()
+_ACTIVE_SSE_CLIENTS = 0
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
     "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
@@ -601,8 +613,12 @@ _HTML_SCRIPT = """  <script>
 
     function sessionMatchesFilter(session) {
       if (selectedRuntime !== 'all' && session.runtime !== selectedRuntime) return false;
-      if (activeOnly && session.observed !== 'running' && !session.waiting_question && session.observed !== 'idle') {
-        return false;
+      if (activeOnly) {
+        const obs = session.observed || 'stopped';
+        const isActive = obs === 'running' || obs === 'idle' || obs === 'waiting_input' ||
+          obs === 'starting' || obs === 'recovery_needed' ||
+          Boolean(session.alive) || Boolean(session.waiting_question);
+        if (!isActive) return false;
       }
       return true;
     }
@@ -998,9 +1014,15 @@ _HTML_SCRIPT = """  <script>
         goalCell.style.whiteSpace = 'nowrap';
         goalCell.title = goal || '';
 
-        const cost = session.attempt && typeof session.attempt.cost_usd === 'number'
-          ? '$' + session.attempt.cost_usd.toFixed(3)
-          : '-';
+        const costNum = (typeof session.cost_usd === 'number')
+          ? session.cost_usd
+          : (session.attempt && typeof session.attempt.cost_usd === 'number' ? session.attempt.cost_usd : null);
+        let cost = '-';
+        if (costNum !== null) {
+          cost = '$' + costNum.toFixed(3) + (session.cost_complete === false ? '*' : '');
+        } else if (session.has_attempts) {
+          cost = 'unknown';
+        }
         const costCell = makeElement('td', '', cost);
         costCell.style.color = 'var(--yellow)';
 
@@ -1021,7 +1043,7 @@ _HTML_SCRIPT = """  <script>
       const allNative = nativeSessions || [];
       const filtered = allNative.filter((proc) => {
         if (selectedRuntime !== 'all' && proc.runtime !== selectedRuntime) return false;
-        if (activeOnly && proc.observed !== 'running' && proc.observed !== 'active') return false;
+        if (activeOnly && proc.kind === 'daemon') return false;
         return true;
       });
       document.getElementById('nativeCount').textContent =
@@ -1291,8 +1313,16 @@ _HTML_SCRIPT = """  <script>
       if (statNative) statNative.textContent = metrics.native_sessions || 0;
       document.getElementById('statTasks').textContent = metrics.running_tasks || 0;
       document.getElementById('statBroadcasts').textContent = metrics.total_broadcasts || 0;
-      document.getElementById('statCost').textContent =
-        '$' + Number(metrics.total_cost_usd || 0).toFixed(4);
+      const costComplete = metrics.cost_complete !== false;
+      const totalCostNum = typeof metrics.total_cost_usd === 'number' ? metrics.total_cost_usd : null;
+      const hasAttempts = (data.sessions || []).some((s) => Boolean(s.has_attempts));
+      let costText;
+      if (totalCostNum === null || (!costComplete && totalCostNum === 0 && hasAttempts)) {
+        costText = 'unknown';
+      } else {
+        costText = '$' + totalCostNum.toFixed(4) + (costComplete ? '' : '*');
+      }
+      document.getElementById('statCost').textContent = costText;
 
       renderApprovals(data.pending_questions || []);
       renderRuntimes(data.runtimes || {});
@@ -1301,7 +1331,10 @@ _HTML_SCRIPT = """  <script>
       renderNativeSessions(data.native_sessions || [], metrics);
       renderBroadcasts(data.broadcasts || []);
       renderEvents(data.events || [], data.sessions || []);
-      renderTopology(data);
+      const topoData = (selectedRuntime === 'all' && !activeOnly)
+        ? data
+        : { ...data, sessions: (data.sessions || []).filter(sessionMatchesFilter) };
+      renderTopology(topoData);
     }
 
     async function init() {
@@ -1763,10 +1796,7 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                 if self.collector is None:
                     raise _HTTPError(500, "Collector not configured")
                 params = self._query_params()
-                if not params:
-                    self._send_json(200, self._upgrade_snapshot(self.collector.collect(limit=25), {}))
-                else:
-                    self._send_json(200, self._collect_filtered_snapshot(params, default_limit=25))
+                self._send_json(200, self._collect_filtered_snapshot(params, default_limit=25))
             elif path == "/api/v1/health":
                 if identity is None:
                     raise _HTTPError(401, "Unauthorized")
@@ -1888,111 +1918,249 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
             raise _HTTPError(500, "Collector not configured")
         return self.collector
 
-    def _upgrade_snapshot(self, snapshot: dict[str, Any], params: dict[str, list[str]]) -> dict[str, Any]:
+    def _parse_filter_params(
+        self,
+        params: dict[str, list[str]],
+        *,
+        default_limit: int = 25,
+        max_limit: int = 500,
+        default_events: bool = True,
+    ) -> dict[str, Any]:
+        limit = self._parse_int_param(params, "limit", default_limit, minimum=1, maximum=max_limit)
+        session_limit_raw = self._first_param(params, "session_limit")
+        session_limit: int | None = None
+        if session_limit_raw is not None:
+            session_limit = self._parse_int_param(params, "session_limit", limit, minimum=1, maximum=1000)
+        include_events = self._parse_bool_param(params, "include_events", default_events)
+        include_native = self._parse_bool_param(params, "include_native", True)
+        runtime_raw = self._first_param(params, "runtime")
+        try:
+            runtime = parse_runtime_filter(runtime_raw)
+        except ValueError as error:
+            raise _HTTPError(400, str(error)) from None
+        source = self._first_param(params, "source")
+        if source is not None:
+            source = source.lower()
+            if source not in {"all", "bridge", "native"}:
+                raise _HTTPError(400, f"Unsupported source {source!r}")
+        status_raw = self._first_param(params, "status")
+        try:
+            status = normalize_status_filter(status_raw)
+        except ValueError as error:
+            raise _HTTPError(400, str(error)) from None
+        after_seq = None
+        if self._first_param(params, "after_seq") is not None:
+            after_seq = self._parse_int_param(params, "after_seq", 0, minimum=0, maximum=10**12)
+        return {
+            "limit": limit,
+            "session_limit": session_limit,
+            "include_events": include_events,
+            "include_native": include_native,
+            "runtime": runtime,
+            "source": source,
+            "status": status,
+            "after_seq": after_seq,
+        }
+
+    def _upgrade_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        params: dict[str, list[str]],
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Backfill multi-runtime & native discovery if an older broker daemon replied."""
         if not isinstance(snapshot, dict) or "sessions" not in snapshot:
             return snapshot
-        if "runtimes" in snapshot and "native_sessions" in snapshot:
-            return snapshot
+        if snapshot.get("collector_version") and "runtimes" in snapshot and "native_sessions" in snapshot:
+            upgraded = dict(snapshot)
+        elif snapshot.get("legacy_broker") and "runtimes" in snapshot and "native_sessions" in snapshot:
+            upgraded = dict(snapshot)
+        else:
+            collector = self.collector
+            proc_root = getattr(collector, "proc_root", None) if collector is not None else None
+            native_home = getattr(collector, "native_home", None) if collector is not None else None
+            include_native = self._parse_bool_param(params, "include_native", True)
 
-        collector = self.collector
-        proc_root = getattr(collector, "proc_root", None) if collector is not None else None
-        native_home = getattr(collector, "native_home", None) if collector is not None else None
-        include_native = self._parse_bool_param(params, "include_native", True)
+            sessions = list(snapshot.get("sessions") or [])
+            live_pids: set[int] = set()
+            live_native_ids: set[tuple[str, str]] = set()
+            for sess in sessions:
+                rt = normalize_runtime(sess.get("runtime")) or sess.get("runtime") or ""
+                sess["runtime"] = rt
+                sess.setdefault("display_runtime", display_runtime(rt))
+                sess.setdefault("source", "bridge")
+                sess.setdefault("managed", True)
+                wpid = sess.get("worker_pid")
+                obs = sess.get("observed")
+                is_live = obs in ("running", "idle", "waiting_input", "starting") or bool(sess.get("alive"))
+                if sess.get("alive") and isinstance(wpid, int) and wpid > 0:
+                    live_pids.add(wpid)
+                nid = sess.get("native_id")
+                if is_live and nid and rt:
+                    live_native_ids.add((rt, str(nid)))
 
-        sessions = list(snapshot.get("sessions") or [])
-        live_pids: set[int] = set()
-        live_native_ids: set[tuple[str, str]] = set()
-        for sess in sessions:
-            rt = normalize_runtime(sess.get("runtime")) or sess.get("runtime") or ""
-            sess["runtime"] = rt
-            sess.setdefault("display_runtime", display_runtime(rt))
-            sess.setdefault("source", "bridge")
-            sess.setdefault("managed", True)
-            wpid = sess.get("worker_pid")
-            obs = sess.get("observed")
-            is_live = obs in ("running", "idle", "waiting_input", "starting") or bool(sess.get("alive"))
-            if sess.get("alive") and isinstance(wpid, int) and wpid > 0:
-                live_pids.add(wpid)
-            nid = sess.get("native_id")
-            if is_live and nid and rt:
-                live_native_ids.add((rt, str(nid)))
+            native_sessions: list[dict[str, Any]] = []
+            if include_native and "native_sessions" not in snapshot:
+                native_sessions = collect_native_sessions(
+                    proc_root=proc_root,
+                    home=native_home,
+                    exclude_pids=live_pids,
+                    exclude_native_ids=live_native_ids,
+                )
+            elif include_native and "native_sessions" in snapshot:
+                native_sessions = list(snapshot.get("native_sessions") or [])
 
-        native_sessions: list[dict[str, Any]] = []
-        if include_native and "native_sessions" not in snapshot:
-            native_sessions = collect_native_sessions(
-                proc_root=proc_root,
-                home=native_home,
-                exclude_pids=live_pids,
-                exclude_native_ids=live_native_ids,
+            metrics = dict(snapshot.get("metrics") or {})
+            runtimes = summarize_runtimes(sessions, native_sessions)
+            metrics.setdefault("native_sessions", sum(1 for n in native_sessions if n.get("kind") != "daemon"))
+            metrics.setdefault("native_workers", sum(1 for n in native_sessions if n.get("kind") == "worker"))
+            metrics.setdefault("native_daemons", sum(1 for n in native_sessions if n.get("kind") == "daemon"))
+            metrics.setdefault(
+                "total_all_active",
+                int(metrics.get("active_sessions") or 0) + int(metrics.get("native_sessions") or 0),
             )
-        elif "native_sessions" in snapshot:
-            native_sessions = list(snapshot.get("native_sessions") or [])
+            events = list(snapshot.get("events") or [])
+            if events and "latest_event_seq" not in metrics:
+                metrics["latest_event_seq"] = max((int(ev.get("seq", 0)) for ev in events), default=0)
 
-        metrics = dict(snapshot.get("metrics") or {})
-        runtimes = summarize_runtimes(sessions, native_sessions)
-        metrics.setdefault("native_sessions", sum(1 for n in native_sessions if n.get("kind") != "daemon"))
-        metrics.setdefault("native_workers", sum(1 for n in native_sessions if n.get("kind") == "worker"))
-        metrics.setdefault("native_daemons", sum(1 for n in native_sessions if n.get("kind") == "daemon"))
-        metrics.setdefault(
-            "total_all_active",
-            int(metrics.get("active_sessions") or 0) + int(metrics.get("native_sessions") or 0),
+            upgraded = dict(snapshot)
+            upgraded["sessions"] = sessions
+            upgraded["native_sessions"] = native_sessions
+            upgraded["runtimes"] = runtimes
+            upgraded["metrics"] = metrics
+            if not snapshot.get("collector_version"):
+                upgraded["legacy_broker"] = True
+
+        active_filters = filters or self._parse_filter_params(params)
+        if any(
+            (
+                active_filters.get("runtime"),
+                active_filters.get("source") not in (None, "all"),
+                active_filters.get("status") not in (None, "all"),
+                active_filters.get("session_limit") is not None,
+                active_filters.get("after_seq") is not None,
+            )
+        ):
+            upgraded = filter_snapshot_dict(
+                upgraded,
+                runtime=active_filters.get("runtime"),
+                source=active_filters.get("source"),
+                status=active_filters.get("status"),
+                session_limit=active_filters.get("session_limit"),
+                after_seq=active_filters.get("after_seq"),
+                event_limit=active_filters.get("limit"),
+            )
+        return upgraded
+
+    def _collect_filtered_snapshot_with_meta(
+        self,
+        params: dict[str, list[str]],
+        *,
+        default_limit: int = 25,
+        max_limit: int = 500,
+        default_events: bool = True,
+        parsed_filters: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        collector = self._require_collector()
+        filters = parsed_filters or self._parse_filter_params(
+            params,
+            default_limit=default_limit,
+            max_limit=max_limit,
+            default_events=default_events,
+        )
+        orig_session_limit = filters.get("session_limit")
+        withhold_session_limit = (
+            filters.get("status") not in (None, "all") and orig_session_limit is not None
+        )
+        collect_filters = (
+            {**filters, "session_limit": None} if withhold_session_limit else filters
         )
 
-        upgraded = dict(snapshot)
-        upgraded["sessions"] = sessions
-        upgraded["native_sessions"] = native_sessions
-        upgraded["runtimes"] = runtimes
-        upgraded["metrics"] = metrics
-        return upgraded
+        kwargs: dict[str, Any] = {
+            "limit": collect_filters["limit"],
+            "include_events": collect_filters["include_events"],
+        }
+        if collect_filters["runtime"] is not None:
+            kwargs["runtime"] = collect_filters["runtime"]
+        if collect_filters["source"] is not None and collect_filters["source"] != "all":
+            kwargs["source"] = collect_filters["source"]
+        if collect_filters["status"] is not None and collect_filters["status"] != "all":
+            kwargs["status"] = collect_filters["status"]
+        if collect_filters["session_limit"] is not None:
+            kwargs["session_limit"] = collect_filters["session_limit"]
+        if not collect_filters["include_native"]:
+            kwargs["include_native"] = False
+        if collect_filters["after_seq"] is not None:
+            kwargs["after_seq"] = collect_filters["after_seq"]
+
+        raw = collector.collect(**kwargs)
+        upgraded = self._upgrade_snapshot(raw, params, filters=collect_filters)
+        events_truncated_before_filter = False
+        has_ev_filter = any(
+            (
+                collect_filters.get("runtime"),
+                collect_filters.get("source") not in (None, "all"),
+                collect_filters.get("status") not in (None, "all"),
+                collect_filters.get("after_seq") is not None,
+            )
+        )
+        wide_limit = max(int(collect_filters["limit"]), int(max_limit))
+        post_events = list(upgraded.get("events") or [])
+        widened = should_widen_events(
+            raw,
+            post_events,
+            req_limit=collect_filters["limit"],
+            max_limit=wide_limit,
+            has_filter=has_ev_filter,
+            source=collect_filters.get("source"),
+            include_events=collect_filters["include_events"],
+        )
+        if widened:
+            # Collector is either pre-v3 or had events dropped at the Web layer after hitting its page limit;
+            # widen once to max_limit so matching/older events are not masked or silently skipped.
+            wide_kwargs = dict(kwargs)
+            wide_kwargs["limit"] = wide_limit
+            raw = collector.collect(**wide_kwargs)
+            upgraded = self._upgrade_snapshot(raw, params, filters=collect_filters)
+            post_events = list(upgraded.get("events") or [])
+        events_truncated_before_filter = is_event_window_truncated(
+            raw,
+            post_events,
+            req_limit=collect_filters["limit"],
+            wide_limit=wide_limit if widened else collect_filters["limit"],
+            has_filter=has_ev_filter,
+            source=collect_filters.get("source"),
+            include_events=collect_filters["include_events"],
+        )
+        if widened and len(post_events) > collect_filters["limit"]:
+            upgraded = {**upgraded, "events": post_events[: collect_filters["limit"]]}
+        if withhold_session_limit and orig_session_limit is not None:
+            upgraded = {
+                **upgraded,
+                "sessions": list(upgraded.get("sessions") or [])[:orig_session_limit],
+                "native_sessions": list(upgraded.get("native_sessions") or [])[:orig_session_limit],
+            }
+        return upgraded, events_truncated_before_filter
 
     def _collect_filtered_snapshot(
         self,
         params: dict[str, list[str]],
         *,
         default_limit: int = 25,
+        max_limit: int = 500,
         default_events: bool = True,
+        parsed_filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        collector = self._require_collector()
-        limit = self._parse_int_param(params, "limit", default_limit, minimum=1, maximum=500)
-        session_limit_raw = self._first_param(params, "session_limit")
-        include_events = self._parse_bool_param(params, "include_events", default_events)
-        include_native = self._parse_bool_param(params, "include_native", True)
-        runtime_raw = self._first_param(params, "runtime")
-        runtime = normalize_runtime(runtime_raw)
-        if runtime_raw and runtime is None and runtime_raw.lower() != "all":
-            raise _HTTPError(400, f"Unsupported runtime {runtime_raw!r}")
-        source = self._first_param(params, "source")
-        if source is not None:
-            source = source.lower()
-            if source not in {"all", "bridge", "native"}:
-                raise _HTTPError(400, f"Unsupported source {source!r}")
-        status = self._first_param(params, "status")
-        if status is not None:
-            status = status.lower()
-            if status not in {"all", "active", "running", "idle", "waiting", "stopped"}:
-                raise _HTTPError(400, f"Unsupported status {status!r}")
-        after_seq = None
-        if self._first_param(params, "after_seq") is not None:
-            after_seq = self._parse_int_param(params, "after_seq", 0, minimum=0, maximum=10**12)
-
-        kwargs: dict[str, Any] = {
-            "limit": limit,
-            "include_events": include_events,
-        }
-        if runtime is not None:
-            kwargs["runtime"] = runtime
-        if source is not None and source != "all":
-            kwargs["source"] = source
-        if status is not None and status != "all":
-            kwargs["status"] = status
-        if session_limit_raw is not None:
-            kwargs["session_limit"] = self._parse_int_param(params, "session_limit", limit, minimum=1, maximum=1000)
-        if not include_native:
-            kwargs["include_native"] = False
-        if after_seq is not None:
-            kwargs["after_seq"] = after_seq
-        return self._upgrade_snapshot(collector.collect(**kwargs), params)
+        upgraded, events_truncated = self._collect_filtered_snapshot_with_meta(
+            params,
+            default_limit=default_limit,
+            max_limit=max_limit,
+            default_events=default_events,
+            parsed_filters=parsed_filters,
+        )
+        if events_truncated:
+            upgraded = {**upgraded, "events_truncated": True}
+        return upgraded
 
     def _handle_api_v1_health(self) -> None:
         params = self._query_params()
@@ -2036,21 +2204,37 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
 
     def _handle_api_v1_sessions(self) -> None:
         params = self._query_params()
-        snapshot = self._collect_filtered_snapshot(params, default_limit=200, default_events=False)
-        runtime_raw = self._first_param(params, "runtime")
-        runtime = normalize_runtime(runtime_raw)
-        source = (self._first_param(params, "source") or "all").lower()
-        status = (self._first_param(params, "status") or "all").lower()
+        filters = self._parse_filter_params(
+            params,
+            default_limit=200,
+            max_limit=1000,
+            default_events=False,
+        )
+        offset = self._parse_int_param(params, "offset", 0, minimum=0, maximum=100000)
+        sessions_filters = dict(filters)
+        sessions_filters["session_limit"] = None
+        snapshot = self._collect_filtered_snapshot(
+            params,
+            default_limit=200,
+            max_limit=1000,
+            default_events=False,
+            parsed_filters=sessions_filters,
+        )
+        runtime = filters["runtime"]
+        source = filters["source"] or "all"
+        status = filters["status"] or "all"
         host_id = self._first_param(params, "host_id")
-        limit = self._parse_int_param(params, "limit", 200, minimum=1, maximum=1000)
-        rows = unified_sessions(
+        limit = filters["limit"]
+        if filters["session_limit"] is not None:
+            limit = min(limit, filters["session_limit"])
+        all_rows = unified_sessions(
             snapshot,
             runtime=runtime,
             source=source,
             status=status,
             host_id=host_id,
-            limit=limit,
         )
+        rows = all_rows[offset : offset + limit]
         self._send_json(
             200,
             {
@@ -2061,9 +2245,13 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                     "source": source,
                     "status": status,
                     "host_id": host_id,
+                    "offset": offset,
                     "limit": limit,
                 },
                 "count": len(rows),
+                "total": len(all_rows),
+                "offset": offset,
+                "truncated": (offset + len(rows)) < len(all_rows),
                 "runtimes": snapshot.get("runtimes", {}),
                 "metrics": snapshot.get("metrics", {}),
                 "sessions": rows,
@@ -2076,24 +2264,65 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
         after_seq = None
         if self._first_param(params, "after_seq") is not None:
             after_seq = self._parse_int_param(params, "after_seq", 0, minimum=0, maximum=10**12)
-        runtime_raw = self._first_param(params, "runtime")
-        runtime = normalize_runtime(runtime_raw)
-        if runtime_raw and runtime is None and runtime_raw.lower() != "all":
-            raise _HTTPError(400, f"Unsupported runtime {runtime_raw!r}")
-        collector = self._require_collector()
-        collect_kwargs: dict[str, Any] = {"limit": limit, "include_events": True, "include_native": False}
-        if runtime is not None:
-            collect_kwargs["runtime"] = runtime
-        if after_seq is not None:
-            collect_kwargs["after_seq"] = after_seq
-        snapshot = collector.collect(**collect_kwargs)
-        events = list(snapshot.get("events") or [])
-        next_seq = max((int(ev.get("seq", 0)) for ev in events), default=after_seq or 0)
+        try:
+            runtime = parse_runtime_filter(self._first_param(params, "runtime"))
+        except ValueError as error:
+            raise _HTTPError(400, str(error)) from None
+        raw_snapshot, events_truncated = self._collect_filtered_snapshot_with_meta(
+            params,
+            default_limit=50,
+            max_limit=500,
+            default_events=True,
+            parsed_filters={
+                "limit": limit,
+                "session_limit": None,
+                "runtime": runtime,
+                "source": None,
+                "status": None,
+                "include_native": False,
+                "include_events": True,
+                "after_seq": after_seq,
+            },
+        )
+        is_legacy = bool(
+            raw_snapshot.get("legacy_broker")
+            or (not raw_snapshot.get("collector_version") and "runtimes" not in raw_snapshot)
+        )
+        if (is_legacy or events_truncated) and after_seq is not None:
+            msg = (
+                "Connected broker daemon does not support incremental after_seq event queries; upgrade and restart the broker service"
+                if is_legacy
+                else "Collector event window truncated before filter; incremental after_seq queries require a server-side filtering collector"
+            )
+            raise _HTTPError(501, msg)
+        if events_truncated:
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "timestamp": raw_snapshot.get("timestamp"),
+                    "after_seq": after_seq,
+                    "next_seq": 0,
+                    "count": 0,
+                    "events": [],
+                    "events_truncated": True,
+                },
+            )
+            return
+        events = list(raw_snapshot.get("events") or [])
+        metrics = raw_snapshot.get("metrics") or {}
+        max_event_seq = max((int(ev.get("seq", 0)) for ev in events), default=after_seq or 0)
+        latest_db_seq = int(metrics.get("latest_event_seq") or 0)
+        # Only jump cursor to latest_db_seq when not legacy and all matching events fit in this page.
+        if not is_legacy and (after_seq is None or len(events) < limit):
+            next_seq = max(max_event_seq, latest_db_seq, after_seq or 0)
+        else:
+            next_seq = max(max_event_seq, after_seq or 0)
         self._send_json(
             200,
             {
                 "ok": True,
-                "timestamp": snapshot.get("timestamp"),
+                "timestamp": raw_snapshot.get("timestamp"),
                 "after_seq": after_seq,
                 "next_seq": next_seq,
                 "count": len(events),
@@ -2108,8 +2337,9 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "version": "1.0",
                 "auth": {
-                    "schemes": ["Authorization: Bearer <admin.token>", "Cookie: cab_monitor_session=<id>"],
-                    "csrf_required_for": ["POST /api/respond", "POST /api/host/ping", "POST /auth/logout"],
+                    "schemes": ["Authorization: Bearer <admin.token>", f"Cookie: {SESSION_COOKIE}=<id>"],
+                    "csrf_required_for": ["POST /api/respond", "POST /api/host/ping"],
+                    "cookie_origin_required_for": ["POST /api/respond", "POST /api/host/ping", "POST /auth/logout"],
                 },
                 "runtimes": [
                     {"id": rt, "display": display_runtime(rt)}
@@ -2128,15 +2358,15 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                     },
                     "GET /api/v1/sessions": {
                         "description": "Unified Bridge + native worker/session feed.",
-                        "query": ["runtime=all|pi|claude|antigravity|agy|codex", "source=all|bridge|native", "status=all|active|running|idle|waiting|stopped", "host_id", "limit"],
+                        "query": ["runtime=all|pi|claude|antigravity|agy|codex", "source=all|bridge|native", "status=all|active|running|idle|waiting|waiting_input|stopped", "host_id", "offset", "limit"],
                     },
                     "GET /api/v1/events": {
-                        "description": "Incremental Bridge event feed ordered by seq.",
+                        "description": "Bridge event feed ordered by seq. Without after_seq, returns the latest limit events; pass after_seq (e.g. after_seq=0 for full history) to paginate ascending without skipping events.",
                         "query": ["after_seq", "runtime", "limit"],
                     },
                     "GET /api/v1/stream": {
-                        "description": "Server-Sent Events (SSE) stream emitting snapshot and event frames.",
-                        "query": ["after_seq", "runtime", "source", "status", "interval", "once=1", "max_events"],
+                        "description": "Server-Sent Events (SSE) stream emitting snapshot, event, and cursor frames. Non-legacy snapshot frames contain current state with events=[] while matching events arrive strictly as individual event frames (initial un-cursored connections emit the latest tail limit events and advance from that window; pass after_seq=0 or Last-Event-ID for strict gapless replay).",
+                        "query": ["after_seq", "limit", "runtime", "source", "status", "interval", "once=1", "max_events", "max_seconds"],
                     },
                     "GET /api/v1/schema": {
                         "description": "Machine-readable schema describing monitor API endpoints and supported runtimes.",
@@ -2146,6 +2376,7 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_api_v1_stream(self) -> None:
+        global _ACTIVE_SSE_CLIENTS
         params = self._query_params()
         self._require_collector()
         once = self._parse_bool_param(params, "once", False)
@@ -2157,68 +2388,300 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
                 interval = float(interval_raw)
             except ValueError:
                 raise _HTTPError(400, "Invalid interval parameter") from None
+            if interval <= 0:
+                raise _HTTPError(400, "interval must be positive")
             interval = max(0.2, min(10.0, interval))
-        runtime_raw = self._first_param(params, "runtime")
-        runtime = normalize_runtime(runtime_raw)
-        if runtime_raw and runtime is None and runtime_raw.lower() != "all":
-            raise _HTTPError(400, f"Unsupported runtime {runtime_raw!r}")
-        after_seq = None
-        if self._first_param(params, "after_seq") is not None:
-            after_seq = self._parse_int_param(params, "after_seq", 0, minimum=0, maximum=10**12)
+        max_seconds_raw = self._first_param(params, "max_seconds")
+        max_seconds = SSE_MAX_LIFETIME_SECONDS
+        if max_seconds_raw is not None:
+            try:
+                parsed_seconds = float(max_seconds_raw)
+            except ValueError:
+                raise _HTTPError(400, "Invalid max_seconds parameter") from None
+            if parsed_seconds <= 0:
+                raise _HTTPError(400, "max_seconds must be positive")
+            max_seconds = max(0.2, min(SSE_MAX_LIFETIME_SECONDS, parsed_seconds))
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
+        # Validate filter params before opening the 200 text/event-stream response.
+        poll_limit = 50
+        filters = self._parse_filter_params(
+            params,
+            default_limit=poll_limit,
+            max_limit=500,
+            default_events=True,
+        )
+        if not filters["include_events"]:
+            raise _HTTPError(400, "include_events=false is not supported on /api/v1/stream")
+        runtime = filters["runtime"]
+        last_event_id: int | None = None
+        last_event_id_raw = self.headers.get("Last-Event-ID")
+        if last_event_id_raw is not None and last_event_id_raw.strip() != "":
+            try:
+                parsed_id = int(last_event_id_raw.strip())
+            except ValueError:
+                raise _HTTPError(400, "Invalid Last-Event-ID header") from None
+            if parsed_id < 0 or parsed_id > 10**12:
+                raise _HTTPError(400, "Last-Event-ID out of range")
+            last_event_id = parsed_id
+        # Browser EventSource reconnects with Last-Event-ID while keeping original URL query params.
+        initial_after_seq = last_event_id if last_event_id is not None else filters["after_seq"]
 
-        def write_sse(event_name: str, payload: dict[str, Any], event_id: str | int | None = None) -> None:
-            lines: list[str] = []
-            if event_id is not None:
-                lines.append(f"id: {event_id}")
-            lines.append(f"event: {event_name}")
-            lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
-            lines.append("")
-            self.wfile.write(("\n".join(lines) + "\n").encode("utf-8"))
-            self.wfile.flush()
+        def stream_authorized() -> bool:
+            if self.state is None:
+                return True
+            live_token = self._load_token()
+            return live_token is not None and self._identity(live_token) is not None
 
-        emitted = 0
-        last_digest: str | None = None
-        last_seq = after_seq or 0
+        poll_session_limit = filters["session_limit"]
+        poll_status_filter = filters.get("status")
+        needs_full_sessions_for_status = (
+            poll_session_limit is not None and poll_status_filter not in (None, "all")
+        )
+
+        def collect_for_poll(after_cursor: int | None) -> tuple[dict[str, Any], bool]:
+            poll_filters = dict(filters)
+            poll_filters["after_seq"] = after_cursor
+            poll_params = dict(params)
+            if needs_full_sessions_for_status:
+                poll_filters["session_limit"] = None
+                poll_params.pop("session_limit", None)
+            if after_cursor is not None:
+                poll_params["after_seq"] = [str(after_cursor)]
+            else:
+                poll_params.pop("after_seq", None)
+            return self._collect_filtered_snapshot_with_meta(
+                poll_params,
+                default_limit=poll_limit,
+                max_limit=500,
+                default_events=True,
+                parsed_filters=poll_filters,
+            )
+
+        with _SSE_CLIENTS_LOCK:
+            if _ACTIVE_SSE_CLIENTS >= MAX_SSE_CLIENTS:
+                raise _HTTPError(503, "Too many active SSE stream connections")
+            _ACTIVE_SSE_CLIENTS += 1
+
         try:
-            while True:
-                snap = self._collect_filtered_snapshot(params, default_limit=50, default_events=True)
-                digest_basis = {
-                    "metrics": snap.get("metrics"),
-                    "runtimes": snap.get("runtimes"),
-                    "sessions": snap.get("sessions"),
-                    "native_sessions": snap.get("native_sessions"),
-                    "pending_questions": snap.get("pending_questions"),
-                }
-                digest = hashlib.sha256(
-                    json.dumps(digest_basis, sort_keys=True, ensure_ascii=False).encode("utf-8")
-                ).hexdigest()
-                if digest != last_digest:
-                    write_sse("snapshot", snap, event_id=last_seq)
-                    last_digest = digest
-                    emitted += 1
-                    if max_events and emitted >= max_events:
+            initial_snap, initial_events_truncated = collect_for_poll(initial_after_seq)
+            initial_legacy = bool(
+                initial_snap.get("legacy_broker")
+                or (not initial_snap.get("collector_version") and "runtimes" not in initial_snap)
+            )
+            if (initial_legacy or initial_events_truncated) and (initial_after_seq is not None or not once):
+                msg = (
+                    "Connected broker daemon does not support reliable incremental SSE streaming; upgrade and restart the broker service"
+                    if initial_legacy
+                    else "Collector event window truncated before filter; incremental SSE streaming requires a server-side filtering collector"
+                )
+                raise _HTTPError(501, msg)
+            if not stream_authorized():
+                raise _HTTPError(401, "Unauthorized")
+
+            try:
+                self.connection.settimeout(SSE_SOCKET_TIMEOUT_SECONDS)
+            except OSError:
+                pass
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            last_write_at = time.monotonic()
+            started_at = last_write_at
+
+            def write_sse(event_name: str, payload: dict[str, Any], event_id: str | int | None = None) -> None:
+                nonlocal last_write_at
+                lines: list[str] = []
+                if event_id is not None:
+                    lines.append(f"id: {event_id}")
+                lines.append(f"event: {event_name}")
+                lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
+                lines.append("")
+                self.wfile.write(("\n".join(lines) + "\n").encode("utf-8"))
+                self.wfile.flush()
+                last_write_at = time.monotonic()
+
+            def write_keepalive() -> None:
+                nonlocal last_write_at
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                last_write_at = time.monotonic()
+
+            emitted = 0
+            last_digest: str | None = None
+            last_seq = initial_after_seq or 0
+            client_cursor_seq: int | None = initial_after_seq
+            has_cursor = initial_after_seq is not None
+            pending_initial: tuple[dict[str, Any], bool] | None = (initial_snap, initial_events_truncated)
+
+            try:
+                while True:
+                    if time.monotonic() - started_at >= max_seconds:
                         break
-                events = [ev for ev in (snap.get("events") or []) if int(ev.get("seq", 0)) > last_seq]
-                events.sort(key=lambda item: int(item.get("seq", 0)))
-                for ev in events:
-                    seq = int(ev.get("seq", 0))
-                    if runtime and ev.get("runtime") and ev.get("runtime") != runtime:
+                    if not stream_authorized():
+                        break
+                    if pending_initial is not None:
+                        snap, events_truncated_before_filter = pending_initial
+                        pending_initial = None
+                    else:
+                        snap, events_truncated_before_filter = collect_for_poll(last_seq if has_cursor else None)
+                    # Re-check auth AFTER blocking collect() before flushing any sensitive frame.
+                    if not stream_authorized():
+                        break
+
+                    snap_legacy = bool(
+                        snap.get("legacy_broker")
+                        or (not snap.get("collector_version") and "runtimes" not in snap)
+                    )
+                    latest_db_seq = int((snap.get("metrics") or {}).get("latest_event_seq") or 0)
+                    source_filter = filters.get("source")
+                    status_filter = filters.get("status")
+                    allowed_session_ids = (
+                        {
+                            s.get("id")
+                            for s in (snap.get("sessions") or [])
+                            if s.get("id") and matches_bridge_status(s, status_filter)
+                        }
+                        if status_filter and status_filter != "all"
+                        else None
+                    )
+                    if poll_session_limit is not None and needs_full_sessions_for_status:
+                        snap = {
+                            **snap,
+                            "sessions": list(snap.get("sessions") or [])[:poll_session_limit],
+                            "native_sessions": list(snap.get("native_sessions") or [])[:poll_session_limit],
+                        }
+                    raw_events = (
+                        []
+                        if (source_filter == "native" or events_truncated_before_filter)
+                        else list(snap.get("events") or [])
+                    )
+                    events = [
+                        ev
+                        for ev in raw_events
+                        if int(ev.get("seq", 0)) > last_seq
+                        and not (runtime and ev.get("runtime") and ev.get("runtime") != runtime)
+                        and (allowed_session_ids is None or ev.get("session_id") in allowed_session_ids)
+                    ]
+                    events.sort(key=lambda item: int(item.get("seq", 0)))
+
+                    # Only advance the cursor pre-snapshot when no pending matching events await delivery
+                    # and this poll did not hit a page boundary (before or after Web-layer filtering).
+                    can_advance_past_db = (
+                        not snap_legacy
+                        and not events
+                        and not events_truncated_before_filter
+                        and len(raw_events) < filters["limit"]
+                    )
+                    if can_advance_past_db:
+                        last_seq = max(last_seq, latest_db_seq)
+
+                    if snap_legacy:
+                        snapshot_event_id: int | None = None
+                    elif events and not has_cursor:
+                        # Never pre-acknowledge un-sent events if the client disconnects after snapshot.
+                        snapshot_event_id = max(last_seq, int(events[0].get("seq", 0)) - 1)
+                    else:
+                        snapshot_event_id = last_seq
+
+                    digest_metrics = snap.get("metrics")
+                    if isinstance(digest_metrics, dict):
+                        digest_metrics = {k: v for k, v in digest_metrics.items() if k != "latest_event_seq"}
+
+                    def _strip_relative(val: Any) -> Any:
+                        if isinstance(val, dict):
+                            return {k: _strip_relative(v) for k, v in val.items() if not k.endswith("_rel")}
+                        if isinstance(val, list):
+                            return [_strip_relative(item) for item in val]
+                        return val
+
+                    digest_basis = _strip_relative(
+                        {
+                            "coordinator": snap.get("coordinator"),
+                            "hosts": snap.get("hosts"),
+                            "groups": snap.get("groups"),
+                            "broadcasts": snap.get("broadcasts"),
+                            "peer_queues": snap.get("peer_queues"),
+                            "metrics": digest_metrics,
+                            "runtimes": snap.get("runtimes"),
+                            "sessions": snap.get("sessions"),
+                            "native_sessions": snap.get("native_sessions"),
+                            "pending_questions": snap.get("pending_questions"),
+                        }
+                    )
+                    digest = hashlib.sha256(
+                        json.dumps(digest_basis, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                    ).hexdigest()
+                    if digest != last_digest:
+                        if not stream_authorized():
+                            return
+                        # Deliver state in snapshot (with events=[] on non-legacy or truncated streams) and stream events as separate SSE frames
+                        # so a disconnect after snapshot/partial events never replays already-processed inline snapshot events.
+                        if events_truncated_before_filter:
+                            snapshot_payload = {**snap, "events": [], "events_truncated": True}
+                        elif snap_legacy:
+                            snapshot_payload = snap
+                        else:
+                            snapshot_payload = {**snap, "events": []}
+                        write_sse("snapshot", snapshot_payload, event_id=snapshot_event_id)
+                        if snapshot_event_id is not None:
+                            client_cursor_seq = snapshot_event_id
+                        last_digest = digest
+                        emitted += 1
+                        if max_events and emitted >= max_events:
+                            break
+                    hit_max_events = False
+                    for ev in events:
+                        if not stream_authorized():
+                            return
+                        seq = int(ev.get("seq", 0))
+                        last_seq = max(last_seq, seq)
+                        write_sse("event", ev, event_id=seq)
+                        client_cursor_seq = seq
+                        emitted += 1
+                        if max_events and emitted >= max_events:
+                            hit_max_events = True
+                            break
+                    if snap_legacy:
+                        break
+                    if (
+                        not hit_max_events
+                        and not events_truncated_before_filter
+                        and len(raw_events) < filters["limit"]
+                    ):
+                        raw_max_seq = max((int(ev.get("seq", 0)) for ev in raw_events), default=last_seq)
+                        last_seq = max(last_seq, raw_max_seq, latest_db_seq)
+                    has_cursor = True
+                    if (
+                        not hit_max_events
+                        and not (max_events and emitted >= max_events)
+                        and (client_cursor_seq is None or last_seq > client_cursor_seq)
+                    ):
+                        if not stream_authorized():
+                            return
+                        write_sse("cursor", {"last_seq": last_seq}, event_id=last_seq)
+                        client_cursor_seq = last_seq
+                        emitted += 1
+                        if max_events and emitted >= max_events:
+                            hit_max_events = True
+                    if once or events_truncated_before_filter or hit_max_events or (max_events and emitted >= max_events):
+                        break
+                    if len(raw_events) >= filters["limit"]:
                         continue
-                    write_sse("event", ev, event_id=seq)
-                    last_seq = max(last_seq, seq)
-                    emitted += 1
-                    if max_events and emitted >= max_events:
+                    now = time.monotonic()
+                    if now - last_write_at >= SSE_KEEPALIVE_SECONDS:
+                        write_keepalive()
+                    remaining = max_seconds - (time.monotonic() - started_at)
+                    if remaining <= 0:
                         break
-                if once or (max_events and emitted >= max_events):
-                    break
-                time.sleep(interval)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            return
+                    time.sleep(min(interval, remaining))
+            except (_HTTPError, BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                return
+        finally:
+            with _SSE_CLIENTS_LOCK:
+                _ACTIVE_SSE_CLIENTS = max(0, _ACTIVE_SSE_CLIENTS - 1)
 
     def _handle_login(self, token: str) -> None:
         origin = self.headers.get("Origin")

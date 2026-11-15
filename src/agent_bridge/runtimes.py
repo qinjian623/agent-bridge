@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import stat
+import uuid
 from collections import deque
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -546,6 +547,7 @@ class ClaudeRuntime:
         self.native_id = session["native_id"]
         self.started_before = bool(session.get("has_native_history"))
         self.total_usage = claude_counters(session.get("native_usage_total")) if self.started_before else {}
+        self._client_cost_scope = uuid.uuid4().hex
         self.client = None
 
     async def permission(self, tool_name, input_data, context):
@@ -659,6 +661,7 @@ class ClaudeRuntime:
                 normalized = claude_usage(
                     self.total_usage, message.model_usage, message.usage or {}, message.total_cost_usd
                 )
+                normalized["reported_cost_scope"] = self._client_cost_scope
                 self.total_usage = claude_counters(message.model_usage, self.total_usage)
                 result = {
                     "answer": answer,

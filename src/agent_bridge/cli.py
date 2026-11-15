@@ -125,9 +125,10 @@ def build_parser():
     return parser
 
 
-def main():
+def main(argv: list[str] | None = None):
     os.umask(0o077)
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args(argv)
     try:
         state = state_directory(args.state)
         if args.command == "init":
@@ -227,6 +228,17 @@ def main():
             )
         elif args.command == "monitor":
             if args.web:
+                if (
+                    args.runtime != "all"
+                    or args.source != "all"
+                    or args.active_only
+                    or args.session_limit is not None
+                    or args.no_native
+                ):
+                    parser.error(
+                        "--runtime, --source, --active-only, --session-limit, and --no-native "
+                        "only apply to terminal monitor mode (use the Web UI filters or /api/v1/* query params)."
+                    )
                 from .web_monitor import run_web_monitor
 
                 run_web_monitor(

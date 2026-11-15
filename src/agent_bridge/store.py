@@ -996,7 +996,13 @@ class Store:
                         "invalid_continuation", "Only an interrupted task in this session can be continued"
                     )
                 db.execute("UPDATE tasks SET status='queued',cancel_requested=0 WHERE id=?", (continue_task_id,))
-            self.event(db, "session_control_requested", {"action": action, "revision": revision + 1}, session_id)
+            self.event(
+                db,
+                "session_control_requested",
+                {"action": action, "revision": revision + 1},
+                session_id,
+                continue_task_id,
+            )
             return self.remember(
                 db, request_id, fingerprint, {"session_id": session_id, "desired": desired, "revision": revision + 1}
             )

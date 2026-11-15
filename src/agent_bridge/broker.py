@@ -995,6 +995,9 @@ class Broker:
         self.launching = set()
         self.stopping = asyncio.Event()
         self.request_locks = {}
+        self._monitor_collector = None
+        self._monitor_lock = asyncio.Lock()
+        self._monitor_inflight = None
         self.delivery_scheduler = DeliveryScheduler(self.store, self.peer_factory, config=self.config)
         self.outbox_puller = OutboxPuller(self.store, self.peer_factory, self.host_registry, self.config)
         self.event_mirror = EventMirror(self.store, self.peer_factory, self.host_registry, self.config)
@@ -2125,19 +2128,42 @@ class Broker:
         if method == "agent_monitor":
             from .monitor import MonitorCollector
 
-            collector = MonitorCollector(self.state, host_registry=self.host_registry)
             limit = args.get("limit", 15)
             include_events = args.get("include_events", True)
-            return collector.collect(
-                limit=limit,
-                include_events=include_events,
-                runtime=args.get("runtime"),
-                source=args.get("source"),
-                status=args.get("status"),
-                session_limit=args.get("session_limit"),
-                include_native=args.get("include_native", True),
-                after_seq=args.get("after_seq"),
-            )
+            try:
+                async with self._monitor_lock:
+                    if self._monitor_inflight is not None and not self._monitor_inflight.done():
+                        try:
+                            await asyncio.shield(self._monitor_inflight)
+                        except Exception:
+                            pass
+                    if self._monitor_collector is None:
+                        self._monitor_collector = MonitorCollector(self.state, host_registry=self.host_registry)
+                    else:
+                        self._monitor_collector.host_registry = self.host_registry
+                    collector = self._monitor_collector
+                    inflight = asyncio.create_task(
+                        asyncio.to_thread(
+                            collector.collect,
+                            limit=limit,
+                            include_events=include_events,
+                            runtime=args.get("runtime"),
+                            source=args.get("source"),
+                            status=args.get("status"),
+                            session_limit=args.get("session_limit"),
+                            include_native=args.get("include_native", True),
+                            after_seq=args.get("after_seq"),
+                        )
+                    )
+                    inflight.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+                    self._monitor_inflight = inflight
+                    try:
+                        return await asyncio.shield(inflight)
+                    finally:
+                        if inflight.done() and self._monitor_inflight is inflight:
+                            self._monitor_inflight = None
+            except ValueError as exc:
+                raise BridgeError("invalid_request", str(exc)) from None
         if method == "agent_hosts":
             host_id = args.get("host_id")
             if host_id is not None and not isinstance(host_id, str):
@@ -2621,6 +2647,11 @@ class Broker:
             for task in (delivery_scheduler, outbox_puller, event_mirror, host_watcher):
                 task.cancel()
             await asyncio.gather(delivery_scheduler, outbox_puller, event_mirror, host_watcher, return_exceptions=True)
+            if self._monitor_inflight is not None and not self._monitor_inflight.done():
+                try:
+                    await asyncio.shield(self._monitor_inflight)
+                except Exception:
+                    pass
             close_peers = getattr(self.peer_factory, "close", None)
             try:
                 if close_peers is not None:
