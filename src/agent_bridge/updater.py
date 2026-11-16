@@ -17,6 +17,7 @@ import shutil
 import socket
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -55,20 +56,25 @@ class UpdateUncertain(RuntimeError):
     """A service command may still be running; do not repeat it or undo its files."""
 
 
+class _ServiceCommandError(RuntimeError):
+    def __init__(self, message: str, *, returncode: int, stderr: str = ""):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
+
+
 def _private(path: Path, *, directory=False):
     info = path.lstat()
-    import stat
 
     kind = stat.S_ISDIR if directory else stat.S_ISREG
     if not kind(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError(f"Update {'directory' if directory else 'file'} must be private and owned: {path}")
 
 
-def _write(path: Path, value):
-    data = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2) + "\n"
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False, prefix=".update-") as output:
+def _write_bytes(path: Path, data: bytes, mode: int = 0o600):
+    with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, delete=False, prefix=".update-") as output:
         temporary = Path(output.name)
-        os.chmod(temporary, 0o600)
+        os.chmod(temporary, mode)
         output.write(data)
         output.flush()
         os.fsync(output.fileno())
@@ -78,14 +84,25 @@ def _write(path: Path, value):
         temporary.unlink(missing_ok=True)
 
 
+def _write(path: Path, value):
+    data = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    _write_bytes(path, data.encode())
+
+
 def _run(argv, *, timeout=120):
     # Do not persist stderr or the environment: gh may include credential diagnostics.
     try:
         result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as error:
         raise UpdateUncertain("Command timed out; its outcome must be checked before retrying") from error
+    if result.returncode < 0:
+        raise UpdateUncertain("Command terminated by signal; its outcome must be checked before retrying")
     if result.returncode:
-        raise RuntimeError(f"{Path(argv[0]).name} command failed (exit {result.returncode})")
+        raise _ServiceCommandError(
+            f"{Path(argv[0]).name} command failed (exit {result.returncode})",
+            returncode=result.returncode,
+            stderr=result.stderr if isinstance(result.stderr, str) else "",
+        )
     return result.stdout
 
 
@@ -861,27 +878,18 @@ class Updater:
 
     def _restart(self):
         service = self.settings["service_name"]
-        command = (
-            ["systemctl", "--user", "restart", service]
-            if self.settings["service_kind"] == "systemd"
-            else ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{service}"]
-        )
+        if self.settings["service_kind"] == "systemd":
+            command = ["systemctl", "--user", "restart", service]
+        else:
+            command = ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{_launchd_label(service)}"]
         _run(command, timeout=45)
 
     def service_managed(self):
         """Changing current has no effect until the service uses our stable launcher."""
         launcher = str(self.root / "bin/agent-bridge")
-        try:
-            if self.settings["service_kind"] == "systemd":
-                value = _run(
-                    ["systemctl", "--user", "show", self.settings["service_name"], "-p", "ExecStart", "--value"],
-                    timeout=10,
-                )
-                return re.search(r"(?:^|[ ;{])path=" + re.escape(launcher) + r"\s*;", value) is not None
-            value = _run(["launchctl", "print", f"gui/{os.getuid()}/{self.settings['service_name']}"], timeout=10)
-            return any(line.strip() == "program = " + launcher for line in value.splitlines())
-        except (OSError, RuntimeError):
-            return False
+        return _probe_broker_service_state(
+            self.settings["service_kind"], self.settings["service_name"], launcher,
+        )[2]
 
     async def _activate(
         self,
@@ -951,8 +959,8 @@ class Updater:
             except UpdateUncertain:
                 raise
             except (RuntimeError, OSError, BridgeError):
-                self._switch(previous)
                 try:
+                    self._switch(previous)
                     self._restart()
                     await self._healthy(self.state, expected_version=previous_version)
                 except (RuntimeError, OSError, BridgeError) as error:
@@ -1018,15 +1026,46 @@ class Updater:
             return {"status": "deferred", "reason": "another_updater"}
 
 
-def _launcher(root: Path, bootstrap: Path, module: str):
+_LAUNCHER_MODULES = (
+    ("agent-bridge", "agent_bridge.cli"),
+    ("agent-bridge-update", "agent_bridge.updater"),
+)
+
+
+def _launcher_prefix(root: Path, module: str):
     return (
         "#!/bin/sh\nset -eu\n"
         + f"root={shlex.quote(str(root))}\n"
         + 'if [ -x "$root/current/bin/python" ]; then\n'
         + '  release=$(CDPATH= cd -- "$root/current" && pwd -P)\n'
-        + f'  exec "$release/bin/python" -m {module} "$@"\nfi\n'
-        + f'exec {shlex.quote(str(bootstrap))} -m {module} "$@"\n'
+        + f'  exec "$release/bin/python" -m {module} "$@"\nfi\nexec '
     )
+
+
+def _launcher(root: Path, bootstrap: Path, module: str):
+    return _launcher_prefix(root, module) + shlex.quote(str(bootstrap)) + f' -m {module} "$@"\n'
+
+
+def _managed_launcher_bootstrap(content: str, root: Path, module: str) -> Path | None:
+    """Return the bootstrap path when content is exactly our launcher template, not arbitrary shell."""
+    prefix = _launcher_prefix(root, module)
+    suffix = f' -m {module} "$@"\n'
+    if not content.startswith(prefix) or not content.endswith(suffix):
+        return None
+    token = content[len(prefix) : len(content) - len(suffix)]
+    if not token:
+        return None
+    try:
+        parts = shlex.split(token)
+    except ValueError:
+        return None
+    if len(parts) != 1 or shlex.quote(parts[0]) != token:
+        return None
+    raw = parts[0]
+    if not raw or "\x00" in raw or "\n" in raw or "\r" in raw:
+        return None
+    bootstrap = Path(raw)
+    return bootstrap if bootstrap.is_absolute() else None
 
 
 def _systemd_exec_start(args: list[str]) -> str:
@@ -1042,6 +1081,10 @@ def _launchd_path_env() -> str:
     )
 
 
+def _launchd_label(name: str) -> str:
+    return name[:-6] if name.endswith(".plist") else name
+
+
 def _validate_repository(repository: str) -> None:
     if (
         not isinstance(repository, str)
@@ -1051,12 +1094,15 @@ def _validate_repository(repository: str) -> None:
         raise ValueError("Invalid GitHub repository")
 
 
-def _expected_launchers(root: Path) -> tuple[Path, Path, dict[str, tuple[str, Path]]]:
-    bootstrap = Path(sys.executable).parent.resolve() / Path(sys.executable).name
+def _expected_launchers(
+    root: Path,
+    bootstrap: Path | None = None,
+) -> tuple[Path, Path, dict[str, tuple[str, Path]]]:
+    bootstrap = bootstrap or Path(sys.executable).parent.resolve() / Path(sys.executable).name
     binary = root / "bin"
     entries = {
         filename: (_launcher(root, bootstrap, module), binary / filename)
-        for filename, module in (("agent-bridge", "agent_bridge.cli"), ("agent-bridge-update", "agent_bridge.updater"))
+        for filename, module in _LAUNCHER_MODULES
     }
     return bootstrap, binary, entries
 
@@ -1109,20 +1155,24 @@ def _check_launcher_conflicts(root: Path) -> None:
     binary = root / "bin"
     _validate_write_target(binary, label="managed bin directory", stop_at=root, expect_dir=True)
     _, _, entries = _expected_launchers(root)
-    for expected, command in entries.values():
+    for filename, module in _LAUNCHER_MODULES:
+        _, command = entries[filename]
         if command.is_symlink():
             raise ValueError("Refusing to overwrite a symlinked managed launcher")
-        if command.exists() and (not command.is_file() or command.read_text() != expected):
+        if command.exists() and (
+            not command.is_file() or _managed_launcher_bootstrap(command.read_text(), root, module) is None
+        ):
             raise ValueError("Refusing to overwrite an unrelated managed launcher")
 
 
-def _ensure_launchers(root: Path) -> tuple[Path, Path]:
-    bootstrap, binary, entries = _expected_launchers(root)
+def _ensure_launchers(root: Path, bootstrap: Path | None = None) -> tuple[Path, Path]:
+    bootstrap, binary, entries = _expected_launchers(root, bootstrap)
     _check_launcher_conflicts(root)
     binary.mkdir(mode=0o700, exist_ok=True)
     for expected, command in entries.values():
-        _write(command, expected)
-        command.chmod(0o700)
+        if not command.exists():
+            _write(command, expected)
+            command.chmod(0o700)
     return bootstrap, binary
 
 
@@ -1167,7 +1217,23 @@ def validate_update_install(
         _private(state, directory=True)
     resolved_root, kind, name = _resolve_root_and_service(root, service_kind, service_name, create=False)
     _check_launcher_conflicts(resolved_root)
+    path = state / "update.json"
     bootstrap = Path(sys.executable).parent.resolve() / Path(sys.executable).name
+    existing = None
+    if path.exists() and not path.is_symlink() and path.is_file():
+        try:
+            existing = json.loads(path.read_text())
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict):
+            recorded = existing.get("bootstrap_python")
+            if (
+                isinstance(recorded, str)
+                and Path(recorded).is_absolute()
+                and "\x00" not in recorded
+                and "\n" not in recorded
+            ):
+                bootstrap = Path(recorded)
     settings: dict[str, object] = {
         "repository": repository,
         "root": str(resolved_root),
@@ -1176,7 +1242,6 @@ def validate_update_install(
         "bootstrap_python": str(bootstrap),
         "interval": interval,
     }
-    path = state / "update.json"
     _validate_write_target(path, label="update.json", stop_at=state)
     if kind == "systemd":
         directory = Path.home() / ".config/systemd/user"
@@ -1186,7 +1251,8 @@ def validate_update_install(
         directory = Path.home() / "Library/LaunchAgents"
         _validate_write_target(directory / "com.cli-agent-bridge.update.plist", label="updater LaunchAgent file")
     if path.exists() and not update_existing:
-        existing = json.loads(path.read_text())
+        if existing is None:
+            existing = json.loads(path.read_text())
         if not isinstance(existing, dict):
             raise ValueError("Invalid update settings")
         normalized = {**existing, "interval": existing.get("interval", 3600)}
@@ -1217,6 +1283,8 @@ def install(
         interval=interval,
         update_existing=update_existing,
     )
+    if enable and not _probe_broker_service_state(kind, name, str(resolved_root / "bin/agent-bridge"))[2]:
+        raise ValueError("Migrate the broker service to its managed launcher before enabling updates")
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     _private(state, directory=True)
     resolved_root.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -1226,9 +1294,7 @@ def install(
     load_settings(state)
     if on_write is not None:
         on_write("update.json")
-    _, binary = _ensure_launchers(resolved_root)
-    if enable and not Updater(state).service_managed():
-        raise ValueError("Migrate the broker service to its managed launcher before enabling updates")
+    _, binary = _ensure_launchers(resolved_root, Path(settings["bootstrap_python"]))
     args = [str(binary / "agent-bridge-update"), "--state", str(state), "--jitter", "300", "run"]
     if kind == "systemd":
         directory = Path.home() / ".config/systemd/user"
@@ -1269,7 +1335,7 @@ def install(
         "launcher": str(binary / "agent-bridge"),
         "timer": str(timer_path),
         "enabled": enable,
-        "broker_service_migrated": Updater(state).service_managed() if enable else False,
+        "broker_service_migrated": bool(enable),
     }
 
 
@@ -1294,7 +1360,7 @@ def _broker_service_spec(
             "[Install]\nWantedBy=default.target\n"
         )
     else:
-        label = name[:-6] if name.endswith(".plist") else name
+        label = _launchd_label(name)
         service_path = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
         arguments = "".join(f"<string>{escape(value)}</string>" for value in args)
         content = (
@@ -1307,33 +1373,115 @@ def _broker_service_spec(
     return resolved_root, kind, name, launcher, service_path, content
 
 
+_SERVICE_ACTIVE = "active"
+_SERVICE_INACTIVE = "inactive"
+_SERVICE_ABSENT = "absent"
+
+
+class _ServiceProbeResult(tuple):
+    def __new__(cls, status: str, pid: int | None, managed: bool):
+        value = super().__new__(cls, (status == _SERVICE_ACTIVE, pid, managed))
+        value.status = status
+        return value
+
+
+def _confirmed_missing_service(kind: str, error: BaseException) -> bool:
+    if not isinstance(error, _ServiceCommandError):
+        return False
+    stderr = error.stderr.lower() if isinstance(error.stderr, str) else ""
+    if kind == "systemd":
+        return (
+            error.returncode == 4
+            or "could not be found" in stderr
+            or "not found" in stderr
+            or "not-found" in stderr
+        )
+    return (
+        error.returncode == 113
+        or "could not find service" in stderr
+        or "service not found" in stderr
+        or "no such process" in stderr
+    )
+
+
+def _unknown_service_state(kind: str, name: str) -> RuntimeError:
+    return RuntimeError(f"Could not determine {kind} service state for {name}; refusing to guess")
+
+
 def _probe_broker_service_state(kind: str, name: str, launcher: str) -> tuple[bool, int | None, bool]:
-    """Return (is_active, main_pid, uses_managed_launcher) from the user service manager."""
+    """Return (is_active, main_pid, uses_managed_launcher); raise if the state is not known."""
     if kind == "systemd":
         try:
             output = _run(
-                ["systemctl", "--user", "show", name, "-p", "ActiveState", "-p", "MainPID", "-p", "ExecStart"],
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    name,
+                    "-p",
+                    "LoadState",
+                    "-p",
+                    "ActiveState",
+                    "-p",
+                    "MainPID",
+                    "-p",
+                    "ExecStart",
+                ],
                 timeout=10,
             )
-        except (OSError, RuntimeError):
-            return False, None, False
+        except UpdateUncertain:
+            raise
+        except (OSError, RuntimeError) as error:
+            if _confirmed_missing_service(kind, error):
+                return _ServiceProbeResult(_SERVICE_ABSENT, None, False)
+            raise _unknown_service_state(kind, name) from error
         fields: dict[str, str] = {}
         for line in output.splitlines():
             if "=" in line:
                 k, v = line.split("=", 1)
                 fields[k.strip()] = v.strip()
-        active = fields.get("ActiveState") in {"active", "activating", "reloading"}
+        load_state = fields.get("LoadState", "")
+        active_state = fields.get("ActiveState", "")
+        if load_state == "not-found" or active_state == "not-found":
+            status = _SERVICE_ABSENT
+        elif active_state in {"active", "activating", "reloading"}:
+            status = _SERVICE_ACTIVE
+        elif active_state in {"inactive", "failed"}:
+            status = _SERVICE_INACTIVE
+        else:
+            raise _unknown_service_state(kind, name) from RuntimeError(
+                "service manager returned no recognized unit state"
+            )
         raw_pid = fields.get("MainPID", "0")
         pid = int(raw_pid) if raw_pid.isdigit() and int(raw_pid) > 0 else None
         exec_val = fields.get("ExecStart", "")
         managed = re.search(r"(?:^|[ ;{])path=" + re.escape(launcher) + r"\s*;", exec_val) is not None
-        return active, pid, managed
-    label = name[:-6] if name.endswith(".plist") else name
+        return _ServiceProbeResult(status, pid, managed)
+    label = _launchd_label(name)
     try:
         output = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], timeout=10)
-    except (OSError, RuntimeError):
-        return False, None, False
-    active = any(line.strip() == "state = running" for line in output.splitlines())
+    except UpdateUncertain:
+        raise
+    except (OSError, RuntimeError) as error:
+        if _confirmed_missing_service(kind, error):
+            return _ServiceProbeResult(_SERVICE_ABSENT, None, False)
+        raise _unknown_service_state(kind, name) from error
+    lowered = output.lower()
+    if "could not find service" in lowered or "no such process" in lowered:
+        return _ServiceProbeResult(_SERVICE_ABSENT, None, False)
+    states = [
+        line.split("=", 1)[1].strip()
+        for line in output.splitlines()
+        if line.strip().startswith("state =") and "=" in line
+    ]
+    if states == ["running"]:
+        status = _SERVICE_ACTIVE
+    elif len(states) == 1 and states[0] in {"not running", "waiting", "exited"}:
+        status = _SERVICE_INACTIVE
+    else:
+        raise _unknown_service_state(kind, name) from RuntimeError(
+            "launchctl returned no recognized job state"
+        )
     pid: int | None = None
     for line in output.splitlines():
         m = re.match(r"^\s*pid\s*=\s*(\d+)\s*$", line)
@@ -1341,7 +1489,7 @@ def _probe_broker_service_state(kind: str, name: str, launcher: str) -> tuple[bo
             pid = int(m.group(1))
             break
     managed = any(line.strip() == "program = " + launcher for line in output.splitlines())
-    return active, pid, managed
+    return _ServiceProbeResult(status, pid, managed)
 
 
 def _expected_managed_version(root: Path) -> str | None:
@@ -1514,9 +1662,12 @@ def validate_broker_service_install(
             if kind == "systemd"
             else "Refusing to replace existing broker LaunchAgent"
         )
+    service_state: str | None = None
     was_active, old_pid, already_managed = (False, None, False)
     if enable:
-        was_active, old_pid, already_managed = _probe_broker_service_state(kind, name, launcher)
+        probe = _probe_broker_service_state(kind, name, launcher)
+        service_state = getattr(probe, "status", _SERVICE_ACTIVE if probe[0] else _SERVICE_INACTIVE)
+        was_active, old_pid, already_managed = probe[0], probe[1], probe[2]
         needs_restart = was_active and (content_changed or not already_managed)
         if needs_restart:
             if type(old_pid) is not int or old_pid <= 0:
@@ -1536,10 +1687,37 @@ def validate_broker_service_install(
         "service_path": service_path,
         "content": content,
         "content_changed": content_changed,
+        "service_state": service_state,
+        "service_present": service_state != _SERVICE_ABSENT if service_state is not None else None,
         "was_active": was_active,
         "old_pid": old_pid,
         "already_managed": already_managed,
     }
+
+
+def _snapshot_file(path: Path) -> tuple[Path, bool, bytes | None, int | None]:
+    if path.is_symlink():
+        raise ValueError(f"Refusing to snapshot symlinked file: {path}")
+    if not path.exists():
+        return path, False, None, None
+    if not path.is_file():
+        raise ValueError(f"Expected regular file: {path}")
+    info = path.lstat()
+    return path, True, path.read_bytes(), stat.S_IMODE(info.st_mode)
+
+
+def _snapshot_broker_files(root: Path, service_path: Path) -> list[tuple[Path, bool, bytes | None, int | None]]:
+    _, _, entries = _expected_launchers(root)
+    launchers = [command for _, command in entries.values() if not command.exists()]
+    return [_snapshot_file(path) for path in (service_path, *launchers)]
+
+
+def _restore_file_snapshot(snapshot: tuple[Path, bool, bytes | None, int | None]) -> None:
+    path, existed, data, mode = snapshot
+    if existed:
+        _write_bytes(path, data or b"", mode if mode is not None else 0o600)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def install_broker_service(
@@ -1567,6 +1745,15 @@ def install_broker_service(
     launcher: str = plan["launcher"]
     service_path: Path = plan["service_path"]
     content: str = plan["content"]
+    enabled_link = service_path.parent / "default.target.wants" / service_path.name if enable and kind == "systemd" else None
+    old_enabled_target = None
+    if enabled_link is not None:
+        if enabled_link.parent.is_symlink() or (enabled_link.parent.exists() and not enabled_link.parent.is_dir()):
+            raise ValueError("Invalid systemd enablement directory")
+        if enabled_link.exists() and not enabled_link.is_symlink():
+            raise ValueError("Expected a systemd enablement symlink")
+        if enabled_link.is_symlink():
+            old_enabled_target = os.readlink(enabled_link)
 
     def _write_service_files() -> None:
         state.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -1578,6 +1765,78 @@ def install_broker_service(
         _write(service_path, content)
         if on_write is not None:
             on_write("broker_service")
+
+    def _rollback(
+        snapshots: list[tuple[Path, bool, bytes | None, int | None]],
+        *,
+        was_active: bool,
+        service_existed: bool,
+        reload_attempted: bool,
+        restart_attempted: bool,
+        start_attempted: bool,
+        bootout_succeeded: bool,
+        bootstrap_succeeded: bool,
+    ) -> None:
+        errors: list[BaseException] = []
+        for snapshot in snapshots:
+            try:
+                _restore_file_snapshot(snapshot)
+            except (OSError, ValueError) as error:
+                raise UpdateUncertain("Broker service files could not be restored") from error
+        if enabled_link is not None:
+            try:
+                if enabled_link.exists() and not enabled_link.is_symlink():
+                    raise ValueError("Systemd enablement link changed to a regular file")
+                if old_enabled_target is None:
+                    enabled_link.unlink(missing_ok=True)
+                elif not enabled_link.is_symlink() or os.readlink(enabled_link) != old_enabled_target:
+                    temporary = enabled_link.with_name(".restore-" + uuid.uuid4().hex)
+                    try:
+                        temporary.symlink_to(old_enabled_target)
+                        os.replace(temporary, enabled_link)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+            except (OSError, ValueError) as error:
+                raise UpdateUncertain("Systemd enablement could not be restored") from error
+        if kind == "systemd":
+            if reload_attempted or restart_attempted or start_attempted:
+                try:
+                    _run(["systemctl", "--user", "daemon-reload"], timeout=15)
+                except UpdateUncertain:
+                    raise
+                except (OSError, RuntimeError) as error:
+                    raise UpdateUncertain("Rollback service reload could not be confirmed") from error
+            try:
+                if was_active and restart_attempted and service_existed:
+                    _run(["systemctl", "--user", "restart", service_path.name], timeout=45)
+                elif not was_active and start_attempted:
+                    _run(["systemctl", "--user", "stop", service_path.name], timeout=15)
+            except UpdateUncertain:
+                raise
+            except (OSError, RuntimeError) as error:
+                errors.append(error)
+        else:
+            label = _launchd_label(name)
+            try:
+                if was_active and bootout_succeeded and service_existed:
+                    if bootstrap_succeeded:
+                        _run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=15)
+                    _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service_path)], timeout=15)
+                elif not was_active and bootstrap_succeeded:
+                    _run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=15)
+            except UpdateUncertain:
+                raise
+            except (OSError, RuntimeError) as error:
+                errors.append(error)
+        if errors:
+            raise UpdateUncertain("Broker service rollback could not be confirmed") from errors[0]
+        if reload_attempted or restart_attempted or start_attempted or bootout_succeeded or bootstrap_succeeded:
+            try:
+                restored = _probe_broker_service_state(kind, name, launcher)
+            except (OSError, RuntimeError) as error:
+                raise UpdateUncertain("Previous broker service state could not be confirmed") from error
+            if restored[0] != was_active:
+                raise UpdateUncertain("Previous broker service state was not restored")
 
     restarted = False
     verified_pid: int | None = None
@@ -1598,26 +1857,53 @@ def install_broker_service(
                             "Refusing to migrate running broker service while busy: "
                             + ", ".join(snapshot["reasons"])
                         )
-                _write_service_files()
-                if kind == "systemd":
-                    unit_name = service_path.name
-                    _run(["systemctl", "--user", "daemon-reload"], timeout=15)
-                    _run(["systemctl", "--user", "enable", unit_name], timeout=15)
-                    _run(["systemctl", "--user", "restart", unit_name], timeout=45)
-                else:
-                    label = name[:-6] if name.endswith(".plist") else name
-                    _run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=15)
-                    _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service_path)], timeout=15)
-                restarted = True
-                verified_pid, verified_version = _verify_migrated_broker(
-                    state,
-                    resolved_root,
-                    kind,
-                    name,
-                    launcher,
-                    previous_pid=old_pid,
-                    restarted=True,
-                )
+                snapshots = _snapshot_broker_files(resolved_root, service_path)
+                service_existed = snapshots[0][1]
+                reload_attempted = restart_attempted = False
+                bootout_succeeded = bootstrap_succeeded = False
+                try:
+                    _write_service_files()
+                    if kind == "systemd":
+                        unit_name = service_path.name
+                        reload_attempted = True
+                        _run(["systemctl", "--user", "daemon-reload"], timeout=15)
+                        _run(["systemctl", "--user", "enable", unit_name], timeout=15)
+                        restart_attempted = True
+                        _run(["systemctl", "--user", "restart", unit_name], timeout=45)
+                    else:
+                        label = _launchd_label(name)
+                        _run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=15)
+                        bootout_succeeded = True
+                        _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service_path)], timeout=15)
+                        bootstrap_succeeded = True
+                    restarted = True
+                    verified_pid, verified_version = _verify_migrated_broker(
+                        state,
+                        resolved_root,
+                        kind,
+                        name,
+                        launcher,
+                        previous_pid=old_pid,
+                        restarted=True,
+                    )
+                except BaseException as error:
+                    if type(error) not in {UpdateUncertain, KeyboardInterrupt, SystemExit}:
+                        try:
+                            _rollback(
+                                snapshots,
+                                was_active=was_active,
+                                service_existed=service_existed,
+                                reload_attempted=reload_attempted,
+                                restart_attempted=restart_attempted,
+                                start_attempted=False,
+                                bootout_succeeded=bootout_succeeded,
+                                bootstrap_succeeded=bootstrap_succeeded,
+                            )
+                        except UpdateUncertain:
+                            raise
+                        except RuntimeError as rollback_error:
+                            raise RuntimeError(f"{error}; {rollback_error}") from error
+                    raise
             finally:
                 if sys.exc_info()[0] not in {UpdateUncertain, KeyboardInterrupt, SystemExit}:
                     from .broker import request
@@ -1629,26 +1915,72 @@ def install_broker_service(
                     except (OSError, TimeoutError, BridgeError, RuntimeError) as error:
                         raise UpdateUncertain("Maintenance release could not be confirmed") from error
         else:
-            _write_service_files()
-            if kind == "systemd":
-                unit_name = service_path.name
-                _run(["systemctl", "--user", "daemon-reload"], timeout=15)
-                _run(["systemctl", "--user", "enable", unit_name], timeout=15)
-                if not was_active:
-                    _run(["systemctl", "--user", "start", unit_name], timeout=15)
-            elif not was_active:
-                _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service_path)], timeout=15)
-            verified_pid, verified_version = _verify_migrated_broker(
-                state,
-                resolved_root,
-                kind,
-                name,
-                launcher,
-                previous_pid=old_pid,
-                restarted=False,
-            )
+            snapshots = _snapshot_broker_files(resolved_root, service_path)
+            service_existed = snapshots[0][1]
+            reload_attempted = restart_attempted = start_attempted = False
+            bootstrap_succeeded = False
+            try:
+                _write_service_files()
+                if kind == "systemd":
+                    unit_name = service_path.name
+                    reload_attempted = True
+                    _run(["systemctl", "--user", "daemon-reload"], timeout=15)
+                    _run(["systemctl", "--user", "enable", unit_name], timeout=15)
+                    if not was_active:
+                        start_attempted = True
+                        _run(["systemctl", "--user", "start", unit_name], timeout=15)
+                elif not was_active:
+                    _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service_path)], timeout=15)
+                    bootstrap_succeeded = True
+                verified_pid, verified_version = _verify_migrated_broker(
+                    state,
+                    resolved_root,
+                    kind,
+                    name,
+                    launcher,
+                    previous_pid=old_pid,
+                    restarted=False,
+                )
+            except BaseException as error:
+                if type(error) not in {UpdateUncertain, KeyboardInterrupt, SystemExit}:
+                    try:
+                        _rollback(
+                            snapshots,
+                            was_active=was_active,
+                            service_existed=service_existed,
+                            reload_attempted=reload_attempted,
+                            restart_attempted=restart_attempted,
+                            start_attempted=start_attempted,
+                            bootout_succeeded=False,
+                            bootstrap_succeeded=bootstrap_succeeded,
+                        )
+                    except UpdateUncertain:
+                        raise
+                    except RuntimeError as rollback_error:
+                        raise RuntimeError(f"{error}; {rollback_error}") from error
+                raise
     else:
-        _write_service_files()
+        snapshots = _snapshot_broker_files(resolved_root, service_path)
+        try:
+            _write_service_files()
+        except BaseException as error:
+            if type(error) not in {UpdateUncertain, KeyboardInterrupt, SystemExit}:
+                try:
+                    _rollback(
+                        snapshots,
+                        was_active=False,
+                        service_existed=snapshots[0][1],
+                        reload_attempted=False,
+                        restart_attempted=False,
+                        start_attempted=False,
+                        bootout_succeeded=False,
+                        bootstrap_succeeded=False,
+                    )
+                except UpdateUncertain:
+                    raise
+                except RuntimeError as rollback_error:
+                    raise RuntimeError(f"{error}; {rollback_error}") from error
+            raise
 
     result: dict[str, object] = {
         "service_kind": kind,

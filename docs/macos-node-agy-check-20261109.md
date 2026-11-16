@@ -27,7 +27,7 @@ Note on macOS `ps`: `ps -axo pid=,ppid=,comm=,args=` truncated executable names 
 
 This confirms fresh native Antigravity sessions on macOS can invoke the local Bridge MCP server. Pre-existing open instances did not reload MCP config, and neither live group broadcasts nor bridge-dispatched AGY inference turns were tested here.
 
-Metadata report persisted on remote private state: `<private-validation-state>/report.json` (mode `0600`).
+Metadata report persisted on remote private state: `<private-report-02>/validation.json` (mode `0600`).
 
 ## Pre-OTA Migration Notes (Historical)
 

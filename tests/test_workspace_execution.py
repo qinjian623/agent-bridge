@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -496,6 +497,141 @@ class ServiceWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], PeerErrorCode.WORKSPACE_CONFLICT)
 
+    async def test_multichunk_manifest_acknowledges_incomplete_prefixes(self):
+        names = []
+        bulk = self.repo / "bulk"
+        bulk.mkdir()
+        for index in range(2200):
+            name = f"bulk/{index:04d}.txt"
+            (self.repo / name).write_text("")
+            names.append(name)
+        manifest = create_workspace_manifest(
+            "bridge", "ws-large-manifest", self.repo, "snapshot",
+            base_commit=self.base, selected_files=names,
+        )
+        data = encode(manifest).encode("utf-8")
+        chunks = chunk_bytes(data)
+        self.assertGreater(len(chunks), 1)
+        workspace_id, digest, _, _ = await self.prepare(manifest)
+        for index, (offset, chunk, chunk_sha256) in enumerate(chunks):
+            result = await self.action(
+                action="chunk", workspace_id=workspace_id, blob_sha256=digest,
+                offset=offset, size=len(chunk), chunk_sha256=chunk_sha256,
+                data=base64.b64encode(chunk).decode("ascii"),
+            )
+            if index < len(chunks) - 1:
+                self.assertNotIn("status", result)
+                self.assertEqual(self.store.get_workspace_transfer(workspace_id)["status"], "receiving")
+            else:
+                self.assertEqual(result.get("status"), "verified")
+        self.assertEqual(self.store.get_workspace_transfer(workspace_id)["status"], "verified")
+
+    async def test_rejected_tail_replacement_preserves_accepted_chunk_and_upload(self):
+        name = "tail-first.bin"
+        prefix = b"a" * MAX_WORKSPACE_CHUNK_BYTES
+        tail = b"0123456789"
+        content = prefix + tail
+        (self.repo / name).write_bytes(content)
+        manifest = create_workspace_manifest(
+            "bridge", "ws-tail-first", self.repo, "snapshot",
+            base_commit=self.base, selected_files=[*SELECTION, name],
+        )
+        workspace_id, digest, data, _ = await self.prepare(manifest)
+        await self.upload_blob(workspace_id, digest, data)
+        blob = sha256(content)
+        tail_payload = {
+            "action": "chunk", "workspace_id": workspace_id, "blob_sha256": blob,
+            "offset": len(prefix), "size": len(tail), "chunk_sha256": sha256(tail),
+            "data": base64.b64encode(tail).decode("ascii"),
+        }
+        await self.action(**tail_payload)
+        [accepted] = self.store.get_workspace_chunks(workspace_id, blob)
+        self.assertEqual(tail, Path(accepted["stored_path"]).read_bytes())
+        conflict_payload = {
+            **tail_payload, "chunk_sha256": sha256(b"different!"),
+            "data": base64.b64encode(b"different!").decode("ascii"),
+        }
+        response = await self.action_response(**conflict_payload)
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], PeerErrorCode.WORKSPACE_CONFLICT)
+        self.assertEqual([accepted], self.store.get_workspace_chunks(workspace_id, blob))
+        self.assertEqual(tail, Path(accepted["stored_path"]).read_bytes())
+
+        def send(payload):
+            try:
+                return "ok", self.service._workspace_chunk(self.store, payload)
+            except BridgeError as error:
+                return "error", error.code
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(send, (tail_payload, conflict_payload)))
+        self.assertEqual(1, sum(kind == "ok" for kind, _ in outcomes))
+        self.assertIn(("error", PeerErrorCode.WORKSPACE_CONFLICT), outcomes)
+        self.assertEqual([accepted], self.store.get_workspace_chunks(workspace_id, blob))
+        self.assertEqual(tail, Path(accepted["stored_path"]).read_bytes())
+
+        await self.action(
+            action="chunk", workspace_id=workspace_id, blob_sha256=blob,
+            offset=0, size=len(prefix), chunk_sha256=sha256(prefix),
+            data=base64.b64encode(prefix).decode("ascii"),
+        )
+        recorded = self.store.get_workspace_blob(blob)
+        self.assertIsNotNone(recorded)
+        self.assertEqual(content, Path(recorded["stored_path"]).read_bytes())
+        await self.upload_all_files(manifest)
+        sealed = await self.seal(workspace_id, digest)
+        self.assertEqual(content, (Path(sealed["ready_path"]) / name).read_bytes())
+
+    async def test_patch_seal_attaches_a_new_file_inside_a_new_directory(self):
+        directory = self.repo / "newdir"
+        directory.mkdir()
+        (directory / "file.py").write_text("new input\n")
+        manifest = create_workspace_manifest(
+            "bridge", "ws-new-directory", self.repo, "patch",
+            base_commit=self.base, selected_files=["newdir/file.py"],
+        )
+        workspace_id, digest, sealed = await self.prepare_and_seal(manifest)
+        ready = Path(sealed["ready_path"])
+        self.assertEqual("new input\n", (ready / "newdir" / "file.py").read_text())
+        response = await self.deliver(self.workspace_ref(workspace_id, digest, manifest), target_seq=1)
+        self.assertTrue(response["ok"], response)
+        session = self.store.get_session(response["result"]["session_id"])
+        self.assertEqual(session["cwd"], str(ready))
+
+    async def test_seal_rejects_new_files_through_symlink_or_file_parents(self):
+        (self.repo / "link").symlink_to("../outside", target_is_directory=True)
+        run_git(self.repo, "add", "-A")
+        run_git(self.repo, "commit", "-qm", "symlink base")
+        base = run_git(self.repo, "rev-parse", "HEAD").decode().strip()
+        for workspace_id, path in (
+            ("ws-symlink-parent", "link/file.py"),
+            ("ws-file-parent", "README.md/file.py"),
+        ):
+            with self.subTest(path=path):
+                data = b"must not be written\n"
+                entry = {
+                    "path": path, "op": "put", "size": len(data), "before_sha256": None,
+                    "sha256": sha256(data), "mode": 0o644,
+                }
+                manifest = normalize_manifest({
+                    "schema": 1, "workspace_id": workspace_id, "project_id": "bridge",
+                    "workspace_mode": "git", "source_base_commit": base,
+                    "delivery_mode": "patch", "selected_files": [path],
+                    "input_digest": compute_input_digest([entry]), "files": [entry],
+                    "patch": None, "total_bytes": len(data), "file_count": 1,
+                })
+                pending, digest, manifest_data, _ = await self.prepare(manifest)
+                await self.upload_blob(pending, digest, manifest_data)
+                await self.upload_blob(pending, entry["sha256"], data)
+                status = await self.inspect(kind="workspace", id=pending, section="status")
+                response = await self.action_response(
+                    action="seal", workspace_id=pending, manifest_sha256=digest,
+                    expected_revision=status["items"][0]["revision"],
+                )
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["error"]["code"], PeerErrorCode.WORKSPACE_CONFLICT)
+                self.assertEqual(self.store.get_workspace_transfer(pending)["status"], "failed")
+
     async def test_prepare_limits_are_enforced(self):
         params = {
             "action": "prepare", "workspace_id": "ws-limit", "project_id": "bridge",
@@ -784,6 +920,20 @@ class BrokerWorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
         replay = await self.broker.call("agent_open", self.args("patch-1"))
         self.assertEqual(replay, opened)
         self.assertEqual(len(self.client.deliver_params), 1)
+
+    async def test_remote_snapshot_dispatch_uploads_a_multi_chunk_file(self):
+        payload = b"a" * (MAX_WORKSPACE_CHUNK_BYTES + 1)
+        (self.source / "large.bin").write_bytes(payload)
+        opened = await self.broker.call(
+            "agent_open",
+            self.args("large-file", {"snapshot_files": [*SELECTION, "large.bin"]}),
+        )
+        self.assertEqual(opened["session_id"], "remote-session")
+        [deliver] = self.client.deliver_params
+        ref = deliver["open"]["workspace_ref"]
+        transfer = self.broker.store.get_workspace_transfer(ref["workspace_id"])
+        self.assertEqual(transfer["status"], "ready")
+        self.assertEqual(payload, (Path(transfer["ready_path"]) / "large.bin").read_bytes())
 
     async def test_remote_read_only_open_is_unchanged(self):
         opened = await self.broker.call(

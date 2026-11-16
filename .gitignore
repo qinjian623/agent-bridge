@@ -5,3 +5,12 @@ __pycache__/
 .state/
 *.sqlite*
 .env
+
+# Private runtime data and local build output
+*.db
+*.db-*
+.env.*
+!.env.example
+*.pem
+*.key
+dist/

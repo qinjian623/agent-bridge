@@ -111,14 +111,14 @@ Skill is valid
 
 此前两次未通过，分别保存失败报告，没有覆盖或当作成功：
 
-- `cold-example-run-report.json`：测试客户端的回调拒绝了 MCP 调用，但初始检查只读到了模型说 READY。改为检查原生 MCP 调用确实成功；给只读工具正确标记，并仅在独立测试会话中预先允许已授权测试工具。
-- `cold-example-run-report.json`：恢复后原生接口丢失临时 MCP 配置，连到了默认服务，找不到测试任务。新增私有 `resume_config_file` 引用，恢复相同的 MCP 配置，不覆盖父模型、沙箱或批准策略。
+- `cold-report-17-report.json`：测试客户端的回调拒绝了 MCP 调用，但初始检查只读到了模型说 READY。改为检查原生 MCP 调用确实成功；给只读工具正确标记，并仅在独立测试会话中预先允许已授权测试工具。
+- `cold-report-18-report.json`：恢复后原生接口丢失临时 MCP 配置，连到了默认服务，找不到测试任务。新增私有 `resume_config_file` 引用，恢复相同的 MCP 配置，不覆盖父模型、沙箱或批准策略。
 
 失败测试的父队列和活动轮次仅按本次测试的 ID 清理，并确认停止。bot 已扫描这三次测试涉及的七个 Codex/Claude 原生会话，均登记为外部子会话，outbox 记录全部为 0。Pi 后台会话不走该扫描。没有创建 Telegram 话题或发送测试消息。
 
 `scripts/restart_smoke.py` 使用非 Git 文件副本运行真实 Pi 任务。在脚本开始、尚未结束时重启独立 broker；确认 worker PID、启动身份、原生 session 保持一致，输入脚本只运行一次。顶层任务完成时，`sleep` 后台进程仍在该 worker 的 cgroup 中；关闭子会话后，确认后台 PID 已退出、整个 cgroup 没有运行进程。源目录没有产生测试输出。报告：`<private-validation-state>/report.json`。
 
-先前用 Codex 做该检查时，重启与单次执行断言通过，但把沙箱内 PID 3 当成宿主 PID，后台检查未通过，报告保留为 `restart-example-run-report.json`。没有据此声称后台已停止；改用 Pi 验证真实宿主进程，接口文档也说明 cgroup 清单使用宿主 PID。
+先前用 Codex 做该检查时，重启与单次执行断言通过，但把沙箱内 PID 3 当成宿主 PID，后台检查未通过，报告保留为 `restart-report-20-report.json`。没有据此声称后台已停止；改用 Pi 验证真实宿主进程，接口文档也说明 cgroup 清单使用宿主 PID。
 
 快照自动检查覆盖已暂存和未暂存修改、删除、二进制、未跟踪文件、符号链接拒绝、请求重试与补丁实际应用。大输出检查重组完整中文结果、核对文件权限和跨任务访问拒绝。服务档位检查覆盖 Codex 启动/恢复/执行和其他程序拒绝不支持字段；未测试付费档位的费用或速度收益。
 
@@ -137,7 +137,7 @@ Skill is valid
 | `claude-deepseek` + `deepseek-flash`（原配置为 `deepseek-v4-flash`） | 通过：目录发现、创建会话、完成一次请求、返回准确模型 ID、检查结果、关闭 worker |
 | `codex-sol` + `gpt-6-luna`（原配置为 `gpt-6.1-sol`） | 未通过调用检查：90 秒内没有输出，测试取消任务并关闭 worker；不能据目录可见声称推理成功 |
 
-两次测试最终均无存活 worker。报告分别为 `<private-validation-state>/report.json` 和 `discovery-example-run.json`，失败任务和取消结果保留在该目录的 SQLite 中。测试子会话由现有 `external_children` 过滤，不登记父会话，也没有执行真实 Telegram 消息测试。没有逐一调用目录内全部模型，未验证 Anthropic 官方账户的真实调用。
+两次测试最终均无存活 worker。报告分别为 `<private-validation-state>/report.json` 和 `discovery-report-22.json`，失败任务和取消结果保留在该目录的 SQLite 中。测试子会话由现有 `external_children` 过滤，不登记父会话，也没有执行真实 Telegram 消息测试。没有逐一调用目录内全部模型，未验证 Anthropic 官方账户的真实调用。
 
 可用 `scripts/discovery_smoke.py --state 独立状态目录 --profile 配置名 --model 目录中的新模型ID` 重做指定模型的检查；该脚本会产生一次真实推理请求。它要求模型与配置中的默认模型不同，结果只用于检查接口，不用于费用与速度排名。
 
@@ -188,7 +188,7 @@ Codex CLI、Claude Code、Pi 的独立评审中，确认并修复了以下 13 �
 
 ## 2026-11-02 分组与指定组广播
 
-新增 `agent_groups`、`agent_group`、`agent_broadcast`，保留原有九个接口及父会话通知。成员使用现有 bridge 会话 ID；广播需要明确的 group_id 和组 revision，各接收方进入原任务队列。使用方法见 [README](README.md#分组与广播)。
+新增 `agent_groups`、`agent_group`、`agent_broadcast`，保留原有九个接口及父会话通知。成员使用现有 bridge 会话 ID；广播需要明确的 group_id 和组 revision，各接收方进入原任务队列。使用方法见 [README](getting-started.md#分组与广播)。
 
 新增 14 项检查，涵盖分组增删、成员增删及重复成员、组外不接收、多个组共享成员、并发重复请求、改变请求内容被拒绝、组成员改变后的原请求重试、服务重启后取回原任务 ID、空组及未知组、暂停与关闭状态、预算限制、写入失败时全部撤销，以及旧数据库升级后保留任务和父通知。
 

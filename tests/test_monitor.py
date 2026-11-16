@@ -361,6 +361,7 @@ class MonitorTests(unittest.TestCase):
         class FakeServer:
             def __init__(self, address: tuple[str, int], handler: Any) -> None:
                 self.address = address
+                self.server_address = address
                 self.handler = handler
                 FakeServer.instance = self
 
@@ -370,7 +371,7 @@ class MonitorTests(unittest.TestCase):
             def server_close(self) -> None:
                 pass
 
-        with patch("agent_bridge.web_monitor.ThreadingHTTPServer", FakeServer):
+        with patch("agent_bridge.web_monitor.BoundedThreadingHTTPServer", FakeServer):
             run_web_monitor(
                 self.state,
                 host="0.0.0.0",
@@ -798,12 +799,127 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(result, expected)
         request.assert_awaited_once_with(self.state, "agent_monitor", {"limit": 3, "include_events": False})
 
+    def test_broker_snapshot_validation_rejects_malformed_group_ids(self) -> None:
+        collector = MonitorCollector(self.state)
+        base = collector.collect(limit=1, include_events=False, include_native=False)
+        validate = collector._is_valid_broker_snapshot_reply
+        self.assertTrue(validate({**base, "groups": [{"id": "team"}]}))
+        self.assertTrue(validate({**base, "groups": [{"group_id": "legacy-team"}]}))
+        self.assertFalse(validate({**base, "groups": [{"id": 7}]}))
+        self.assertFalse(validate({**base, "groups": [{"id": "team", "group_id": 7}]}))
+        self.assertFalse(validate({**base, "groups": [{}]}))
+
+    def test_broker_snapshot_validates_optional_cost_coverage_fields(self) -> None:
+        collector = MonitorCollector(self.state)
+        base = collector.collect(limit=1, include_events=False, include_native=False)
+        validate = collector._is_valid_broker_snapshot_reply
+        metrics = dict(base["metrics"])
+        for key in ("has_attempts", "known_cost_sessions", "known_cost_attempt_sessions", "unknown_cost_sessions"):
+            metrics.pop(key, None)
+        self.assertTrue(validate({**base, "metrics": metrics}))
+        for value in (True, False):
+            self.assertTrue(validate({**base, "metrics": {**metrics, "has_attempts": value}}))
+        for value in (None, [], {}, 0, "true"):
+            with self.subTest(field="has_attempts", value=value):
+                self.assertFalse(validate({**base, "metrics": {**metrics, "has_attempts": value}}))
+        for key in ("known_cost_sessions", "known_cost_attempt_sessions", "unknown_cost_sessions"):
+            for value in (0, 2):
+                self.assertTrue(validate({**base, "metrics": {**metrics, key: value}}))
+            for value in (None, -1, True, False, 0.0, "1", []):
+                with self.subTest(field=key, value=value):
+                    self.assertFalse(validate({**base, "metrics": {**metrics, key: value}}))
+            for value in (0, 2, None, -1, True, False, 0.0, "1", []):
+                with self.subTest(runtime_field=key, value=value):
+                    candidate = {**base, "runtimes": {"codex": {key: value}}}
+                    self.assertEqual(type(value) is int and value >= 0, validate(candidate))
+        for key in ("has_attempts", "has_cost_gaps"):
+            self.assertTrue(validate({**base, "runtimes": {"codex": {key: False}}}))
+            self.assertFalse(validate({**base, "runtimes": {"codex": {key: None}}}))
+
+    def test_legacy_broker_page_keeps_hidden_costs_unknown(self) -> None:
+        collector = MonitorCollector(self.state)
+        reply = {
+            "coordinator": {}, "hosts": [], "events": [], "native_sessions": [], "runtimes": {},
+            "metrics": {"total_sessions": 2, "total_cost_usd": 0.0, "cost_complete": False},
+            "sessions": [{"id": "idle", "has_attempts": False, "cost_usd": 0.0, "cost_complete": True}],
+        }
+        for complete in (None, False, True):
+            candidate = {**reply, "metrics": dict(reply["metrics"])}
+            if complete is None:
+                candidate["metrics"].pop("cost_complete")
+            else:
+                candidate["metrics"]["cost_complete"] = complete
+            for session_limit in (None, 1):
+                with self.subTest(session_limit=session_limit, complete=complete):
+                    result = collector._finalize_broker_reply(
+                        candidate, limit=1, include_native=False, rt_filter=None,
+                        src_filter=None, st_filter=None, session_limit=session_limit, after_seq=None,
+                    )
+                    if complete is True:
+                        self.assertEqual(0.0, result["metrics"]["total_cost_usd"])
+                        self.assertTrue(result["metrics"]["cost_complete"])
+                        self.assertIn("Cost: \x1b[33m$0.0000", render_tui(result))
+                    else:
+                        self.assertIsNone(result["metrics"]["total_cost_usd"])
+                        self.assertTrue(result["metrics"]["has_cost_gaps"])
+                        self.assertIn("Cost: \x1b[33munknown", render_tui(result))
+                    self.assertNotIn("has_attempts", result["metrics"])
+                    self.assertNotIn("unknown_cost_sessions", result["metrics"])
+        self.assertEqual(0.0, reply["metrics"]["total_cost_usd"])
+
     def test_standalone_collector_keeps_local_view_if_broker_is_unavailable(self) -> None:
         (self.state / "broker.sock").touch()
         with patch("agent_bridge.broker.request", new_callable=AsyncMock, side_effect=ConnectionRefusedError):
             snapshot = MonitorCollector(self.state).collect()
         self.assertIn("hosts", snapshot)
         self.assertIn("sessions", snapshot)
+        provenance = snapshot["provenance"]
+        self.assertEqual("local_db_fallback", provenance["snapshot_source"])
+        self.assertIs(provenance["broker_connected"], False)
+        self.assertEqual("fallback", provenance["broker_state"])
+        self.assertIn("rpc_failed", provenance["detail"])
+        self.assertEqual("local_db_fallback", snapshot["coordinator"]["snapshot_source"])
+        self.assertEqual("fallback", snapshot["coordinator"]["connection_state"])
+
+    def test_offline_local_collection_reports_unavailable_broker_provenance(self) -> None:
+        snapshot = MonitorCollector(self.state).collect(include_native=False)
+        provenance = snapshot["provenance"]
+        self.assertEqual("local_db_fallback", provenance["snapshot_source"])
+        self.assertIs(provenance["broker_connected"], False)
+        self.assertEqual("fallback", provenance["connection_state"])
+        self.assertIn("No broker socket", provenance["detail"])
+
+    def test_standalone_collector_marks_valid_rpc_snapshot_as_broker_rpc(self) -> None:
+        (self.state / "broker.sock").touch()
+        local_snapshot = MonitorCollector(
+            self.state, host_registry=ConfigHostRegistry({})
+        ).collect(include_native=False)
+        with patch("agent_bridge.broker.request", new_callable=AsyncMock, return_value=local_snapshot):
+            snapshot = MonitorCollector(self.state).collect(include_native=False)
+        provenance = snapshot["provenance"]
+        self.assertEqual("broker_rpc", provenance["snapshot_source"])
+        self.assertIs(provenance["broker_connected"], True)
+        self.assertEqual("unix_socket", provenance["transport"])
+        self.assertEqual("broker_rpc", snapshot["coordinator"]["snapshot_source"])
+        self.assertEqual("connected", snapshot["coordinator"]["connection_state"])
+
+    def test_legacy_rpc_reply_without_metadata_is_marked_legacy(self) -> None:
+        (self.state / "broker.sock").touch()
+        legacy = MonitorCollector(
+            self.state, host_registry=ConfigHostRegistry({})
+        ).collect(include_native=False)
+        legacy.pop("collector_version", None)
+        legacy.pop("provenance", None)
+        legacy["coordinator"].pop("snapshot_source", None)
+        legacy["coordinator"].pop("broker_connected", None)
+        legacy["coordinator"].pop("connection_state", None)
+        with patch("agent_bridge.broker.request", new_callable=AsyncMock, return_value=legacy):
+            snapshot = MonitorCollector(self.state).collect(include_native=False)
+        provenance = snapshot["provenance"]
+        self.assertEqual("broker_rpc", provenance["snapshot_source"])
+        self.assertIs(provenance["broker_connected"], True)
+        self.assertIs(provenance["legacy"], True)
+        self.assertIn("Legacy broker reply", provenance["detail"])
 
     def test_host_ping_endpoint_forwards_to_broker(self) -> None:
         broker = FakeBroker(self.state, {"result": {"entries": [], "stale": False}})

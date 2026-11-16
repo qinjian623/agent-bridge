@@ -22,6 +22,6 @@ token 包含该案例中的主会话和所有子任务 attempt；主会话生成
 
 测试脚本为 `scripts/benchmark.py`。验证任务使用 `learn_from_result=false`，没有影响本次选择规则；改变任务执行顺序以减少固定先后顺序的影响。每次采用新原生会话，但供应商缓存没有清空或受控；原始报告保存缓存 token。只跑了两个小型代码任务，各一次，不能推断一般任务的收益。token 不是金额，没有实际账单或全部可比价格，因此不报告费用节省比例。
 
-私有完整报告：`<private-validation-state>/report.json`。其中保存原始回答、patch、测试错误、原生用量和会话 ID，不纳入仓库。三个校准案例加六个验证案例合计 16 个主会话轮次和 7 个子任务 attempt，均正常结束。
+私有完整报告：`<private-report-01>/validation.json`。其中保存原始回答、patch、测试错误、原生用量和会话 ID，不纳入仓库。三个校准案例加六个验证案例合计 16 个主会话轮次和 7 个子任务 attempt，均正常结束。
 
 9 个父记录均为 `notify=false`，完成通知表为空。Codex 和 Claude 的全部 12 条原生会话均登记为外部子会话，等待旧 bot 扫描完毕后检查，outbox 记录均为 0。Pi 使用本项目私有 RPC 会话文件。测试 worker 和临时任务服务已退出。

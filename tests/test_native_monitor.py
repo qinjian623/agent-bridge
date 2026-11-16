@@ -537,6 +537,129 @@ class NativeAndApiMonitorTests(unittest.TestCase):
         agy_active = unified_sessions({"sessions": bridge, "native_sessions": native}, runtime="agy", status="active")
         self.assertEqual(["n1"], [r["id"] for r in agy_active])
 
+    def test_paginated_cost_aggregates_use_full_snapshot_state(self) -> None:
+        base = {
+            "timestamp": 1700000000.0,
+            "coordinator": {},
+            "metrics": {"total_sessions": 2, "total_cost_usd": 0.0, "cost_complete": False},
+            "runtimes": {},
+            "hosts": [],
+            "sessions": [
+                {"id": "zero", "has_attempts": False, "cost_usd": 0.0, "cost_complete": True},
+                {"id": "unknown", "has_attempts": True, "cost_usd": None, "cost_complete": False},
+            ],
+            "native_sessions": [],
+            "pending_questions": [],
+            "broadcasts": [],
+            "groups": [],
+            "events": [],
+        }
+        full = filter_snapshot_dict(base)
+        page = filter_snapshot_dict(base, session_limit=1)
+        self.assertEqual(["zero"], [s["id"] for s in page["sessions"]])
+        self.assertTrue(full["metrics"]["has_attempts"])
+        self.assertEqual(1, full["metrics"]["unknown_cost_sessions"])
+        self.assertEqual(1, page["metrics"]["unknown_cost_sessions"])
+        self.assertIn("Cost: \x1b[33munknown", render_tui(full))
+        self.assertIn("Cost: \x1b[33munknown", render_tui(page))
+
+        partial = {
+            **base,
+            "metrics": {"total_sessions": 1, "total_cost_usd": 0.25, "cost_complete": False},
+            "sessions": [{"id": "partial", "has_attempts": True, "cost_usd": 0.25, "cost_complete": False}],
+        }
+        self.assertIn("$0.2500*", render_tui(filter_snapshot_dict(partial, session_limit=1)))
+
+        zero = {
+            **base,
+            "metrics": {"total_sessions": 1, "total_cost_usd": 0.0, "cost_complete": True},
+            "sessions": [{"id": "zero", "has_attempts": False, "cost_usd": 0.0, "cost_complete": True}],
+        }
+        zero_tui = render_tui(filter_snapshot_dict(zero, session_limit=1))
+        self.assertIn("$0.0000", zero_tui)
+        self.assertNotIn("$0.0000*", zero_tui)
+
+        no_attempts = {
+            **base,
+            "metrics": {"total_sessions": 1, "total_cost_usd": 0.0, "cost_complete": False},
+            "sessions": [{"id": "idle", "has_attempts": False, "cost_usd": None, "cost_complete": False}],
+        }
+        no_attempts_tui = render_tui(filter_snapshot_dict(no_attempts, session_limit=1))
+        self.assertIn("$0.0000*", no_attempts_tui)
+        self.assertNotIn("Cost: \x1b[33munknown", no_attempts_tui)
+
+    def test_cost_backfill_keeps_legacy_pagination_unknown(self) -> None:
+        snapshot = {
+            "metrics": {"total_sessions": 2, "total_cost_usd": 0.0, "cost_complete": False},
+            "sessions": [{"id": "idle", "has_attempts": False, "cost_usd": 0.0}],
+        }
+        filtered = filter_snapshot_dict(snapshot)
+        self.assertIsNone(filtered["metrics"]["total_cost_usd"])
+        for key in ("has_attempts", "known_cost_attempt_sessions", "unknown_cost_sessions"):
+            self.assertNotIn(key, filtered["metrics"])
+
+        for cost, complete in ((0.25, False), (0.0, True)):
+            with self.subTest(cost=cost, complete=complete):
+                metrics = {**snapshot["metrics"], "total_cost_usd": cost, "cost_complete": complete}
+                self.assertEqual(cost, filter_snapshot_dict({**snapshot, "metrics": metrics})["metrics"]["total_cost_usd"])
+
+        metrics = {
+            **snapshot["metrics"], "has_attempts": True, "has_cost_gaps": True,
+            "known_cost_attempt_sessions": 1, "unknown_cost_sessions": 1,
+        }
+        self.assertEqual(metrics, filter_snapshot_dict({**snapshot, "metrics": metrics})["metrics"])
+
+    def test_runtime_cost_coverage_counts_only_attempts(self) -> None:
+        idle = {"id": "idle", "runtime": "codex", "has_attempts": False, "cost_usd": 0.0}
+        unknown = {"id": "unknown", "runtime": "codex", "has_attempts": True, "cost_usd": None}
+        for cost in (None, 0.0, 0.25):
+            sessions = [idle, unknown]
+            if cost is not None:
+                sessions.append({"id": "known", "runtime": "codex", "has_attempts": True, "cost_usd": cost})
+            with self.subTest(cost=cost):
+                info = summarize_runtimes(sessions, [])["codex"]
+                self.assertEqual(1 + (cost is not None), info["known_cost_sessions"])
+                self.assertEqual(int(cost is not None), info["known_cost_attempt_sessions"])
+                self.assertEqual(1, info["unknown_cost_sessions"])
+                self.assertTrue(info["has_attempts"])
+                self.assertTrue(info["has_cost_gaps"])
+                self.assertFalse(info["cost_complete"])
+                self.assertEqual(cost or 0.0, info["total_cost_usd"])
+
+    def test_native_pagination_prioritizes_interactive_over_daemon(self) -> None:
+        daemon = {
+            "id": "native:codex:2",
+            "source": "native",
+            "runtime": "codex",
+            "kind": "daemon",
+            "mode": "daemon",
+            "status": "running",
+            "observed": "running",
+            "pid": 2,
+            "alive": True,
+        }
+        interactive = {
+            "id": "native:codex:1",
+            "source": "native",
+            "runtime": "codex",
+            "kind": "interactive",
+            "mode": "interactive",
+            "status": "active",
+            "observed": "active",
+            "pid": 1,
+            "alive": True,
+        }
+        snapshot = {"sessions": [], "native_sessions": [daemon, interactive], "events": [], "metrics": {}}
+        self.assertEqual([interactive["id"]], [r["id"] for r in unified_sessions(snapshot, limit=1)])
+        page = filter_snapshot_dict(snapshot, session_limit=1)
+        self.assertEqual([interactive["id"]], [r["id"] for r in page["native_sessions"]])
+        all_rows = unified_sessions(snapshot)
+        self.assertEqual([interactive["id"], daemon["id"]], [r["id"] for r in all_rows])
+        self.assertEqual("running", all_rows[1]["status"])
+        full_native = filter_snapshot_dict(snapshot, session_limit=10)["native_sessions"]
+        self.assertEqual([interactive["id"], daemon["id"]], [r["id"] for r in full_native])
+        self.assertEqual("running", full_native[1]["status"])
+
     def test_security_redaction_tui_sanitization_and_process_edge_cases(self) -> None:
         # 1. No raw "command" leaked by collect_native_sessions
         items = collect_native_sessions(proc_root=self.proc_root, home=self.home, exclude_pids={3000})
@@ -1206,8 +1329,8 @@ class NativeAndApiMonitorTests(unittest.TestCase):
                 prev_base = w
             return cols
 
-        real_sid = "00000000-0000-7000-8000-000000000005"
-        real_qid = "00000000-0000-7000-8000-000000000013"
+        real_sid = "00000000-0000-7000-8000-000000000003"
+        real_qid = "00000000-0000-7000-8000-000000000004"
         tui_snap = {
             "timestamp": 1700000000.0,
             "coordinator": {"host_id": "主控节点非常长名字", "node_id": "abcdef1234567890", "db_size": 10240},

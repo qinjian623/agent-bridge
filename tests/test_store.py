@@ -113,6 +113,31 @@ class StoreTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, "no longer pending"):
             self.store.respond(sid, question, {"decision": "allow"}, 3, "answer")
 
+    def test_question_enqueues_one_parent_notice_tied_to_its_event(self):
+        self.store.parent_control(
+            "parent", "parent_register", 0, "register-parent", "native-parent", str(self.path),
+        )
+        sid = self.store.open(
+            self.profile, str(self.path), "read-only", "open-parent", parent="parent",
+        )["session_id"]
+        self.store.worker_ready(sid, "generation", 123, "start", "native-" + sid)
+        task_id, attempt_id = self.run_task(sid)
+        question_id = self.store.question(
+            sid, task_id, attempt_id, {"method": "permission"}, expires=0,
+        )
+        event = next(
+            event for event in self.store.events(task_id=task_id)
+            if event["kind"] == "input_required"
+        )
+        self.assertEqual(question_id, event["data"]["question_id"])
+        with self.store.connection() as db:
+            deliveries = [dict(row) for row in db.execute(
+                "SELECT * FROM deliveries WHERE event_seq=?", (event["seq"],)
+            )]
+        self.assertEqual(1, len(deliveries))
+        self.assertEqual("parent", deliveries[0]["parent_id"])
+        self.assertEqual("expired", self.store.get_question(question_id)["status"])
+
     def test_unknown_usage_keeps_reservation(self):
         self.config.token_budget = 100
         sid = self.session("open")

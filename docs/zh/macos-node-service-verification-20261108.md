@@ -32,4 +32,4 @@
 
 未执行远端模型推理、训练或真实会话广播。远端模型配置仍标记为未验证。本次 launchd 检查发生在用户已登录的情况下，未验证登出或整机重启后的恢复。
 
-详细检查结果保存在本机私有目录 `<private-validation-state>/report`，远端服务检查保存在 `<private-validation-state>/report`；不在仓库保存数据库、令牌或原始会话内容。
+详细检查结果保存在本机私有目录 `<private-report-03>/`，远端服务检查保存在 `<private-report-09>/`；不在仓库保存数据库、令牌或原始会话内容。

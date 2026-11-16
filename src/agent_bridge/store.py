@@ -1721,7 +1721,10 @@ class Store:
             )
             db.execute("UPDATE tasks SET status='waiting_input' WHERE id=?", (task_id,))
             db.execute("UPDATE sessions SET observed='waiting_input',revision=revision+1 WHERE id=?", (session_id,))
-            self.event(db, "input_required", {"question_id": key, "expires": expires, **data}, session_id, task_id, attempt_id)
+            seq = self.event(
+                db, "input_required", {**data, "question_id": key, "expires": expires}, session_id, task_id, attempt_id
+            )
+            self.notify_parent(db, session, seq)
             return key
 
     def get_question(self, question_id):
@@ -2121,11 +2124,14 @@ class Store:
         result=None,
         error=None,
         request_id=None,
+        *,
+        db=None,
     ):
         """Persist one idempotency record for `(node_id, state_generation, operation_id)` (ADR-04).
 
         Re-recording the same operation with an identical fingerprint returns the existing row, which lets a
-        crash/retry path inspect the stored outcome instead of running the work twice.
+        crash/retry path inspect the stored outcome instead of running the work twice. Pass `db` to join a
+        caller's transaction when the operation result must commit together with its external effect.
         """
         if not isinstance(operation_id, str) or not operation_id:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "operation_id must be a non-empty string")
@@ -2134,8 +2140,9 @@ class Store:
         encoded_result = encode(result) if result is not None else None
         encoded_error = None if error is None else (error if isinstance(error, str) else encode(error))
         stored_request_id = request_id if isinstance(request_id, str) and request_id else None
-        with self.connection(write=True) as db:
-            existing = db.execute(
+
+        def record(connection):
+            existing = connection.execute(
                 "SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)
             ).fetchone()
             if existing is not None:
@@ -2145,15 +2152,15 @@ class Store:
                         "operation_id was already used for different parameters",
                     )
                 if stored_request_id is not None and not existing["request_id"]:
-                    db.execute(
+                    connection.execute(
                         "UPDATE peer_operations SET request_id=? WHERE operation_id=?",
                         (stored_request_id, operation_id),
                     )
-                    existing = db.execute(
+                    existing = connection.execute(
                         "SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)
                     ).fetchone()
                 return self._peer_operation(existing)
-            db.execute(
+            connection.execute(
                 "INSERT INTO peer_operations(operation_id,node_id,state_generation,fingerprint,method,params,status,result,error,created,updated,request_id) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
@@ -2171,8 +2178,13 @@ class Store:
                     stored_request_id,
                 ),
             )
-            row = db.execute("SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            row = connection.execute("SELECT * FROM peer_operations WHERE operation_id=?", (operation_id,)).fetchone()
             return self._peer_operation(row)
+
+        if db is not None:
+            return record(db)
+        with self.connection(write=True) as connection:
+            return record(connection)
 
     def get_operation(self, operation_id, node_id=None, state_generation=None, fingerprint=None):
         """Return one operation record, optionally constrained to the ADR-04 identity namespace.
@@ -3074,6 +3086,12 @@ class Store:
                 if (existing["size"], existing["chunk_sha256"]) != (size, chunk_sha256):
                     raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "chunk differs from the stored bytes")
                 return
+            if connection.execute(
+                "SELECT 1 FROM workspace_chunks WHERE workspace_id=? AND blob_sha256=? "
+                "AND offset<? AND offset+size>? LIMIT 1",
+                (workspace_id, blob_sha256, offset + size, offset),
+            ).fetchone() is not None:
+                raise BridgeError(PeerErrorCode.WORKSPACE_CONFLICT, "chunk overlaps a stored chunk")
             connection.execute(
                 "INSERT INTO workspace_chunks(workspace_id,blob_sha256,offset,size,chunk_sha256,stored_path) "
                 "VALUES(?,?,?,?,?,?)",

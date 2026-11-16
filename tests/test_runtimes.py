@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import json
 import os
 import signal
 import sys
@@ -11,7 +12,71 @@ from unittest.mock import patch
 
 from agent_bridge.config import Profile
 from agent_bridge.errors import BridgeError
-from agent_bridge.runtimes import ClaudeRuntime, CodexRuntime, JsonProcess, PiRuntime, usage_difference
+from agent_bridge.runtimes import (
+    ClaudeRuntime,
+    CodexRuntime,
+    JsonProcess,
+    PiRuntime,
+    claude_environment,
+    usage_difference,
+)
+
+
+class OllamaEnvironmentTests(unittest.TestCase):
+    def profile(self, **changes):
+        return Profile("ollama", "claude", "model", provider="ollama-anthropic", **changes)
+
+    def test_proxy_settings_are_inherited_or_left_unset(self):
+        with patch.dict(os.environ, {"OLLAMA_API_KEY": "key"}, clear=True):
+            environment = claude_environment(self.profile())
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            self.assertNotIn(name, environment)
+        self.assertEqual("key", environment["OLLAMA_API_KEY"])
+        self.assertEqual("key", environment["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual("", environment["ANTHROPIC_API_KEY"])
+        self.assertEqual("https://ollama.com", environment["ANTHROPIC_BASE_URL"])
+
+    def test_empty_and_env_file_proxy_settings_are_not_replaced(self):
+        with patch.dict(
+            os.environ,
+            {"OLLAMA_API_KEY": "key", "HTTPS_PROXY": "", "HTTP_PROXY": "", "https_proxy": "http://lower:9999"},
+            clear=True,
+        ):
+            environment = claude_environment(self.profile())
+        self.assertEqual("", environment["HTTPS_PROXY"])
+        self.assertEqual("", environment["HTTP_PROXY"])
+        self.assertEqual("http://lower:9999", environment["https_proxy"])
+        self.assertNotIn("http_proxy", environment)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "environment.json"
+            path.write_text(json.dumps({"HTTPS_PROXY": "", "HTTP_PROXY": "http://from-file:8080"}))
+            path.chmod(0o600)
+            with patch.dict(
+                os.environ,
+                {"OLLAMA_API_KEY": "key", "HTTPS_PROXY": "http://inherited:8080", "HTTP_PROXY": ""},
+                clear=True,
+            ):
+                environment = claude_environment(self.profile(env_file=str(path)))
+        self.assertEqual("", environment["HTTPS_PROXY"])
+        self.assertEqual("http://from-file:8080", environment["HTTP_PROXY"])
+
+    def test_endpoint_restriction_and_credential_isolation_remain_intact(self):
+        with patch.dict(
+            os.environ,
+            {"OLLAMA_API_KEY": "key", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            clear=True,
+        ), self.assertRaisesRegex(BridgeError, "HTTPS ollama.com"):
+            claude_environment(self.profile())
+
+        with patch.dict(
+            os.environ,
+            {"OLLAMA_API_KEY": "key", "ANTHROPIC_AUTH_TOKEN": "official", "ANTHROPIC_API_KEY": "official"},
+            clear=True,
+        ):
+            environment = claude_environment(self.profile())
+        self.assertEqual("key", environment["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual("", environment["ANTHROPIC_API_KEY"])
 
 
 class Protocol:
@@ -248,6 +313,115 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         status, result, _ = await running
         self.assertEqual("failed", status)
         self.assertEqual("result", result["answer"])
+
+    async def test_codex_tool_starts_and_completions_only_use_the_current_thread_and_turn(self):
+        runtime = CodexRuntime(
+            Profile("test", "codex", "fixed", executable=sys.executable),
+            {"cwd": "/tmp", "access": "read-only", "native_id": "native"},
+            Path("/tmp"),
+            self.no_op,
+        )
+        original_filter = runtime.client.event_filter
+        self.assertTrue(original_filter({"method": "item/started"}))
+        runtime.client = Protocol({"turn/start": {"turn": {"id": "current"}}})
+        events = []
+
+        async def record(kind, data):
+            events.append((kind, data))
+
+        running = asyncio.create_task(runtime.run("test", self.no_op, record))
+        await asyncio.sleep(0)
+        command = {"id": "command", "type": "commandExecution", "command": "pwd", "status": "inProgress"}
+        change = {"id": "change", "type": "fileChange", "status": "inProgress", "changes": []}
+        for event in (
+            {"method": "item/started", "params": {"threadId": "other", "turnId": "current", "item": command}},
+            {"method": "item/started", "params": {"threadId": "native", "turnId": "old", "item": change}},
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "native",
+                    "turnId": "current",
+                    "item": {"id": "other", "type": "reasoning", "text": "ignored"},
+                },
+            },
+            {"method": "item/started", "params": {"threadId": "native", "turnId": "current", "item": command}},
+            {"method": "item/started", "params": {"threadId": "native", "turnId": "current", "item": change}},
+        ):
+            await runtime.client.events.put(event)
+        completed = {**command, "status": "completed", "exitCode": 0, "aggregatedOutput": "ok"}
+        await runtime.client.events.put(
+            {"method": "item/completed", "params": {"threadId": "native", "turnId": "current", "item": completed}}
+        )
+        await runtime.client.events.put(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "native",
+                    "turnId": "current",
+                    "item": {"id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "done"},
+                },
+            }
+        )
+        await runtime.client.events.put(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "native", "turn": {"id": "current", "status": "completed"}},
+            }
+        )
+        status, result, _ = await asyncio.wait_for(running, 1)
+        self.assertEqual("completed", status)
+        self.assertEqual("done", result["answer"])
+        self.assertEqual(
+            ["tool_started", "tool_started", "tool_completed"],
+            [kind for kind, _ in events if kind.startswith("tool_")],
+        )
+        self.assertEqual(["command", "change"], [data["id"] for kind, data in events if kind == "tool_started"])
+        completed_event = [data for kind, data in events if kind == "tool_completed"][-1]
+        self.assertEqual("command", completed_event["id"])
+        self.assertEqual("ok", completed_event["aggregatedOutput"])
+
+    async def test_codex_interruption_closes_only_open_started_tools(self):
+        runtime = CodexRuntime(
+            Profile("test", "codex", "fixed", executable=sys.executable),
+            {"cwd": "/tmp", "access": "read-only", "native_id": "native"},
+            Path("/tmp"),
+            self.no_op,
+        )
+        runtime.client = Protocol({"turn/start": {"turn": {"id": "current"}}})
+        events = []
+
+        async def record(kind, data):
+            events.append((kind, data))
+
+        running = asyncio.create_task(runtime.run("test", self.no_op, record))
+        await asyncio.sleep(0)
+        command = {"id": "command", "type": "commandExecution", "command": "pwd", "status": "inProgress"}
+        change = {"id": "change", "type": "fileChange", "status": "inProgress", "changes": []}
+        for item in (command, change):
+            await runtime.client.events.put(
+                {"method": "item/started", "params": {"threadId": "native", "turnId": "current", "item": item}}
+            )
+        await runtime.client.events.put(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "native",
+                    "turnId": "current",
+                    "item": {**command, "status": "completed"},
+                },
+            }
+        )
+        await runtime.client.events.put(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "native", "turn": {"id": "current", "status": "interrupted"}},
+            }
+        )
+        status, _, _ = await asyncio.wait_for(running, 1)
+        self.assertEqual("interrupted", status)
+        completed = [data for kind, data in events if kind == "tool_completed"]
+        self.assertEqual(["command", "change"], [data["id"] for data in completed])
+        self.assertEqual(["completed", "interrupted"], [data["status"] for data in completed])
 
     async def test_pi_prompt_ack_and_message_end_are_not_completion(self):
         with tempfile.TemporaryDirectory() as path:

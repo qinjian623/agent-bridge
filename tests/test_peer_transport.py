@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shlex
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -227,10 +228,7 @@ class SshPeerTransportTests(unittest.IsolatedAsyncioTestCase):
                 "-o",
                 "BatchMode=yes",
                 "gpu-a.internal",
-                "/usr/local/bin/agent-bridge",
-                "relay",
-                "--state",
-                "/srv/agent-bridge",
+                "/usr/local/bin/agent-bridge relay --state /srv/agent-bridge",
             ),
         )
         self.assertNotIn("shell", spawn.await_args.kwargs)
@@ -243,7 +241,7 @@ class SshPeerTransportTests(unittest.IsolatedAsyncioTestCase):
         transport = SshPeerTransport("gpu-b", "user@gpu-b", "/opt/agent-bridge")
 
         self.assertEqual(transport.host_id, "gpu-b")
-        self.assertEqual(transport.argv, ("ssh", "user@gpu-b", "/opt/agent-bridge", "relay"))
+        self.assertEqual(transport.argv, ("ssh", "user@gpu-b", "/opt/agent-bridge relay"))
 
         keyword = SshPeerTransport(
             host_id="gpu-c",
@@ -254,8 +252,53 @@ class SshPeerTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             keyword.argv,
-            ("ssh", "-p", "2222", "user@gpu-c", "/opt/agent-bridge", "relay", "--state", "/srv/state"),
+            ("ssh", "-p", "2222", "user@gpu-c", "/opt/agent-bridge relay --state /srv/state"),
         )
+
+    def test_remote_command_quotes_spaces_quotes_and_shell_expansion(self):
+        executable = "/opt/agent bridge/bin/agent-$(touch /tmp/never-run)-'quoted'"
+        state = "/srv/state with spaces/$HOME;$(touch /tmp/never-run)/`id`"
+        transport = SshPeerTransport(
+            make_host(
+                remote_executable=executable,
+                remote_state=state,
+                ssh_options=("-o", "BatchMode=yes"),
+            )
+        )
+
+        self.assertEqual(
+            transport.argv,
+            (
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "gpu-a.internal",
+                shlex.join((executable, "relay", "--state", state)),
+            ),
+        )
+        self.assertEqual(shlex.split(transport.argv[-1]), [executable, "relay", "--state", state])
+        self.assertIn(shlex.quote(executable), transport.argv[-1])
+        self.assertIn(shlex.quote(state), transport.argv[-1])
+        self.assertIn("$HOME", shlex.split(transport.argv[-1])[-1])
+
+    def test_simple_remote_paths_keep_the_existing_command_tokens(self):
+        transport = SshPeerTransport(make_host())
+
+        self.assertEqual(transport.argv[-1], "/usr/local/bin/agent-bridge relay")
+        self.assertEqual(shlex.split(transport.argv[-1]), ["/usr/local/bin/agent-bridge", "relay"])
+
+    def test_rejects_ssh_option_target_and_control_characters(self):
+        cases = (
+            {"ssh_target": "-oProxyCommand=touch /tmp/never-run"},
+            {"ssh_target": "gpu-a\n-oProxyCommand=touch /tmp/never-run"},
+            {"remote_executable": "/opt/agent\nbridge"},
+            {"remote_state": "/srv/state\r"},
+            {"ssh_options": ("-o", "BatchMode=yes\nProxyCommand=touch /tmp/never-run")},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes), self.assertRaises(BridgeError) as caught:
+                SshPeerTransport(make_host(**changes))
+            self.assertEqual(caught.exception.code, PeerErrorCode.INVALID_PARAMS)
 
     async def test_reuses_one_process_for_multiple_sequential_frames(self):
         def handler(request):

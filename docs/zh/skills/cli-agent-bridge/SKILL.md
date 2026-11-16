@@ -21,7 +21,7 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - `agent_broadcast(group_id, message, expected_revision, request_id, reservation)` 只向指定组的成员各派发一条任务，可能产生推理费用；reservation 按每个成员计算。不要把全部会话加入临时组来代替明确选择目标。暂停、关闭、正在排空和等待恢复的成员会跳过，检查每个 recipient 的任务 ID 或原因。
 - 广播重试保留相同 request_id 和参数，返回原收件人和任务 ID；组成员后来改变不会补发。入队不等于执行成功，按 task_id 查看结果。移除成员或删除组不撤回已排队任务，需用 agent_cancel；删除的组 ID 不复用。
 - 原生成员广播与收件：用 `agent_broadcast_status(broadcast_id, refresh=true)` 查各目标状态（`pending`/`enqueued`/`received` 及 `processing_status`；收到不代表执行完成，`uncertain`/`unconfirmed` 先读原生记录核实，不自动重发）。Codex 仅入原会话队列，不唤醒已关闭会话；AGY 仅在确认原实例关闭后自动恢复同一原生 ID（沿用原配置，不写活动终端、不传跳过权限参数、不补发历史 `skipped`）。原生会话不计入 bridge 预算（启用 `token_budget` 时拒绝含原生成员的广播），无 `task_id` 故 `agent_cancel` 不适用。
-- 原生成员可主动用 `agent_group_inbox(group_id, runtime, native_id, after, limit)` 分页只读收件（保存 `cursor` 作下次 `after`，每页最多 10 条；协调者代查不等于目标已收到）。本机有管理权限的原生会话可发广播，受限子会话不可；只通知用户指定成员，禁止成员收到后自动广播确认。唤醒锁与进程检查细节见 [README 分组与广播](../../README.md#分组与广播)。
+- 原生成员可主动用 `agent_group_inbox(group_id, runtime, native_id, after, limit)` 分页只读收件（保存 `cursor` 作下次 `after`，每页最多 10 条；协调者代查不等于目标已收到）。本机有管理权限的原生会话可发广播，受限子会话不可；只通知用户指定成员，禁止成员收到后自动广播确认。唤醒锁与进程检查细节见 [使用指南：分组与广播](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#分组与广播)。
 - `agent_inspect {}` 总览直接列出每个会话的 `runtime`、`provider`、`model`、`profile`、`effort` 和 `service_tier`；查询实际会话详情时传 `session_id`。
 - 修改代码用 `agent_open(access=workspace-write)`；服务创建独立 Git worktree，默认从 HEAD 开始。需要当前未提交内容时列出 `snapshot_files`；非 Git 目录用 `workspace_mode=copy` 并列出文件。不能偷偷 commit、stash 或清理主目录。
 - `request_id` 在重试时保持不变，改变内容时使用新 ID。已存在的 session 固定程序和供应商；换模型用新 session，重试旧任务可提供 `retry_task_id`。
@@ -36,8 +36,8 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - 需要输入或批准时从 `agent_inspect` 读取 question_id 和 expires，使用 respond 回答仍有效的请求；不自动扩大用户授权。
 - 普通 Flash 任务先运行本 skill 的 [scripts/provider_windows.py](../../../../skills/cli-agent-bridge/scripts/provider_windows.py)，按已核对的低峰窗口优先选 `claude-ollama`（Ollama Cloud）；官方 `pi-deepseek` / `claude-deepseek` 使用 DeepSeek 官方低峰窗口。只影响新任务，须先满足模型验证、工具及质量要求；供应商认证与配额分别保留，已有 session 不迁移。详细时段及节假日用法见 [分工表](resources/router-prompt.md#flash-按供应商低峰时间分配)。
 - 默认使用均衡策略。单个任务可传 `requirements.strategy=cost/speed/balanced`；指定模型不被自动替换。遇到配额等待先读 `quota_cooldowns`，确认恢复后再用 `quota_resume`；失败任务不会自动重跑。
-- 用量与计费：子任务统计含每次 attempt；需汇总父会话时在 `parent_register` 传原生 Codex 的 `usage_path`（可选 `usage_since`，`notify=false` 仅统计，`parent_meter_stop` 停止计数）。缺少执行前基数或未登记父用量时只报不完整/部分统计，不把历史总量当本轮新增；换模型重试的质量归各自 attempt、费用计全部执行；未知价格不按零算，CLI 估算不作实际账单。详见 [README 均衡选择与费用](../../README.md#均衡选择与费用)。
-- 异步任务的父会话通知与可选 Telegram（详见 [README 父会话与 Telegram](../../README.md#父会话与-telegram)）：不默认登记无关主会话；Telegram 任务须配置可读的 `telegram_database` 并保留默认 `external_child_filter` 子会话登记（不支持时更新现有 bot，严禁设为 `null` 绕过）。父会话若用临时 MCP 启动，登记时须传私有 `resume_config_file`（不改父模型或审批策略）。收到通知后仅 `completed` 可调 `agent_review`，结果不明先核查再 `resolve`，处理后用 `parent_ack` 确认（不重发结果不明的通知，也不重启共享 Codex daemon）。
+- 用量与计费：子任务统计含每次 attempt；需汇总父会话时在 `parent_register` 传原生 Codex 的 `usage_path`（可选 `usage_since`，`notify=false` 仅统计，`parent_meter_stop` 停止计数）。缺少执行前基数或未登记父用量时只报不完整/部分统计，不把历史总量当本轮新增；换模型重试的质量归各自 attempt、费用计全部执行；未知价格不按零算，CLI 估算不作实际账单。详见 [使用指南：均衡选择与费用](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#均衡选择与费用)。
+- 异步任务的父会话通知与可选 Telegram（详见 [使用指南：父会话与 Telegram](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#父会话与-telegram)）：不默认登记无关主会话；Telegram 任务须配置可读的 `telegram_database` 并保留默认 `external_child_filter` 子会话登记（不支持时更新现有 bot，严禁设为 `null` 绕过）。父会话若用临时 MCP 启动，登记时须传私有 `resume_config_file`（不改父模型或审批策略）。收到通知后仅 `completed` 可调 `agent_review`，结果不明先核查再 `resolve`，处理后用 `parent_ack` 确认（不重发结果不明的通知，也不重启共享 Codex daemon）。
 
 任务结束后关闭不再使用的子会话，并检查 `owned_processes`；顶层回答结束不证明后台进程结束。cgroup 之外的 tmux、远程作业等需另查。保留未合入的 worktree、副本和补丁供主 agent 检查；不要自动删除。
 

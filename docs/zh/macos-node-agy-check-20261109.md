@@ -27,7 +27,7 @@ macOS 的 `ps -axo pid=,ppid=,comm=,args=` 本次将真实 AGY 的 `comm` 截断
 
 这确认了 `macos-node` 上新原生 AGY 可以主动调用本机 Bridge。既有活动 AGY 实例没有重载 MCP，不能据此声称它们也已加载新配置。没有验证真实会话广播，也没有执行 Bridge 派发到 AGY 的模型任务；远端 `agy` profile 的验证标记本次未修改。
 
-原生检查的紧凑元数据在 `macos-node`：`<private-validation-state>/report.json`，权限 `0600`。该文件不含凭据、工具正文或聊天原文。
+原生检查的紧凑元数据在 `macos-node`：`<private-report-02>/validation.json`，权限 `0600`。该文件不含凭据、工具正文或聊天原文。
 
 ## 自动更新迁移前说明（历史记录）
 

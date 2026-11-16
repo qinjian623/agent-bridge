@@ -32,4 +32,4 @@ Monitor snapshots previously rebuilt a fresh host registry and showed connected 
 
 Remote model inference, training jobs, and live broadcasts were not executed in this verification pass (remote profiles stayed `verified=false`), and `launchd` was verified only within an active logged-in session rather than pre-login/post-reboot.
 
-Detailed artifacts remain in local private state (`<private-validation-state>/report` and remote `deployments/macos-node-service-20261108/`); no databases, tokens, or raw chats were committed.
+Detailed artifacts remain in local private state (`<private-report-03>/` and remote `<private-remote-check>/`); no databases, tokens, or raw chats were committed.

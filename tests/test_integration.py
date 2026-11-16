@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -6,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from mcp import ClientSession, StdioServerParameters
@@ -17,7 +19,8 @@ from agent_bridge.discovery import model_record
 from agent_bridge.errors import BridgeError
 from agent_bridge.routing import choose, task_samples
 from agent_bridge.store import Store
-from agent_bridge.workspace import worktree
+from agent_bridge.worker import Worker
+from agent_bridge.workspace import directory_copy, worktree
 
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -138,6 +141,18 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await self.broker.call("agent_hosts", {"host_id": "missing"})
             self.assertEqual(caught.exception.code, "peer_host_unknown")
 
+    async def test_agent_monitor_marks_broker_served_snapshot(self):
+        snapshot = await self.broker.call("agent_monitor", {"include_native": False})
+        provenance = snapshot["provenance"]
+        self.assertEqual("broker", provenance["snapshot_source"])
+        self.assertIs(provenance["broker_connected"], True)
+        self.assertEqual("connected", provenance["connection_state"])
+        self.assertEqual("unix_socket", provenance["transport"])
+        self.assertEqual("broker", provenance["served_by"])
+        self.assertEqual("broker", snapshot["coordinator"]["snapshot_source"])
+        self.assertIs(snapshot["coordinator"]["broker_connected"], True)
+        self.assertEqual("connected", snapshot["coordinator"]["connection_state"])
+
     async def test_child_client_cannot_control_owner(self):
         with (
             patch.dict(os.environ, {"AGENT_BRIDGE_ROLE": "child"}),
@@ -184,6 +199,76 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BridgeError, "positive token reservation"):
             await request(self.state, "agent_dispatch", {"profile": "fixed", "cwd": str(self.state), "instruction": "task", "request_id": "budget"})
         self.assertEqual([], self.broker.store.sessions())
+
+    async def test_copy_mode_worker_results_keep_immutable_captured_bytes(self):
+        source = self.state / "copy-source"
+        source.mkdir()
+        (source / "file.txt").write_text("input\n")
+        cwd, metadata = directory_copy(self.state, source, "copy-retention", ["file.txt"])
+        store = self.broker.store
+        sid = store.open(
+            self.broker.config.profiles["fixed"], cwd, "workspace-write", "copy-open", workspace=metadata,
+        )["session_id"]
+
+        async def run_task(label, body):
+            task_id = store.dispatch(sid, label, "dispatch-" + label)["task_id"]
+            worker = Worker(self.state, self.broker.config, sid)
+            begin = worker.store.begin_attempt
+
+            def assign(*args):
+                worker.store.claim(self.broker.config)
+                return begin(*args)
+
+            async def connect():
+                return None
+
+            async def run(instruction, on_started, on_event):
+                await on_started("turn")
+                body(Path(cwd))
+                worker.shutdown = True
+                return "completed", {"answer": label}, {"total_tokens": 1, "complete": True}
+
+            async def close():
+                return None
+
+            agent = SimpleNamespace(native_id="native", connect=connect, run=run, close=close)
+            with (
+                patch("agent_bridge.worker.runtime", return_value=agent),
+                patch.object(worker.store, "begin_attempt", assign),
+            ):
+                await asyncio.wait_for(worker.run(), 2)
+            self.assertEqual("completed", store.get_task(task_id)["status"])
+            return task_id
+
+        first = await run_task("task-one", lambda root: (root / "file.txt").write_text("first output\n"))
+        first_task = await self.broker.call("agent_result", {"task_id": first})
+        changes = json.loads(Path(first_task["result"]["files"]["changes"]).read_text())
+        record = changes["file.txt"]
+        retained = Path(record["path"])
+        self.assertEqual(b"first output\n", retained.read_bytes())
+        self.assertEqual(hashlib.sha256(b"first output\n").hexdigest(), record["sha256"])
+        artifact_id = first_task["result"]["artifact"]["artifact_id"]
+
+        async def assert_first_result_bytes():
+            task = await self.broker.call("agent_result", {"task_id": first})
+            saved = json.loads(Path(task["result"]["files"]["changes"]).read_text())["file.txt"]
+            self.assertEqual(b"first output\n", Path(saved["path"]).read_bytes())
+            full = await self.broker.call(
+                "agent_result", {"task_id": first, "artifact_id": artifact_id, "limit": 65536},
+            )
+            saved = json.loads(Path(json.loads(full["content"])["files"]["changes"]).read_text())["file.txt"]
+            self.assertEqual(b"first output\n", Path(saved["path"]).read_bytes())
+            self.assertEqual(record["sha256"], saved["sha256"])
+
+        await assert_first_result_bytes()
+
+        def overwrite_and_delete(root):
+            (root / "file.txt").write_text("second output\n")
+            (root / "file.txt").unlink()
+
+        await run_task("task-two", overwrite_and_delete)
+        self.assertFalse((Path(cwd) / "file.txt").exists())
+        await assert_first_result_bytes()
 
     async def test_failed_dispatch_closes_a_session_created_before_a_state_race(self):
         with patch.object(self.broker.store, "dispatch", side_effect=BridgeError("state_changed", "fixture")):

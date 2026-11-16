@@ -123,10 +123,13 @@ def _parse_host(host_id: str, raw: Mapping[str, object]) -> HostConfig:
         raise BridgeError("invalid_config", f"Host {host_id!r} ssh_options must be a list of strings")
 
     pull_interval = raw.get("pull_interval", 2.0)
+    try:
+        finite_interval = isinstance(pull_interval, (int, float)) and math.isfinite(pull_interval)
+    except OverflowError:
+        finite_interval = False
     if (
         isinstance(pull_interval, bool)
-        or not isinstance(pull_interval, (int, float))
-        or not math.isfinite(pull_interval)
+        or not finite_interval
         or pull_interval <= 0
     ):
         raise BridgeError("invalid_config", f"Host {host_id!r} pull_interval must be a positive number")

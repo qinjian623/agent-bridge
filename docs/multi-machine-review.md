@@ -2,8 +2,8 @@
 
 # Multi-Machine Design Adversarial Review Record (Historical Archive)
 
-> **Archive Note**: All 16 review findings (`A1-A8` and `D1-D8`) recorded here have been integrated into the canonical specification:  
-> 👉 **[Multi-Machine Access Design & Architecture Specification](multi-machine-design.md)** (Section 3: Architectural Decision Records).  
+> **Archive Note**: All 16 review findings (`A1-A8` and `D1-D8`) recorded here have been integrated into the canonical specification:
+> 👉 **[Multi-Machine Access Design & Architecture Specification](multi-machine-design.md)** (Section 3: Architectural Decision Records).
 > Retained for historical auditability of the static adversarial review.
 
 ---
@@ -48,5 +48,5 @@ The 16 findings across both reviews were synthesized into concrete architectural
 
 ## 3. Private Review Artifacts
 
-Raw review outputs, task/attempt IDs, hashes, and teardown logs remain stored locally in private state:  
-`<private-validation-state>/report`
+Raw review outputs, task/attempt IDs, hashes, and teardown logs remain stored locally in private state:
+`<private-report-04>/`

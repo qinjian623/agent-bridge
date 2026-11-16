@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
 import os
 import socket
@@ -62,7 +61,7 @@ def build_parser():
     )
     relay = commands.add_parser("relay", help="Bridge stdin/stdout peer JSONL to the local node service")
     relay.add_argument("--state", default=argparse.SUPPRESS)
-    worker = commands.add_parser("worker", help=argparse.SUPPRESS)
+    worker = commands.add_parser("worker", help="Internal worker command (managed automatically)")
     worker.add_argument("session_id")
     monitor = commands.add_parser("monitor", help="Monitor active agents, tasks, and communications")
     monitor.add_argument("--web", action="store_true", help="Launch local web-based monitor dashboard")
@@ -222,9 +221,13 @@ def main(argv: list[str] | None = None):
             if update_configured:
                 from .updater import Updater
 
-                with contextlib.suppress(OSError, ValueError):
+                try:
                     managed = Updater(state).service_managed()
+                except (OSError, ValueError, RuntimeError):
+                    managed = None
             warnings: list[str] = []
+            if managed is None:
+                warnings.append("Could not determine whether the broker service uses the managed launcher")
             if config.worker_launcher == "systemd" and not env["systemd_user"]:
                 warnings.append("worker_launcher is 'systemd' but systemd --user is unavailable; consider 'detached'")
             if not env["tools"]["uv"]:
@@ -304,7 +307,7 @@ def main(argv: list[str] | None = None):
 
             params = json.loads(args.json if args.json is not None else sys.stdin.read() or "{}")
             print(json.dumps(asyncio.run(request(state, args.method, params)), ensure_ascii=False, indent=2))
-    except (BridgeError, OSError, ValueError) as error:
+    except (BridgeError, OSError, ValueError, RuntimeError) as error:
         print(
             json.dumps(
                 {"error": error.as_dict() if isinstance(error, BridgeError) else str(error)}, ensure_ascii=False

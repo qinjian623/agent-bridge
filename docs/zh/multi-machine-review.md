@@ -48,4 +48,4 @@
 
 ## 3. 原始审查记录凭据
 原始审查结果、模型返回字段、任务/attempt ID、文档版本摘要和关闭检查保存在本机私有目录：  
-`<private-validation-state>/report`
+`<private-report-04>/`

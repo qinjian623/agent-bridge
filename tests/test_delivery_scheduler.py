@@ -385,5 +385,95 @@ class BrokerStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], await asyncio.wait_for(scheduler.step(), 2))
 
 
+class BrokerPublicCancelTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
+        (self.state / "config.json").write_text(json.dumps({
+            "profiles": {"fixture": {"runtime": "codex", "model": "fixed", "executable": sys.executable}},
+            "worker_launcher": "detached", "telegram_database": None,
+        }))
+        self.client = FakePeerClient()
+        self.broker = Broker(self.state, peer_factory=FakePeerFactory(self.client))
+
+    def create_and_send(self, name="team", request_id="send"):
+        groups.control_group(
+            self.broker.store, name, "create", 0, "create-" + name,
+            remote_members=[REMOTE_BRIDGE],
+        )
+        sent = groups.broadcast(self.broker.store, name, "queued message", 0, request_id)
+        return sent["recipients"][0]["delivery_id"]
+
+    def outbox(self, delivery_id):
+        with self.broker.store.connection() as db:
+            return dict(db.execute(
+                "SELECT * FROM peer_outbox WHERE delivery_id=?", (delivery_id,)
+            ).fetchone())
+
+    async def test_public_cancel_tombstones_a_pending_group_delivery_and_replays(self):
+        delivery_id = self.create_and_send()
+        original_operation = self.outbox(delivery_id)["operation_id"]
+
+        first = await self.broker.api_call(
+            "agent_cancel", {"delivery_id": delivery_id, "request_id": "cancel"}
+        )
+        self.assertEqual("tombstone_pending", first["result"]["status"])
+        self.assertEqual(delivery_id, first["result"]["delivery_id"])
+        self.assertEqual(1, first["result"]["tombstone_seq"])
+        self.assertNotEqual(original_operation, self.outbox(delivery_id)["operation_id"])
+        self.assertEqual([], self.client.deliver_calls)
+
+        replay = await self.broker.api_call(
+            "agent_cancel", {"delivery_id": delivery_id, "request_id": "cancel"}
+        )
+        self.assertEqual(first, replay)
+        self.assertEqual("tombstone_pending", self.outbox(delivery_id)["status"])
+        self.assertEqual([], self.client.deliver_calls)
+
+        self.client.deliveries.append({"status": "cancelled"})
+        [result] = await self.broker.delivery_scheduler.step()
+        self.assertEqual("cancelled", result["status"])
+        [params] = self.client.deliver_calls
+        self.assertEqual(delivery_id, params["delivery_id"])
+        self.assertEqual("tombstone", params["seq_kind"])
+        self.assertNotIn("message", params)
+        self.assertEqual("cancelled", self.outbox(delivery_id)["status"])
+
+    async def test_public_cancel_keeps_a_pending_delivery_local_when_host_id_is_supplied(self):
+        delivery_id = self.create_and_send("team-host", "send-host")
+        response = await self.broker.api_call(
+            "agent_cancel",
+            {"delivery_id": delivery_id, "host_id": "gpu-a", "request_id": "cancel-host"},
+        )
+        self.assertEqual("tombstone_pending", response["result"]["status"])
+        self.assertEqual("tombstone_pending", self.outbox(delivery_id)["status"])
+        self.assertEqual([], self.client.deliver_calls)
+
+    async def test_public_cancel_refuses_sending_and_uncertain_local_deliveries(self):
+        for status in ("sending", "uncertain"):
+            with self.subTest(status=status):
+                delivery_id = self.create_and_send(
+                    "team-" + status, "send-" + status,
+                )
+                with self.broker.store.connection(write=True) as db:
+                    db.execute(
+                        "UPDATE peer_outbox SET status=?,revision=revision+1 WHERE delivery_id=?",
+                        (status, delivery_id),
+                    )
+                response = await self.broker.api_call(
+                    "agent_cancel",
+                    {"delivery_id": delivery_id, "request_id": "cancel-" + status},
+                )
+                self.assertEqual("delivery_blocked", response["error"]["code"])
+                self.assertEqual(status, self.outbox(delivery_id)["status"])
+                self.assertEqual([], self.client.deliver_calls)
+                replay = await self.broker.api_call(
+                    "agent_cancel",
+                    {"delivery_id": delivery_id, "request_id": "cancel-" + status},
+                )
+                self.assertEqual(response, replay)
+
+
 if __name__ == "__main__":
     unittest.main()

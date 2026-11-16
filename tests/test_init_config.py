@@ -4,7 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -267,6 +267,65 @@ class InitConfigTests(unittest.TestCase):
             cli.main(["--state", str(self.state), "init", "--non-interactive"])
         self.assertEqual(1, err.exception.code)
         self.assertEqual("{corrupt-json", (self.state / "config.json").read_text())
+
+    def test_non_interactive_unknown_profile_key_is_clear_and_preserves_config(self):
+        original = {
+            "profiles": {"p1": {"runtime": "codex", "provider": "openai-codex", "model": "gpt-5"}},
+            "worker_launcher": "detached",
+            "parallel_limit": 3,
+            "quota_limit": 2,
+            "task_timeout": 3600,
+            "interrupt_timeout": 30,
+            "default_strategy": "balanced",
+            "hosts": {},
+            "projects": {},
+        }
+        config_path = self.state / "config.json"
+        config_path.write_text(json.dumps(original, indent=2) + "\n")
+        before = config_path.read_bytes()
+        secret = "sk-test-secret-value-1234567890"
+        profile = json.dumps(
+            {
+                "name": "p2",
+                "runtime": "codex",
+                "model": "gpt-5",
+                "unknown_option": secret,
+            }
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        fake_env = {
+            "platform": "linux",
+            "runtimes": {},
+            "tools": {},
+            "systemd_user": False,
+            "launchd_user": False,
+        }
+        with (
+            patch.object(Path, "home", return_value=self.home),
+            patch.object(init_config, "detect_environment", return_value=fake_env),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            cli.main(
+                [
+                    "--state",
+                    str(self.state),
+                    "init",
+                    "--non-interactive",
+                    "--profile",
+                    profile,
+                ]
+            )
+
+        self.assertEqual(1, caught.exception.code)
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual("invalid_config", payload["error"]["code"])
+        self.assertIn("unknown fields", payload["error"]["message"])
+        self.assertNotIn(secret, stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertEqual(before, config_path.read_bytes())
 
     def test_doctor_reports_environment_and_warnings(self):
         self._run_cli(

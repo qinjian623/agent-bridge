@@ -8,12 +8,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from agent_bridge import native_broadcast
 from agent_bridge.broker import Broker
 from agent_bridge.config import Config, Profile
 from agent_bridge.errors import BridgeError
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.peer_api import DirectPeerService
-from agent_bridge.peer_protocol import INLINE_RESULT_BYTES, PeerErrorCode
+from agent_bridge.peer_protocol import INLINE_RESULT_BYTES, DeliverySource, PeerErrorCode
 from agent_bridge.store import Store, encode
 
 
@@ -660,6 +661,115 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
             ),
             PeerErrorCode.OPERATION_NOT_FOUND,
         )
+
+    async def test_cancel_native_delivery_cancels_the_unsent_queue_row_atomically(self):
+        deliver_params = self.deliver_params(
+            operation=self.operation("op-native"),
+            delivery_id="delivery-native",
+            target_seq=1,
+            target={"kind": "native", "runtime": "codex", "id": "native-1"},
+        )
+        delivered = await self.peer("peer.deliver", deliver_params)
+        self.assertTrue(delivered["ok"], delivered)
+        self.assertIsNone(delivered["result"]["task_id"])
+        self.assertEqual(
+            "pending",
+            self.store.get_native_send_by_delivery(DeliverySource.PEER_DELIVER, "delivery-native")["status"],
+        )
+
+        params = {"operation": self.operation("cancel-native"), "delivery_id": "delivery-native"}
+        cancelled = await self.peer("peer.cancel", params)
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertEqual(
+            {"target": "delivery-native", "status": "cancelled", "tombstone_seq": 1},
+            cancelled["result"],
+        )
+        queued = self.store.get_native_send_by_delivery(DeliverySource.PEER_DELIVER, "delivery-native")
+        self.assertEqual("cancelled", queued["status"])
+        self.assertIn("not_received", queued["receipt"])
+        self.assertEqual("cancelled", self.store.get_inbox_delivery("delivery-native")["status"])
+        self.assertEqual("cancelled", self.store.get_operation("op-native")["status"])
+
+        commits = self.store.max_peer_commit_seq()
+        replay = await self.peer("peer.cancel", params)
+        self.assertEqual(cancelled, replay)
+        self.assertEqual(commits, self.store.max_peer_commit_seq())
+        late_message = await self.peer("peer.deliver", deliver_params)
+        self.assertTrue(late_message["ok"], late_message)
+        self.assertEqual("cancelled", late_message["result"]["status"])
+        self.assertEqual("cancelled", late_message["result"]["send_status"])
+
+        sender = AsyncMock()
+        await native_broadcast.deliver(self.store, self.config, sender=sender)
+        sender.assert_not_awaited()
+        self.assertEqual([], self.store.claim_eligible_native_sends())
+
+    async def test_cancel_native_operation_target_finds_the_saved_delivery_queue(self):
+        delivered = await self.peer(
+            "peer.deliver",
+            self.deliver_params(
+                operation=self.operation("op-native-target"),
+                delivery_id="delivery-native-target",
+                target_seq=1,
+                target={"kind": "native", "runtime": "codex", "id": "native-1"},
+            ),
+        )
+        self.assertTrue(delivered["ok"], delivered)
+        cancelled = await self.peer(
+            "peer.cancel",
+            {"operation": self.operation("cancel-native-target"), "operation_id": "op-native-target"},
+        )
+        self.assertTrue(cancelled["ok"], cancelled)
+        self.assertEqual(
+            {"target": "op-native-target", "status": "cancelled"},
+            cancelled["result"],
+        )
+        self.assertEqual(
+            "cancelled",
+            self.store.get_native_send_by_delivery(
+                DeliverySource.PEER_DELIVER, "delivery-native-target"
+            )["status"],
+        )
+        self.assertEqual("cancelled", self.store.get_operation("op-native-target")["status"])
+
+    async def test_cancel_native_refuses_a_claimed_or_uncertain_queue_row(self):
+        delivered = await self.peer(
+            "peer.deliver",
+            self.deliver_params(
+                operation=self.operation("op-native-race"),
+                delivery_id="delivery-native-race",
+                target_seq=1,
+                target={"kind": "native", "runtime": "codex", "id": "native-1"},
+            ),
+        )
+        self.assertTrue(delivered["ok"], delivered)
+        [claimed] = self.store.claim_eligible_native_sends()
+        self.assertEqual("sending", claimed["status"])
+
+        sending = await self.peer(
+            "peer.cancel",
+            {"operation": self.operation("cancel-native-sending"), "delivery_id": "delivery-native-race"},
+        )
+        self.assert_error(sending, PeerErrorCode.DELIVERY_BLOCKED)
+        self.assertEqual(
+            "sending",
+            self.store.get_native_send_by_delivery(DeliverySource.PEER_DELIVER, "delivery-native-race")["status"],
+        )
+        self.assertEqual("completed", self.store.get_operation("op-native-race")["status"])
+        self.assertIsNone(self.store.get_operation("cancel-native-sending"))
+
+        self.store.update_native_send(claimed["id"], "uncertain", expected_status="sending")
+        uncertain = await self.peer(
+            "peer.cancel",
+            {"operation": self.operation("cancel-native-uncertain"), "delivery_id": "delivery-native-race"},
+        )
+        self.assert_error(uncertain, PeerErrorCode.DELIVERY_BLOCKED)
+        self.assertEqual(
+            "uncertain",
+            self.store.get_native_send_by_delivery(DeliverySource.PEER_DELIVER, "delivery-native-race")["status"],
+        )
+        self.assertEqual("received", self.store.get_inbox_delivery("delivery-native-race")["status"])
+        self.assertEqual("completed", self.store.get_operation("op-native-race")["status"])
 
     async def test_result_returns_inline_summaries_and_paged_artifact_refs(self):
         small_task = self.complete_task({"answer": "all good"}, "small-result")

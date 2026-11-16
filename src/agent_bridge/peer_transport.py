@@ -6,6 +6,7 @@ import contextlib
 import inspect
 import json
 import math
+import shlex
 import socket
 import uuid
 from collections.abc import Callable, Iterable, Sequence
@@ -61,6 +62,10 @@ from .peer_protocol import (
 DEFAULT_PEER_TIMEOUT = 65.0
 SSH_EXECUTABLE = "ssh"
 TERMINATE_TIMEOUT = 5.0
+
+
+def _has_control_characters(value: str) -> bool:
+    return any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
 
 
 class PeerTransport(Protocol):
@@ -134,10 +139,12 @@ class PeerService(Protocol):
 class SshPeerTransport:
     """One persistent SSH JSONL channel, started lazily and serialized frame by frame.
 
-    The SSH command is always executed with an argument list (never through a shell). A lost connection,
-    closed pipe, exited process or timeout raises `BridgeError(peer_host_offline)`; callers must treat that as an
-    unknown outcome rather than a failed operation (ADR-01/ADR-05). After a transport error the child is
-    terminated so a stale frame can never be paired with a later response.
+    SSH is always started with an argument list (never through a local shell). OpenSSH joins the arguments
+    after the target into one remote command and lets the remote shell parse it, so that command is built with
+    `shlex.join` to preserve executable and state paths verbatim. A lost connection, closed pipe, exited process
+    or timeout raises `BridgeError(peer_host_offline)`; callers must treat that as an unknown outcome rather than
+    a failed operation (ADR-01/ADR-05). After a transport error the child is terminated so a stale frame can
+    never be paired with a later response.
     """
 
     def __init__(
@@ -168,15 +175,26 @@ class SshPeerTransport:
 
         if not isinstance(ssh_target, str) or not ssh_target:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "ssh_target is required")
+        if ssh_target.startswith("-") or _has_control_characters(ssh_target):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "ssh_target must not be an SSH option or contain control characters")
         if not isinstance(remote_executable, str) or not remote_executable:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote_executable is required")
+        if _has_control_characters(remote_executable):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote_executable must not contain control characters")
         if remote_state is not None and (not isinstance(remote_state, str) or not remote_state):
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote_state must be a non-empty string")
+        if remote_state is not None and _has_control_characters(remote_state):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "remote_state must not contain control characters")
         if isinstance(ssh_options, (str, bytes)):
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "ssh_options must be a sequence of strings")
         options = tuple(ssh_options)
-        if any(not isinstance(option, str) or not option for option in options):
-            raise peer_error(PeerErrorCode.INVALID_PARAMS, "ssh_options must be a sequence of non-empty strings")
+        if any(
+            not isinstance(option, str) or not option or _has_control_characters(option) for option in options
+        ):
+            raise peer_error(
+                PeerErrorCode.INVALID_PARAMS,
+                "ssh_options must be a sequence of non-empty strings without control characters",
+            )
 
         self.host_id = host_id or ssh_target
         self.ssh_target = ssh_target
@@ -184,17 +202,17 @@ class SshPeerTransport:
         self.remote_state = remote_state
         self.ssh_options = options
         self.ssh_command = ssh_command
-        argv = [ssh_command, *options, ssh_target, remote_executable, "relay"]
+        remote_command = [remote_executable, "relay"]
         if remote_state is not None:
-            argv.extend(("--state", remote_state))
-        self._argv = tuple(argv)
+            remote_command.extend(("--state", remote_state))
+        self._argv = (ssh_command, *options, ssh_target, shlex.join(remote_command))
         self._process: asyncio.subprocess.Process | None = None
         self.connection_generation = 0
         self._lock = asyncio.Lock()
 
     @property
     def argv(self) -> tuple[str, ...]:
-        """Exact argument vector used to start SSH (no shell, no string interpolation)."""
+        """Exact SSH argument vector; the final element is the shell-quoted remote command."""
         return self._argv
 
     async def call(
@@ -300,7 +318,7 @@ class SshPeerTransport:
             return self._process
         await self._stop()
         try:
-            # Every argument is passed verbatim; shell=False is implicit in create_subprocess_exec.
+            # Every local argument is passed verbatim; shell=False is implicit in create_subprocess_exec.
             process = await asyncio.create_subprocess_exec(
                 *self._argv,
                 stdin=asyncio.subprocess.PIPE,

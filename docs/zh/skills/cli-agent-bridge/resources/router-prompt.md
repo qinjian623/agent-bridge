@@ -63,7 +63,7 @@
 - 原生 Codex 主会话在派单前，先检查并复用已有父记录；记录不存在时才用 `agent_control(action="parent_register", session_id=父记录ID, native_session_id=已核实的当前原生ID, cwd=..., expected_revision=..., request_id=..., notify=true)` 登记自己的通知。新记录用 revision `0`；`parent_register` 不能更新已有记录，须确认原记录已启用通知并保留 Telegram 过滤、用量设置及私有恢复配置。原设置无法通知时直接说明，不悄悄替换记录。自动通知目前还要求配置 `codex_async_python`，且已有共享 Codex daemon；仅登记父记录不代表可发送，也不支持其他原生程序作为通知目标。Bridge 管理的主会话保留已有父会话关系；不编造原生 ID，不登记其他用户的会话。
 - 创建子会话时，在 `agent_open` 或 `agent_dispatch` 传 `parent=父记录ID`。复用已有子会话前，检查它保存的 parent；向已有会话派单时传 parent 不会修改原关系。没有可用的自动通知方式时直接说明；通知结果不明时不盲目重发。
 - `agent_dispatch` 完成必要的建会话、工作目录或远程准备后，入队即返回任务和会话 ID，不等待模型执行完成。保存这些 ID 及实际作业的 `operation_id`，继续独立工作；没有其他工作且通知已配置时，报告待完成事项并结束本轮。不循环调用 `agent_wait`、sleep、`agent_operation(wait=...)` 或状态查询。用户要求同步等待时才有限等待，超时不重新派单。
-- 收到通知后读取对应任务和事件，分别处理完成、失败、取消、中断或等待恢复。仅 `completed` 进入独立审查，依赖任务仍须等 `agent_review(accepted)`。处理事件后用 `agent_control(action="parent_ack", event_seq=..., ...)` 确认。入队、原生会话收到及主会话确认处理是三种状态；暂停或关闭的父会话不会自动唤醒。提问或审批请求目前只记录 `input_required` 事件，不主动通知父会话，因此不能依靠完成通知自动处理等待输入的任务；交互任务须说明此限制。
+- 收到通知后读取对应任务和事件，分别处理完成、失败、取消、中断或等待恢复。仅 `completed` 进入独立审查，依赖任务仍须等 `agent_review(accepted)`。处理事件后用 `agent_control(action="parent_ack", event_seq=..., ...)` 确认。入队、原生会话收到及主会话确认处理是三种状态；暂停或关闭的父会话不会自动唤醒。提问或审批请求会向已登记的父会话发送 `input_required` 通知；检查问题及有效期后通过 `agent_control(action="respond", ...)` 回答，再确认处理该事件。任务仍在等待输入，不能按已完成任务审核。
 - 子会话另行启动后台编译、训练或远程作业时，完成通知必须跟踪实际作业，不能只报告启动成功。保留作业 ID，并使用已获授权的完成回调或监测程序；只写 `completion.json` 不会通知主会话。复用已有监测程序，不重复建立定时任务，也不让模型循环查询。
 
 派单按桥接工具实际参数传递，小任务一两句话说清即可，长任务/异步任务使用结构化信息；每个子任务说明书必须自包含（子会话看不到主会话历史）。

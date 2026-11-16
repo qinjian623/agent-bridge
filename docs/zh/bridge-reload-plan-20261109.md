@@ -2,7 +2,9 @@
 
 # Bridge 重载与实际验证计划
 
-状态更新（11-09 12:03）：本机于 11:43:49 在本轮操作之外重新开机，Bridge 于 11:44:11 自动启动为 PID <process-02-pid>，已加载通知修复。本轮没有执行 restart。下文保留开机前的准备步骤；不应在服务已经更新后照单再重启一次。
+本文保留 2026-11-09 的计划与检查结果，不是再次重启服务的指令。私人项目、进程和通知标识以及报告位置已改为说明性占位符；报告仍在私下保留，不随仓库发布。
+
+状态更新（11-09 12:03）：本机于 11:43:49 在本轮操作之外重新开机，Bridge 于 11:44:11 自动启动为 PID <process-01-pid>，已加载通知修复。本轮没有执行 restart。下文保留开机前的准备步骤；不应在服务已经更新后照单再重启一次。
 
 11:53 的检查无活跃任务、worker、在途发送或未返回 API 请求。生产环境通知记录已精确撤回：10:15 曾确认同一回执仍在原生队列，11:53:38 清理后记录为 `processed/removed/removed`，11:57 只读复查队列及最近 100 轮均无该项。代码只有取得原生 `deleted=true` 才写入此状态；未另存删除响应原文或完成时间。
 
@@ -10,20 +12,20 @@
 
 截至 12:03，71 条旧通知仍为 `unknown/uncertain`，创建于 11-03 至 11-04，不能解释为 71 项待执行任务，也不补发。`macos-node` 在线；本机 8080 未监听，不能报告网页已恢复。
 
-独立 Native 验证未通过，已在任何队列写入前停止。空 `CODEX_HOME` 的独立 stdio 实例可以创建测试线程，但 `thread/turns/list` 返回 -32600：首条用户消息前线程尚未 materialized；`thread/read(includeTurns=true)` 又返回 -32601：`list_turns is not supported yet`。因此无法按计划确认空历史，不制造首个模型轮次来绕过限制。所有测试进程已退出、临时目录与数据库已删除；没有复制认证、使用共享 daemon、发送或删除队列消息。可重跑的脚本为 `scripts/check_native_notification_retract.py`，私有报告在 `<private-validation-state>/report`。生产 <observed-notification-id> 的实际撤回与此次未通过的隔离测试分别记录，不合并为“全项实测通过”。
+独立 Native 验证未通过，已在任何队列写入前停止。空 `CODEX_HOME` 的独立 stdio 实例可以创建测试线程，但 `thread/turns/list` 返回 -32600：首条用户消息前线程尚未 materialized；`thread/read(includeTurns=true)` 又返回 -32601：`list_turns is not supported yet`。因此无法按计划确认空历史，不制造首个模型轮次来绕过限制。所有测试进程已退出、临时目录与数据库已删除；没有复制认证、使用共享 daemon、发送或删除队列消息。可重跑的脚本为 `scripts/check_native_notification_retract.py`，私有报告在 `<private-report-06>/`。生产 <observed-notification-id> 的实际撤回与此次未通过的隔离测试分别记录，不合并为“全项实测通过”。
 
-脚本增加 7 项方法、目标与报告保护测试后，最终完整 652 项测试通过，耗时 21.659 秒；Ruff 与差异检查通过。最终结果保存在 `<private-validation-state>/report.json` 和 `unittest-final.log`。Bridge 仍为 PID <process-02-pid>，NRestarts=0。本轮未提交或推送代码。
+脚本增加 7 项方法、目标与报告保护测试后，最终完整 652 项测试通过，耗时 21.659 秒；Ruff 与差异检查通过。最终结果保存在 `<private-report-07>/validation.json` 和 `unittest-final.log`。Bridge 仍为 PID <process-01-pid>，NRestarts=0。本轮未提交或推送代码。
 
-13:29 后按用户要求恢复 Web：新增本机用户服务 `~/.config/systemd/user/cli-agent-bridge-web.service`，启用 `default.target` 自动启动及失败重启，仍只监听 `127.0.0.1:8080`，不在 unit 中存凭据。unit 验证通过，登录页和认证后快照返回 200，未认证快照返回 401；连续三次快照 `macos-node` 均在线。Bridge、共享 Codex daemon 与原有三个 worker 的 PID/启动标识均未变化。用户 linger 已启用；未为验证再次重启整机。检查元数据在 `<private-validation-state>/report.json`。
+13:29 后按用户要求恢复 Web：新增本机用户服务 `~/.config/systemd/user/cli-agent-bridge-web.service`，启用 `default.target` 自动启动及失败重启，仍只监听 `127.0.0.1:8080`，不在 unit 中存凭据。unit 验证通过，登录页和认证后快照返回 200，未认证快照返回 401；连续三次快照 `macos-node` 均在线。Bridge、共享 Codex daemon 与原有三个 worker 的 PID/启动标识均未变化。用户 linger 已启用；未为验证再次重启整机。检查元数据在 `<private-report-08>/validation.json`。
 
 本次只重载 `cli-agent-bridge.service`。不重启共享 Codex daemon、`macos-node` 服务、Web 监控，不改变模型、权限或已有会话的原生 ID，不重跑任何编译任务。
 
 ## 开机前准备快照与会受影响的部分
 
-- 本机 Broker：PID <process-11-pid>，11-08 15:41 启动，尚未加载昨晚的常驻通知修复。
-- 当前有一个 Flash 任务运行，worker PID <process-08-pid>。三个旧 Pi worker PID <process-09-pid>、<process-13-pid>、<process-12-pid> 空闲。四者分别位于独立 `agent-bridge-...service`，不在 Broker 的 cgroup。
+- 本机 Broker：PID <process-02-pid>，11-08 15:41 启动，尚未加载昨晚的常驻通知修复。
+- 当前有一个 Flash 任务运行，worker PID <process-03-pid>。三个旧 Pi worker PID <process-04-pid>、<process-05-pid>、<process-06-pid> 空闲。四者分别位于独立 `agent-bridge-...service`，不在 Broker 的 cgroup。
 - 本次只读快照中，通知、原生发送队列及 peer_outbox 的 sending=0，原生 processing running=0，未返回 API 请求=0；这些数字必须在执行时重新检查。
-- `processed + queue_cleanup=pending` 共 146 条，全部属于 `example-project`。这是待核查记录数，不能当作原生队列中的实际消息数。
+- `processed + queue_cleanup=pending` 共 146 条，全部属于 `example-coordinator`。这是待核查记录数，不能当作原生队列中的实际消息数。
 
 重载会让新的通知、ACK、原生接收及撤回逻辑生效。服务启动后会自动核查上述已 ACK 记录：只撤回仍在同一原生线程队列中、clientId 与已有回执均匹配的那一条；已经进入原生轮次的记录不删除、不打断。结果未知后只读核查，不自动再次删除或重新发送。未 ACK 的通知不在这批清理范围内。
 

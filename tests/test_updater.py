@@ -433,6 +433,27 @@ class ActivationTests(UpdateFixture):
         self.assertEqual(["agent_update_prepare"], [c.args[1] for c in request.call_args_list])
         self.assertTrue(self.new.exists())
 
+    def test_failed_rollback_symlink_switch_keeps_maintenance_and_candidate(self):
+        switch = self.updater._switch
+
+        def fail_restore(target):
+            if target == self.old:
+                raise OSError("synthetic disk failure")
+            switch(target)
+
+        with (
+            patch("agent_bridge.broker.request", new=AsyncMock(side_effect=self.prepare)) as request,
+            patch.object(updater, "busy_snapshot", return_value={"busy": False}),
+            patch.object(self.updater, "_switch", side_effect=fail_restore),
+            patch.object(self.updater, "_restart", side_effect=RuntimeError("failed")) as restart,
+            self.assertRaises(updater.UpdateUncertain),
+        ):
+            asyncio.run(self.updater._activate(self.new, self.digest))
+        restart.assert_called_once()
+        self.assertEqual(["agent_update_prepare"], [c.args[1] for c in request.call_args_list])
+        self.assertEqual(self.new, self.updater.current.resolve())
+        self.assertTrue(self.new.exists())
+
     def test_uncertain_rollback_keeps_candidate_files_for_possible_live_process(self):
         with (
             patch("agent_bridge.broker.request", new=AsyncMock(side_effect=self.prepare)),
@@ -668,6 +689,123 @@ class TimerAndLauncherTests(UpdateFixture):
                 ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/com.cli-agent-bridge.broker"],
                 run.call_args.args[0],
             )
+
+    def test_existing_managed_launchers_survive_install_from_versioned_release_python(self):
+        stable_python = self.home / "stable-python"
+        stable_python.write_text("#!/bin/sh\n")
+        stable_python.chmod(0o700)
+        binary = self.root / "bin"
+        binary.mkdir(mode=0o700)
+        original: dict[Path, bytes] = {}
+        for filename, module in updater._LAUNCHER_MODULES:
+            launcher = binary / filename
+            updater._write(launcher, updater._launcher(self.root, stable_python, module))
+            launcher.chmod(0o700)
+            original[launcher] = launcher.read_bytes()
+
+        release_python = self.new / "bin/python"
+        with (
+            patch.object(updater.sys, "executable", str(release_python)),
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run") as run,
+        ):
+            result = updater.install(
+                self.state,
+                service_kind="systemd",
+                root=self.root,
+                update_existing=True,
+            )
+
+        self.assertEqual(str(binary / "agent-bridge"), result["launcher"])
+        for launcher, data in original.items():
+            self.assertEqual(data, launcher.read_bytes())
+        run.assert_not_called()
+
+    def test_managed_launcher_validation_rejects_arbitrary_shell_without_mutating_it(self):
+        binary = self.root / "bin"
+        binary.mkdir(mode=0o700)
+        launcher = binary / "agent-bridge"
+        content = "#!/bin/sh\nset -eu\nexec /bin/sh -c 'touch /tmp/unexpected'\n"
+        launcher.write_text(content)
+        launcher.chmod(0o700)
+
+        with self.assertRaisesRegex(ValueError, "unrelated managed launcher"):
+            updater._ensure_launchers(self.root)
+
+        self.assertEqual(content, launcher.read_text())
+
+    def test_launchd_service_name_with_plist_suffix_uses_one_normalized_label(self):
+        launcher = str(self.root / "bin/agent-bridge")
+        self.updater.settings["service_kind"] = "launchd"
+        self.updater.settings["service_name"] = "com.example.bridge.plist"
+        label = "com.example.bridge"
+        with patch.object(
+            updater,
+            "_run",
+            return_value=f"\tstate = running\n\tpid = 321\n\tprogram = {launcher}\n",
+        ) as run:
+            self.assertTrue(self.updater.service_managed())
+            self.updater._restart()
+
+        self.assertEqual(
+            [
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+            ],
+            [invocation.args[0] for invocation in run.call_args_list],
+        )
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run") as run,
+        ):
+            result = updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="launchd",
+                service_name="com.example.bridge.plist",
+                enable=False,
+            )
+        service_path = self.home / "Library/LaunchAgents/com.example.bridge.plist"
+        self.assertEqual(str(service_path), result["service_path"])
+        self.assertEqual(label, plistlib.loads(service_path.read_bytes())["Label"])
+        run.assert_not_called()
+
+    def test_update_install_preserves_recorded_bootstrap_python_after_ota(self):
+        recorded = self.home / "stable-python"
+        recorded.write_text("#!/bin/sh\n")
+        updater._write(
+            self.state / "update.json",
+            {**self.settings, "bootstrap_python": str(recorded)},
+        )
+        release_python = self.new / "bin/python"
+        with (
+            patch.object(updater.sys, "executable", str(release_python)),
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run") as run,
+        ):
+            _, _, _, settings = updater.validate_update_install(
+                self.state,
+                service_kind="systemd",
+                root=self.root,
+            )
+            self.assertEqual(str(recorded), settings["bootstrap_python"])
+            _, _, _, reconfigured = updater.validate_update_install(
+                self.state,
+                service_kind="systemd",
+                root=self.root,
+                update_existing=True,
+            )
+            self.assertEqual(str(recorded), reconfigured["bootstrap_python"])
+            updater.install(self.state, service_kind="systemd", root=self.root)
+
+        saved = json.loads((self.state / "update.json").read_text())
+        self.assertEqual(str(recorded), saved["bootstrap_python"])
+        self.assertEqual(
+            updater._launcher(self.root, recorded, "agent_bridge.cli"),
+            (self.root / "bin/agent-bridge").read_text(),
+        )
+        run.assert_not_called()
 
 
 class CrashAndHealthTests(UpdateFixture):
@@ -1631,6 +1769,497 @@ class GitHubHttpsReleaseTests(UpdateFixture):
         linked_state = link_ancestor / "existing_parent" / "state"
         with self.assertRaisesRegex(ValueError, "symlinked directory"):
             updater._validate_write_target(linked_state, label="state directory", expect_dir=True)
+
+
+class ServiceStateProbeTests(UpdateFixture):
+    def test_probe_returns_absent_only_for_confirmed_missing_units_and_jobs(self):
+        launcher = str(self.root / "bin/agent-bridge")
+        systemd_missing = Mock(returncode=4, stdout="", stderr="Unit example.service could not be found.")
+        with patch.object(updater.subprocess, "run", return_value=systemd_missing):
+            self.assertEqual(
+                (False, None, False),
+                updater._probe_broker_service_state("systemd", "example.service", launcher),
+            )
+        launchd_missing = Mock(returncode=113, stdout="", stderr="Could not find service")
+        with patch.object(updater.subprocess, "run", return_value=launchd_missing):
+            self.assertEqual(
+                (False, None, False),
+                updater._probe_broker_service_state("launchd", "com.example.bridge", launcher),
+            )
+
+    def test_probe_unknown_failures_do_not_look_absent(self):
+        launcher = str(self.root / "bin/agent-bridge")
+        for kind in ("systemd", "launchd"):
+            for error in (RuntimeError("probe failed"), updater.UpdateUncertain("probe timed out")):
+                with (
+                    self.subTest(kind=kind, error=type(error).__name__),
+                    patch.object(updater, "_run", side_effect=error),
+                    self.assertRaises(RuntimeError),
+                ):
+                    updater._probe_broker_service_state(kind, "example.service", launcher)
+
+    def test_failed_probe_aborts_install_before_writes_or_service_control(self):
+        service_path = self.home / ".config/systemd/user/cli-agent-bridge.service"
+        for error in (RuntimeError("probe failed"), updater.UpdateUncertain("probe timed out")):
+            commands: list[list[str]] = []
+
+            def _run(cmd, timeout=10, error=error, commands=commands):
+                commands.append(cmd)
+                if cmd[:3] == ["systemctl", "--user", "show"]:
+                    raise error
+                raise AssertionError(f"Unexpected service command {cmd}")
+
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(updater.Path, "home", return_value=self.home),
+                patch.object(updater, "_run", side_effect=_run),
+                self.assertRaises(RuntimeError),
+            ):
+                updater.install_broker_service(
+                    self.state,
+                    root=self.root,
+                    service_kind="systemd",
+                    service_name="cli-agent-bridge.service",
+                    enable=True,
+                    force=True,
+                )
+
+            self.assertEqual(1, len(commands))
+            self.assertEqual(["systemctl", "--user", "show"], commands[0][:3])
+            self.assertFalse(service_path.exists())
+            self.assertFalse((self.root / "bin").exists())
+
+    def test_confirmed_missing_systemd_fresh_install_starts_and_verifies(self):
+        service_path = self.home / ".config/systemd/user/cli-agent-bridge.service"
+        launcher = str(self.root / "bin/agent-bridge")
+        started = {"value": False}
+
+        def _subprocess_run(argv, **_kwargs):
+            if argv[:3] == ["systemctl", "--user", "show"]:
+                if not started["value"]:
+                    return Mock(returncode=4, stdout="", stderr="Unit example.service could not be found.")
+                return Mock(
+                    returncode=0,
+                    stdout=(
+                        "LoadState=loaded\nActiveState=active\nMainPID=9999\n"
+                        f"ExecStart={{ path={launcher} ; }}\n"
+                    ),
+                    stderr="",
+                )
+            if argv[:3] == ["systemctl", "--user", "start"]:
+                started["value"] = True
+            return Mock(returncode=0, stdout="", stderr="")
+
+        async def _request(_state, method, args):
+            if method == "agent_update_status":
+                return {"pid": 9999, "version": "0.2.12"}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater.subprocess, "run", side_effect=_subprocess_run),
+            patch.object(updater, "_expected_managed_version", return_value="0.2.12"),
+            patch("agent_bridge.broker.request", side_effect=_request),
+        ):
+            result = updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="systemd",
+                service_name="cli-agent-bridge.service",
+                enable=True,
+                force=True,
+            )
+
+        self.assertTrue(started["value"])
+        self.assertEqual(9999, result["pid"])
+        self.assertTrue(service_path.is_file())
+
+
+class BrokerServiceRollbackTests(UpdateFixture):
+    def test_failed_start_restores_systemd_enablement_symlink(self):
+        unit = self.home / ".config/systemd/user/cli-agent-bridge.service"
+        link = unit.parent / "default.target.wants" / unit.name
+        link.parent.mkdir(parents=True)
+        for was_enabled in (False, True):
+            with self.subTest(was_enabled=was_enabled):
+                unit.write_text("[Service]\nExecStart=/old/agent-bridge serve\n")
+                link.unlink(missing_ok=True)
+                if was_enabled:
+                    link.symlink_to("../original.service")
+
+                def run(cmd, timeout=10):
+                    if cmd[:3] == ["systemctl", "--user", "show"]:
+                        return "LoadState=loaded\nActiveState=inactive\nMainPID=0\n"
+                    if cmd[:3] == ["systemctl", "--user", "enable"]:
+                        link.unlink(missing_ok=True)
+                        link.symlink_to(unit)
+                    if cmd[:3] == ["systemctl", "--user", "start"]:
+                        raise RuntimeError("start failed")
+                    return ""
+
+                with (
+                    patch.object(updater.Path, "home", return_value=self.home),
+                    patch.object(updater, "_run", side_effect=run),
+                    self.assertRaisesRegex(RuntimeError, "start failed"),
+                ):
+                    updater.install_broker_service(self.state, root=self.root, service_kind="systemd", enable=True, force=True)
+                self.assertEqual(was_enabled, link.is_symlink())
+                if was_enabled:
+                    self.assertEqual("../original.service", os.readlink(link))
+
+    def test_restore_failure_stops_service_commands_and_keeps_maintenance(self):
+        unit = self.home / ".config/systemd/user/cli-agent-bridge.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text("[Service]\nExecStart=/old/agent-bridge serve\n")
+        commands, methods = [], []
+
+        def run(cmd, timeout=10):
+            commands.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return "LoadState=loaded\nActiveState=active\nMainPID=4242\nExecStart={ path=/old/agent-bridge ; }\n"
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                raise RuntimeError("activation failed")
+            return ""
+
+        async def request(_state, method, args):
+            methods.append(method)
+            return {"token": "test-lease", "broker_pid": 4242, "expires_at": time.time() + 180}
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=run),
+            patch.object(updater, "_restore_file_snapshot", side_effect=OSError("disk failure")),
+            patch("agent_bridge.broker.request", side_effect=request),
+            self.assertRaises(updater.UpdateUncertain),
+        ):
+            updater.install_broker_service(self.state, root=self.root, service_kind="systemd", enable=True, force=True)
+        self.assertEqual(["systemctl", "--user", "restart", unit.name], commands[-1])
+        self.assertEqual(["agent_update_prepare"], methods)
+
+    def test_updater_enable_probes_before_any_file_changes(self):
+        before = {p.relative_to(self.home): p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+        for error in (updater.UpdateUncertain("timeout"), RuntimeError("probe failed")):
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(updater.Path, "home", return_value=self.home),
+                patch.object(updater, "_run", side_effect=error),
+                self.assertRaises(type(error)),
+            ):
+                updater.install(self.state, root=self.root, service_kind="systemd", enable=True)
+            self.assertEqual(before, {p.relative_to(self.home): p.read_bytes() for p in self.home.rglob("*") if p.is_file()})
+
+    def test_launchd_unknown_or_conflicting_states_are_not_inactive(self):
+        for output in ("state = novel-unknown\n", "state = running\nstate = waiting\n", "pid = 42\n"):
+            with self.subTest(output=output), patch.object(updater, "_run", return_value=output):
+                with self.assertRaises(RuntimeError):
+                    updater._probe_broker_service_state("launchd", "com.example.bridge", "/example/bridge")
+
+    def test_active_systemd_migration_failure_restores_unit_mode_and_service_state(self):
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True)
+        unit_path = unit_dir / "cli-agent-bridge.service"
+        old_unit = "[Unit]\n[Service]\nExecStart=/old/.venv/bin/agent-bridge serve\n"
+        unit_path.write_text(old_unit)
+        unit_path.chmod(0o640)
+        commands: list[list[str]] = []
+        restart_count = 0
+
+        def _run(cmd, timeout=10):
+            nonlocal restart_count
+            commands.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return "ActiveState=active\nMainPID=4242\nExecStart={ path=/old/.venv/bin/agent-bridge ; }\n"
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                restart_count += 1
+                if restart_count == 1:
+                    raise RuntimeError("activation failed")
+            return ""
+
+        async def _request(_state, method, args):
+            if method == "agent_update_prepare":
+                return {"token": "tok-rollback", "expires_at": time.time() + 180, "broker_pid": 4242}
+            if method == "agent_update_finish":
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_run),
+            patch("agent_bridge.broker.request", side_effect=_request),
+            self.assertRaisesRegex(RuntimeError, "activation failed"),
+        ):
+            updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="systemd",
+                service_name="cli-agent-bridge.service",
+                enable=True,
+                force=True,
+            )
+
+        self.assertEqual(old_unit, unit_path.read_text())
+        self.assertEqual(0o640, unit_path.stat().st_mode & 0o777)
+        self.assertEqual(2, restart_count)
+        self.assertEqual(
+            [
+                ["systemctl", "--user", "restart", "cli-agent-bridge.service"],
+                ["systemctl", "--user", "restart", "cli-agent-bridge.service"],
+            ],
+            [cmd for cmd in commands if cmd[:3] == ["systemctl", "--user", "restart"]],
+        )
+
+    def test_inactive_systemd_start_failure_restores_unit_without_restarting_it(self):
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True)
+        unit_path = unit_dir / "cli-agent-bridge.service"
+        old_unit = "[Unit]\n[Service]\nExecStart=/old/.venv/bin/agent-bridge serve\n"
+        unit_path.write_text(old_unit)
+        unit_path.chmod(0o644)
+        commands: list[list[str]] = []
+
+        def _run(cmd, timeout=10):
+            commands.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return "ActiveState=inactive\nMainPID=0\nExecStart=\n"
+            if cmd[:3] == ["systemctl", "--user", "start"]:
+                raise RuntimeError("start failed")
+            return ""
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_run),
+            patch("agent_bridge.broker.request") as request,
+            self.assertRaisesRegex(RuntimeError, "start failed"),
+        ):
+            updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="systemd",
+                service_name="cli-agent-bridge.service",
+                enable=True,
+                force=True,
+            )
+
+        request.assert_not_called()
+        self.assertEqual(old_unit, unit_path.read_text())
+        self.assertEqual(0o644, unit_path.stat().st_mode & 0o777)
+        self.assertFalse(any(cmd[:3] == ["systemctl", "--user", "restart"] for cmd in commands))
+        self.assertIn(["systemctl", "--user", "stop", "cli-agent-bridge.service"], commands)
+
+    def test_launchd_migration_failure_restores_previous_plist_and_unrelated_jobs(self):
+        launch_dir = self.home / "Library/LaunchAgents"
+        launch_dir.mkdir(parents=True)
+        plist_path = launch_dir / "com.example.bridge.plist"
+        old_plist = b"<plist><dict><key>Label</key><string>com.example.bridge</string></dict></plist>\n"
+        plist_path.write_bytes(old_plist)
+        plist_path.chmod(0o640)
+        unrelated = launch_dir / "com.example.other.plist"
+        unrelated_bytes = b"<plist><dict><key>Label</key><string>com.example.other</string></dict></plist>\n"
+        unrelated.write_bytes(unrelated_bytes)
+        commands: list[list[str]] = []
+        bootstrap_count = 0
+
+        def _run(cmd, timeout=10):
+            nonlocal bootstrap_count
+            commands.append(cmd)
+            if cmd[:2] == ["launchctl", "print"]:
+                return "\tstate = running\n\tpid = 7777\n\tprogram = /old/agent-bridge\n"
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                bootstrap_count += 1
+                if bootstrap_count == 1:
+                    raise RuntimeError("bootstrap failed")
+            return ""
+
+        async def _request(_state, method, args):
+            if method == "agent_update_prepare":
+                return {"token": "tok-launchd", "expires_at": time.time() + 180, "broker_pid": 7777}
+            if method == "agent_update_finish":
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_run),
+            patch("agent_bridge.broker.request", side_effect=_request),
+            self.assertRaisesRegex(RuntimeError, "bootstrap failed"),
+        ):
+            updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="launchd",
+                service_name="com.example.bridge.plist",
+                enable=True,
+                force=True,
+            )
+
+        self.assertEqual(old_plist, plist_path.read_bytes())
+        self.assertEqual(0o640, plist_path.stat().st_mode & 0o777)
+        self.assertEqual(unrelated_bytes, unrelated.read_bytes())
+        self.assertEqual(2, bootstrap_count)
+        self.assertEqual(
+            [["launchctl", "bootout", f"gui/{os.getuid()}/com.example.bridge"]],
+            [cmd for cmd in commands if cmd[:2] == ["launchctl", "bootout"]],
+        )
+
+    def test_launchd_verification_failure_reloads_previous_job_and_removes_candidate(self):
+        launch_dir = self.home / "Library/LaunchAgents"
+        launch_dir.mkdir(parents=True)
+        plist_path = launch_dir / "com.example.bridge.plist"
+        old_plist = b"<plist><dict><key>Label</key><string>com.example.bridge</string></dict></plist>\n"
+        plist_path.write_bytes(old_plist)
+        plist_path.chmod(0o600)
+        commands: list[list[str]] = []
+
+        def _run(cmd, timeout=10):
+            commands.append(cmd)
+            if cmd[:2] == ["launchctl", "print"]:
+                return "\tstate = running\n\tpid = 7777\n\tprogram = /old/agent-bridge\n"
+            return ""
+
+        async def _request(_state, method, args):
+            if method == "agent_update_prepare":
+                return {"token": "tok-verify", "expires_at": time.time() + 180, "broker_pid": 7777}
+            if method == "agent_update_finish":
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_run),
+            patch.object(updater, "_verify_migrated_broker", side_effect=RuntimeError("verification failed")),
+            patch("agent_bridge.broker.request", side_effect=_request),
+            self.assertRaisesRegex(RuntimeError, "verification failed"),
+        ):
+            updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="launchd",
+                service_name="com.example.bridge.plist",
+                enable=True,
+                force=True,
+            )
+
+        self.assertEqual(old_plist, plist_path.read_bytes())
+        self.assertEqual(0o600, plist_path.stat().st_mode & 0o777)
+        label = f"gui/{os.getuid()}/com.example.bridge"
+        self.assertEqual(
+            [
+                ["launchctl", "bootout", label],
+                ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+                ["launchctl", "bootout", label],
+                ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+            ],
+            [cmd for cmd in commands if cmd[:2] in (["launchctl", "bootout"], ["launchctl", "bootstrap"])],
+        )
+
+    def test_signal_terminated_service_command_is_uncertain(self):
+        killed = Mock(returncode=-9, stdout="", stderr="")
+        with (
+            patch.object(updater.subprocess, "run", return_value=killed),
+            self.assertRaises(updater.UpdateUncertain),
+        ):
+            updater._run(["systemctl", "--user", "restart", "cli-agent-bridge.service"], timeout=10)
+
+    def test_uncertain_rollback_stops_further_commands_and_leaves_maintenance(self):
+        self._assert_rollback_stops(updater.UpdateUncertain("rollback reload timed out"))
+
+    def test_failed_rollback_reload_stops_further_commands_and_leaves_maintenance(self):
+        self._assert_rollback_stops(RuntimeError("rollback reload failed"))
+
+    def _assert_rollback_stops(self, rollback_error):
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True)
+        unit_path = unit_dir / "cli-agent-bridge.service"
+        old_unit = "[Unit]\n[Service]\nExecStart=/old/.venv/bin/agent-bridge serve\n"
+        unit_path.write_text(old_unit)
+        unit_path.chmod(0o600)
+        commands: list[list[str]] = []
+        activation_failed = {"value": False}
+        finish_calls: list[dict] = []
+
+        def _run(cmd, timeout=10):
+            commands.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return "ActiveState=active\nMainPID=4242\nExecStart={ path=/old/.venv/bin/agent-bridge ; }\n"
+            if cmd[:3] == ["systemctl", "--user", "daemon-reload"]:
+                if activation_failed["value"]:
+                    raise rollback_error
+                return ""
+            if cmd[:3] == ["systemctl", "--user", "enable"]:
+                return ""
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                if not activation_failed["value"]:
+                    activation_failed["value"] = True
+                    raise RuntimeError("activation restart failed")
+                return ""
+            return ""
+
+        async def _request(_state, method, args):
+            if method == "agent_update_prepare":
+                return {"token": "tok-uncertain", "expires_at": time.time() + 180, "broker_pid": 4242}
+            if method == "agent_update_finish":
+                finish_calls.append(dict(args))
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_run),
+            patch("agent_bridge.broker.request", side_effect=_request),
+            self.assertRaises(updater.UpdateUncertain),
+        ):
+            updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="systemd",
+                service_name="cli-agent-bridge.service",
+                enable=True,
+                force=True,
+            )
+
+        self.assertTrue(activation_failed["value"])
+        self.assertEqual(old_unit, unit_path.read_text())
+        self.assertEqual(0o600, unit_path.stat().st_mode & 0o777)
+        restart_commands = [cmd for cmd in commands if cmd[:3] == ["systemctl", "--user", "restart"]]
+        self.assertEqual(1, len(restart_commands))
+        self.assertEqual(
+            ["systemctl", "--user", "restart", "cli-agent-bridge.service"],
+            restart_commands[0],
+        )
+        self.assertEqual(["systemctl", "--user", "daemon-reload"], commands[-1])
+        self.assertEqual([], finish_calls)
+
+    def test_disabled_install_restores_previous_unit_and_removes_new_launchers_on_write_failure(self):
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True)
+        unit_path = unit_dir / "cli-agent-bridge.service"
+        old_unit = "[Unit]\n[Service]\nExecStart=/old/.venv/bin/agent-bridge serve\n"
+        unit_path.write_text(old_unit)
+        unit_path.chmod(0o640)
+
+        def _fail_after_write(_item):
+            raise RuntimeError("write callback failed")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run") as run,
+            self.assertRaisesRegex(RuntimeError, "write callback failed"),
+        ):
+            updater.install_broker_service(
+                self.state,
+                root=self.root,
+                service_kind="systemd",
+                service_name="cli-agent-bridge.service",
+                enable=False,
+                force=True,
+                on_write=_fail_after_write,
+            )
+
+        run.assert_not_called()
+        self.assertEqual(old_unit, unit_path.read_text())
+        self.assertEqual(0o640, unit_path.stat().st_mode & 0o777)
+        self.assertFalse((self.root / "bin/agent-bridge").exists())
+        self.assertFalse((self.root / "bin/agent-bridge-update").exists())
 
 
 if __name__ == "__main__":

@@ -55,4 +55,4 @@ agent-bridge call agent_hosts --json '{}'
 
 ## 首次启用记录
 
-旧 Broker PID <process-02-pid> 没有配置监视器或新接口，修改源文件不能让已载入内存的 Python 代码自动变化，经核实空闲窗口后执行了单次 Broker 升级：PID <process-02-pid> 变为 2166491，新即时刷新接口返回正常，Web PID <process-01-pid> 与共享 Codex daemon PID <process-14-pid> 启动标识均保持不变。随后合并 `linux-node-b` 配置后协调端 PID 不变，远端服务 PID <process-07-pid> 运行正常。复查时 `macos-node` 因私网链路暂时离线（`<vpn-ip>:22` 超时），配置与注册保持原样。
+旧 Broker PID <process-01-pid> 没有配置监视器或新接口，修改源文件不能让已载入内存的 Python 代码自动变化，经核实空闲窗口后执行了单次 Broker 升级：PID <process-01-pid> 变为 <process-07-pid>，新即时刷新接口返回正常，Web PID <process-08-pid> 与共享 Codex daemon PID <process-09-pid> 启动标识均保持不变。随后合并 `linux-node-b` 配置后协调端 PID 不变，远端服务 PID <process-10-pid> 运行正常。复查时 `macos-node` 因私网链路暂时离线（`<vpn-ip>:22` 超时），配置与注册保持原样。

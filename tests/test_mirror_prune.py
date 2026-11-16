@@ -10,7 +10,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from agent_bridge import mirror_prune
 from agent_bridge.cli import build_parser, main
 from agent_bridge.config import Profile
 from agent_bridge.errors import BridgeError
@@ -142,6 +144,7 @@ class MirrorPruneTests(unittest.TestCase):
         identity = FileNodeIdentityStore(self.state).load_or_create()
         with self.store.connection(write=True) as db:
             local_only_seq = self.store.event(db, "task_queued", {"task": "local-work"})
+            local_only_created = db.execute("SELECT created FROM events WHERE seq=?", (local_only_seq,)).fetchone()[0]
 
         origin = _raw_event(seq=5, payload={"blob": "a" * 300})
         direct_seq = _insert_legacy_mirror(
@@ -155,7 +158,16 @@ class MirrorPruneTests(unittest.TestCase):
         echo_1 = _wrap_hop(origin, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=50)
         echo_1_seq = _insert_legacy_mirror(self.store, echo_1)
         self_echo = _wrap_hop(
-            _raw_event(host_id="local", node_id=identity.node_id, generation=identity.state_generation, seq=1),
+            _raw_event(
+                host_id="local",
+                node_id=identity.node_id,
+                generation=identity.state_generation,
+                seq=local_only_seq,
+                local_id=str(local_only_seq),
+                kind="task_queued",
+                payload={"task": "local-work"},
+                created=local_only_created,
+            ),
             host_id=HOST_B,
             node_id=NODE_B,
             generation=GEN_B,
@@ -209,6 +221,264 @@ class MirrorPruneTests(unittest.TestCase):
         self.assertEqual(9, remaining[0]["origin_seq"])
         self.assertEqual([direct_second_seq], event_seqs)
         self.assertNotEqual(wrapped_first_seq, remaining[0]["local_seq"])
+
+    def test_preserves_conflicting_payloads_for_same_origin_and_prunes_exact_duplicates(self):
+        first = _raw_event(seq=11, payload={"text": "first"})
+        other = _raw_event(seq=11, payload={"text": "different"})
+        first_seq = _insert_legacy_mirror(self.store, first)
+        other_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(other, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=50)
+        )
+        _insert_legacy_mirror(
+            self.store, _wrap_hop(first, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=51)
+        )
+        _insert_legacy_mirror(
+            self.store, _wrap_hop(other, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=52)
+        )
+
+        dry = self.store.prune_duplicate_mirrors(dry_run=True)
+        self.assertEqual(4, dry["total_mirrors"])
+        self.assertEqual(2, dry["kept_mirrors"])
+        self.assertEqual(2, dry["pruned_mirrors"])
+        self.assertEqual(2, dry["pruned_duplicates"])
+        self.assertEqual(0, dry["pruned_self_origins"])
+        with self.store.connection() as db:
+            self.assertEqual(4, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
+
+        result = self.store.prune_duplicate_mirrors(dry_run=False)
+        self.assertEqual(2, result["kept_mirrors"])
+        self.assertEqual(2, result["pruned_mirrors"])
+        self.assertEqual(2, result["pruned_duplicates"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+        self.assertEqual({first_seq, other_seq}, remaining)
+        self.assertEqual({first_seq, other_seq}, event_seqs)
+
+    def test_self_origin_pruning_requires_matching_current_generation_original(self):
+        identity = FileNodeIdentityStore(self.state).load_or_create()
+        with self.store.connection(write=True) as db:
+            local_seq = self.store.event(db, "task_finished", {"status": "done"})
+            created = db.execute("SELECT created FROM events WHERE seq=?", (local_seq,)).fetchone()[0]
+        proven = _raw_event(
+            host_id="local", node_id=identity.node_id, generation=identity.state_generation,
+            seq=local_seq, local_id=str(local_seq), kind="task_finished",
+            payload={"status": "done"}, created=created,
+        )
+        _insert_legacy_mirror(
+            self.store, _wrap_hop(proven, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=60)
+        )
+        _insert_legacy_mirror(
+            self.store, _wrap_hop(proven, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=61)
+        )
+        conflicting = _raw_event(
+            host_id="local", node_id=identity.node_id, generation=identity.state_generation,
+            seq=local_seq, local_id=str(local_seq), kind="task_finished",
+            payload={"status": "different"}, created=created,
+        )
+        conflicting_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(conflicting, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=62)
+        )
+        old = _raw_event(
+            host_id="local", node_id=identity.node_id, generation="old-generation",
+            seq=70, local_id="70",
+        )
+        old_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(old, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=63)
+        )
+        missing = _raw_event(
+            host_id="local", node_id=identity.node_id, generation=identity.state_generation,
+            seq=71, local_id="71",
+        )
+        missing_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(missing, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=64)
+        )
+
+        dry = self.store.prune_duplicate_mirrors(dry_run=True)
+        self.assertEqual(5, dry["total_mirrors"])
+        self.assertEqual(3, dry["kept_mirrors"])
+        self.assertEqual(2, dry["pruned_mirrors"])
+        self.assertEqual(2, dry["pruned_self_origins"])
+        self.assertEqual(0, dry["pruned_duplicates"])
+        with self.store.connection() as db:
+            self.assertEqual(5, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
+
+        result = self.store.prune_duplicate_mirrors(dry_run=False)
+        self.assertEqual(3, result["kept_mirrors"])
+        self.assertEqual(2, result["pruned_mirrors"])
+        self.assertEqual(2, result["pruned_self_origins"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+        self.assertEqual({conflicting_seq, old_seq, missing_seq}, remaining)
+        self.assertEqual({local_seq, conflicting_seq, old_seq, missing_seq}, event_seqs)
+
+    def test_revalidates_missing_self_origin_original_before_apply(self):
+        identity = FileNodeIdentityStore(self.state).load_or_create()
+        with self.store.connection(write=True) as db:
+            local_seq = self.store.event(db, "task_finished", {"status": "done"})
+            created = db.execute("SELECT created FROM events WHERE seq=?", (local_seq,)).fetchone()[0]
+        proven = _raw_event(
+            host_id="local", node_id=identity.node_id, generation=identity.state_generation,
+            seq=local_seq, local_id=str(local_seq), kind="task_finished",
+            payload={"status": "done"}, created=created,
+        )
+        echo_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(proven, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=60)
+        )
+        classify = mirror_prune._classify_plan
+
+        def classify_then_remove_original(plan_db, **kwargs):
+            stats = classify(plan_db, **kwargs)
+            with self.store.connection(write=True) as db:
+                db.execute("DELETE FROM events WHERE seq=?", (local_seq,))
+            return stats
+
+        with patch.object(mirror_prune, "_classify_plan", side_effect=classify_then_remove_original):
+            result = self.store.prune_duplicate_mirrors(dry_run=False)
+
+        self.assertEqual(1, result["kept_mirrors"])
+        self.assertEqual(0, result["pruned_mirrors"])
+        self.assertEqual(0, result["pruned_self_origins"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+        self.assertEqual({echo_seq}, remaining)
+        self.assertEqual({echo_seq}, event_seqs)
+
+    def test_revalidates_new_delivery_protection_before_apply(self):
+        self.store.parent_control("p1", "parent_register", 0, "register-p1", "native-p1", str(self.state))
+        origin = _raw_event(seq=12)
+        canonical_seq = _insert_legacy_mirror(self.store, origin)
+        protected_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(origin, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=52)
+        )
+        repair = mirror_prune._apply_origin_repairs
+
+        def repair_then_add_delivery(store, plan_db, *, batch_size):
+            repaired = repair(store, plan_db, batch_size=batch_size)
+            with store.connection(write=True) as db:
+                db.execute("INSERT INTO deliveries(event_seq,parent_id) VALUES(?,'p1')", (protected_seq,))
+            return repaired
+
+        with patch.object(mirror_prune, "_apply_origin_repairs", side_effect=repair_then_add_delivery):
+            result = self.store.prune_duplicate_mirrors(dry_run=False)
+
+        self.assertEqual(2, result["kept_mirrors"])
+        self.assertEqual(0, result["pruned_mirrors"])
+        self.assertEqual(0, result["pruned_duplicates"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+        self.assertEqual({canonical_seq, protected_seq}, remaining)
+        self.assertEqual({canonical_seq, protected_seq}, event_seqs)
+
+    def test_revalidates_survivor_content_before_apply(self):
+        origin = _raw_event(seq=13, payload={"blob": "keeper-content"})
+        keeper_seq = _insert_legacy_mirror(self.store, origin)
+        candidate_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(origin, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=53)
+        )
+        repair = mirror_prune._apply_origin_repairs
+
+        def repair_then_mutate_keeper(store, plan_db, *, batch_size):
+            repaired = repair(store, plan_db, batch_size=batch_size)
+            with store.connection(write=True) as db:
+                data = json.loads(db.execute("SELECT data FROM events WHERE seq=?", (keeper_seq,)).fetchone()[0])
+                data["payload"] = {"blob": "mutated-after-plan"}
+                db.execute("UPDATE events SET data=? WHERE seq=?", (encode(data), keeper_seq))
+            return repaired
+
+        with patch.object(mirror_prune, "_apply_origin_repairs", side_effect=repair_then_mutate_keeper):
+            result = self.store.prune_duplicate_mirrors(dry_run=False)
+
+        self.assertEqual(2, result["total_mirrors"])
+        self.assertEqual(2, result["kept_mirrors"])
+        self.assertEqual(0, result["pruned_mirrors"])
+        self.assertEqual(0, result["pruned_duplicates"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+            candidate_data = json.loads(
+                db.execute("SELECT data FROM events WHERE seq=?", (candidate_seq,)).fetchone()[0]
+            )
+        self.assertEqual({keeper_seq, candidate_seq}, remaining)
+        self.assertEqual({keeper_seq, candidate_seq}, event_seqs)
+        self.assertIn("keeper-content", json.dumps(candidate_data))
+
+    def test_revalidates_duplicate_survivor_in_every_batch_without_cache(self):
+        origin = _raw_event(seq=14, payload={"blob": "three-copies"})
+        keeper_seq = _insert_legacy_mirror(self.store, origin)
+        second_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(origin, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=54)
+        )
+        third_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(origin, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=55)
+        )
+        repair = mirror_prune._apply_origin_repairs
+        resolve = mirror_prune._resolve_local_identity
+        resolve_calls = {"count": 0}
+
+        def repair_then_remove_keeper(store, plan_db, *, batch_size):
+            repaired = repair(store, plan_db, batch_size=batch_size)
+            with store.connection(write=True) as db:
+                db.execute("DELETE FROM peer_event_mirrors WHERE local_seq=?", (keeper_seq,))
+                db.execute("DELETE FROM events WHERE seq=?", (keeper_seq,))
+            return repaired
+
+        def resolve_then_remove_second(store, local_node_id):
+            resolved = resolve(store, local_node_id)
+            resolve_calls["count"] += 1
+            if resolve_calls["count"] == 3:
+                with store.connection(write=True) as db:
+                    db.execute("DELETE FROM peer_event_mirrors WHERE local_seq=?", (second_seq,))
+                    db.execute("DELETE FROM events WHERE seq=?", (second_seq,))
+            return resolved
+
+        with patch.object(
+            mirror_prune, "_apply_origin_repairs", side_effect=repair_then_remove_keeper
+        ), patch.object(
+            mirror_prune, "_resolve_local_identity", side_effect=resolve_then_remove_second
+        ):
+            result = self.store.prune_duplicate_mirrors(dry_run=False, batch_size=1)
+
+        self.assertEqual(3, resolve_calls["count"])
+        self.assertEqual(3, result["total_mirrors"])
+        self.assertEqual(3, result["kept_mirrors"])
+        self.assertEqual(0, result["pruned_mirrors"])
+        self.assertEqual(0, result["pruned_duplicates"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+        self.assertEqual({third_seq}, remaining)
+        self.assertEqual({third_seq}, event_seqs)
+
+    def test_revalidates_duplicate_survivor_before_apply(self):
+        origin = _raw_event(seq=9, payload={"blob": "payload" * 40})
+        canonical_seq = _insert_legacy_mirror(self.store, origin)
+        echo_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(origin, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=50)
+        )
+        repair = mirror_prune._apply_origin_repairs
+
+        def repair_then_remove_canonical(store, plan_db, *, batch_size):
+            repaired = repair(store, plan_db, batch_size=batch_size)
+            with store.connection(write=True) as db:
+                db.execute("DELETE FROM peer_event_mirrors WHERE local_seq=?", (canonical_seq,))
+                db.execute("DELETE FROM events WHERE seq=?", (canonical_seq,))
+            return repaired
+
+        with patch.object(mirror_prune, "_apply_origin_repairs", side_effect=repair_then_remove_canonical):
+            result = self.store.prune_duplicate_mirrors(dry_run=False)
+
+        self.assertEqual(2, result["kept_mirrors"])
+        self.assertEqual(0, result["pruned_mirrors"])
+        self.assertEqual(0, result["pruned_duplicates"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+        self.assertEqual({echo_seq}, remaining)
+        self.assertEqual({echo_seq}, event_seqs)
 
     def test_repairs_depth_above_32_truncated_origins_and_distinguishes_from_self_origin(self):
         identity = FileNodeIdentityStore(self.state).load_or_create()
@@ -291,19 +561,44 @@ class MirrorPruneTests(unittest.TestCase):
 
         self.assertEqual(6, result["total_mirrors"])
         self.assertEqual(4, result["protected_mirrors"])
-        self.assertEqual(4, result["kept_mirrors"])
-        self.assertEqual(2, result["pruned_mirrors"])
+        self.assertEqual(5, result["kept_mirrors"])
+        self.assertEqual(1, result["pruned_mirrors"])
         self.assertEqual(1, result["pruned_duplicates"])
-        self.assertEqual(1, result["pruned_self_origins"])
+        self.assertEqual(0, result["pruned_self_origins"])
 
         with self.store.connection() as db:
             remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors").fetchall()}
             event_seqs = {row[0] for row in db.execute("SELECT seq FROM events").fetchall()}
-        self.assertEqual({delivered_seq, notified_seq, queued_seq, protected_self_seq}, remaining)
-        self.assertEqual({delivered_seq, notified_seq, queued_seq, protected_self_seq}, event_seqs)
+        self.assertEqual(
+            {delivered_seq, notified_seq, queued_seq, protected_self_seq, unprotected_self_seq},
+            remaining,
+        )
+        self.assertEqual(
+            {delivered_seq, notified_seq, queued_seq, protected_self_seq, unprotected_self_seq},
+            event_seqs,
+        )
         self.assertNotIn(unprotected_direct_seq, remaining)
-        self.assertNotIn(unprotected_self_seq, remaining)
+        self.assertIn(unprotected_self_seq, remaining)
         self.assertEqual(999, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+
+    def test_keeps_self_origin_when_current_generation_is_unavailable(self):
+        self_node = "explicit-self-node"
+        base = _raw_event(host_id="local", node_id=self_node, generation=GEN_A, seq=1)
+        echo_seq = _insert_legacy_mirror(
+            self.store, _wrap_hop(base, host_id=HOST_B, node_id=NODE_B, generation=GEN_B, seq=20)
+        )
+
+        result = self.store.prune_duplicate_mirrors(dry_run=False, local_node_id=self_node)
+
+        self.assertFalse((self.state / IDENTITY_FILENAME).exists())
+        self.assertEqual(1, result["kept_mirrors"])
+        self.assertEqual(0, result["pruned_mirrors"])
+        self.assertEqual(0, result["pruned_self_origins"])
+        with self.store.connection() as db:
+            remaining = {row[0] for row in db.execute("SELECT local_seq FROM peer_event_mirrors")}
+            event_seqs = {row[0] for row in db.execute("SELECT seq FROM events")}
+        self.assertEqual({echo_seq}, remaining)
+        self.assertEqual({echo_seq}, event_seqs)
 
     def test_keep_self_origins_retains_one_copy_and_does_not_create_identity_file(self):
         self.assertFalse((self.state / IDENTITY_FILENAME).exists())
