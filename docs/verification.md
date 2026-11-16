@@ -1,306 +1,63 @@
-# 2026-10-27 Antigravity 接入检查
+> Language: English | [中文](zh/verification.md)
 
-新增 Antigravity 运行时、模型发现、conversation ID 续接、SIGINT 中断、原生权限拒绝处理、用量与限额解析。每个任务一个原生进程，等待终态结果、进程退出和 stderr 读完后才返回。
+# Verification Records
 
-- 126 项自动测试通过，Ruff 检查通过；其中新增 12 项 Antigravity 测试。
-- 离线 CLI fixture 覆盖多轮与跨进程记忆、取消后重开、进程退出但无终态、错误 JSON、错误会话 ID、额外终态、非零退出覆盖 SUCCESS、延迟且超过 stderr 缓冲长度的权限拒绝、累计计数重置、额度耗尽。
-- 真实 broker/worker 的离线组合检查通过：隔离副本、任务存储、连续追问、文件变化提取、220 token 累计均有断言；只读请求在创建会话前拒绝。
-- 本机真实 `agy 1.4.3` 查询返回 13 个模型，启动 NDJSON 会话收到 init，conversation ID 与请求的模型字段正常。没有发送推理提示，原生进程已关闭。
+## 2026-10-27 Antigravity Integration Check
 
-未验证：真实供应商推理、真实工具权限/执行、真实 SIGINT 后续接、真实额度耗尽。未增加默认 profile，未改变私有配置或重启共享服务。仅支持文本及 workspace-write；消费套餐的使用限制见 README。
+Added the Antigravity runtime, model discovery, `conversation` ID resume, `SIGINT` cancellation, native permission-denial failure tracking, and metered/cooldown parsing. One native CLI process runs per turn, completing only after terminal result events, process exit, and stderr completion.
 
-# 2026-10-22 开发检查
+- 126 automated tests passed and Ruff clean (including 12 new Antigravity tests).
+- Offline CLI fixture coverage verified multi-turn/cross-process memory, cancel + reopen persistence, exit without terminal result, malformed JSON, wrong session ID, extra terminal results, non-zero exit overriding `SUCCESS`, delayed permission denial beyond buffer size, usage baseline resets, and quota exhaustion.
+- Isolated broker/worker integration passed (file copy isolation, task store, follow-ups, diff extraction, 220 cumulative tokens; pre-creation rejection on `read-only`).
+- Real `agy 1.4.3` query returned 13 models and launched an NDJSON session confirming `init`, conversation ID, and model without sending paid inference prompts.
 
-这是可运行开发版本的检查记录。已完成本机跨程序执行与原父会话冷恢复；真实 Telegram 消息检查仍待授权。
+Unverified: real provider inference, real tool permissions/execution, live `SIGINT` resume, and live quota exhaustion. Consumer subscription terms remain governed by the notice in README.
 
-自动检查 57 项通过，包含实际 MCP 客户端、Unix socket、独立进程、服务重启、worker 被杀、并发事务、预算预留、原生结束判断、通知去重、Telegram 暂停和删除标记、首轮前的子会话登记，以及继承环境不得改变声明的供应商。父会话计数、Claude 累计差值、价格字段、限流等待、三种选择策略和固定任务断言也已检查。worker 崩溃保留已报告的部分用量，在途用量超过预留时不继续派发。
+## 2026-10-22 Development Verification
 
-本轮新增未提交文件快照、非 Git 副本、相对输入快照的补丁、UTF-8 分页、历史 attempt、父配置恢复、排队原因、问题截止时间、首个输出计时、服务档位和进程清单检查。使用模拟 CLI 的部分不等同于供应商真实执行。现有 codex-async 的 107 项检查在此前修改过滤功能时通过；其测试有既存的 SQLite ResourceWarning，本轮未再修改该项目。
+Automated suite: 57 tests passing covering live MCP stdio clients, Unix sockets, isolated worker processes, broker restarts, worker kill recovery, SQLite concurrency transactions, budget reservations, native terminal detection, notification deduplication, Telegram pause/deletion checks, child registration prior to first turns, inherited env isolation, parent usage accumulation, Claude cumulative deltas, pricing fields, cooldown backoff, all three selection strategies, and fixed benchmark assertions (`ruff` clean, `skill-creator` validator clean; legacy 107 `codex-async` tests also passed on filter integration).
 
-```text
-uv run ruff check src tests scripts     All checks passed
-uv run python -m unittest discover -s tests -v
-Ran 57 tests; OK
-skill-creator/scripts/quick_validate.py skills/cli-agent-bridge
-Skill is valid
-```
+Initial real-model sweep executed 17 attempts (14 completed, 3 interrupted; 3 paused, 5 closed, zero live workers left). Raw transcripts and session IDs stayed in private local directories without committing to Git.
 
-最初一轮真实模型测试有 17 个 attempt：14 个正常结束、3 个确认中断；该轮无失败或结果不明的 attempt。结束时 3 个会话暂停、5 个关闭，测试 worker 全部退出。以下数量均注明所属测试，不把不同阶段统计混成项目实际账单。原始回答和原生 ID 仅保存在私有状态目录，未放入 Git。
-
-| 检查 | Codex | Claude Code | Pi |
+| Check | Codex | Claude Code | Pi |
 | --- | --- | --- | --- |
-| 实际供应商/模型 | OpenAI Codex / gpt-6.1-sol | DeepSeek Anthropic 兼容接口 / deepseek-v4-flash | DeepSeek / deepseek-flash |
-| 读取文件并算 17+25 | 42 | 42 | 42 |
-| 原会话追问 | 正确记住 lantern | 正确记住 lantern | 正确记住 lantern |
-| 暂停时提交任务 | 保持 queued | 保持 queued | 保持 queued |
-| 运行中原生中断 | interrupted | interrupted | interrupted |
-| close、reopen 后上下文 | 原 ID、原记忆保留 | 原 ID、原记忆保留 | 原文件、原记忆保留 |
-| 只读任务尝试写文件 | 原生只读文件系统拒绝 | 无写入/编辑/shell 工具 | 无写入/编辑/shell 工具 |
+| Provider / Model | OpenAI Codex / `gpt-6.1-sol` | DeepSeek Anthropic API / `deepseek-v4-flash` | DeepSeek / `deepseek-flash` |
+| File read + `17 + 25` | `42` | `42` | `42` |
+| Follow-up memory ("lantern") | Retained | Retained | Retained |
+| Queued while paused | Stayed `queued` | Stayed `queued` | Stayed `queued` |
+| Native interrupt mid-turn | `interrupted` | `interrupted` | `interrupted` |
+| Close -> Reopen context | Preserved ID + memory | Preserved ID + memory | Preserved file + memory |
+| Read-only write attempt | Native RO sandbox blocked | No write/edit/shell tools | No write/edit/shell tools |
 
-真实写入测试中，Codex 修复 `add`，Pi 修复 `slug`，分别使用独立 worktree。主程序另起 Python 进程执行断言，两项退出码均为 0；源目录中的未提交和未跟踪文件保持原样。修改、测试结果和 patch 路径保留在任务结果中。
+Writable tasks (`add` in Codex, `slug` in Pi) ran in isolated worktrees and passed independent verification with zero edits to dirty/untracked caller checkouts (`scripts/*_smoke.py` reports kept in `<private-validation-state>/report`). Usage totaled 261,403 tokens across those 17 attempts (including prompt caching; child-only partial count rather than full project billing).
 
-私有报告：
+### Mapping Against Design Criteria (`R1`-`R6`, `E1`-`E12`)
 
-- `<private-validation-state>/report.json`
-- `<private-validation-state>/report.json`
-- `<private-validation-state>/report.json`
-- `<private-validation-state>/report.json`
+- **R1-R6**: Verified live multi-runtime reads/writes/follow-ups, cold Astra parent recovery processing Sol/Pi results plus Claude cross-check (`benchmark.md` for controlled 2-task comparisons), explicit model constraints, multi-model per-runtime isolation, and lifecycle controls (`R3` partial on sample volume).
+- **E1-E12**: Verified concurrent idempotency (`E1`), revision/pause/drain guards (`E2`), close/reopen isolation (`E3`), mid-task Pi broker restart preserving worker PID (`E4`), isolated worktrees/copies (`E5`), native terminal markers (`E6`), shared quota cooldowns (`E7`), non-zero missing usage handling (`E8`), expiring interactive approvals in Claude (`E9`), local parent notifications + Telegram filter blocking 11 unintended replies and verifying 0 bot outbox entries after fix (`E10`), interrupt continuation (`E11`), and attempt-locked `agent_review` gating (`E12`).
 
-报告由仓库 `scripts/*_smoke.py` 生成。它们会产生真实推理费用，普通单元测试不会调用这些脚本。
+## Cold Resume, Files, and Process Inspection Follow-Up
 
-费用记录中，17 个 attempt 已报告 261,403 个 token，其中包含大量缓存输入；这是部分子会话统计，不是项目总量。Claude 主循环以外的用量、部分中断时的用量和主会话开销不完整。数据库中的 `charged_tokens` 是预算核算值，包含保留的预留量，不是实际账单或实际 token 总量。
+`scripts/cold_resume_smoke.py` created an Astra coordinator session plus Sol and Pi child tasks inside an isolated service, exited Astra (`notLoaded`), let children complete, then resumed Astra cleanly under its original `gpt-6-astra / low / on-request` policy to inspect diffs, pass assertions, cross-check via Claude, accept all 3 attempts, and ACK notifications without touching source repos (`<private-validation-state>/report.json`). Earlier two failures cleanly diagnosed MCP callback permissions and ephemeral `--mcp` loss fixed via owner-only `resume_config_file`.
 
-## 与设计检查的对应
+`scripts/restart_smoke.py` validated non-Git `copy` execution with Pi across a mid-run broker restart, confirming preserved worker PID, host PIDs in cgroup (`owned_processes`), and clean exit of background `sleep` subprocesses upon session close (`restart-example-run-report.json`). Earlier Codex sandbox PID mismatch (`PID 3` inside sandbox vs host PID) stayed explicitly documented rather than misclaimed. `service_tier` alias `fast -> priority` was confirmed without paid inference (`service-tier-alias-verified.json`).
 
-| 编号 | 状态 | 证据或未完成部分 |
-| --- | --- | --- |
-| R1 | 通过 | 三个程序真实读取和追问 |
-| R2 | 通过真实完整用例 | Astra 退出后恢复同一原生会话，检查 Sol 和 Pi，再派发 Claude 复查，接受全部结果并确认通知 |
-| R3 | 部分通过 | 工具、输入、供应商、上下文条件和未知质量信息已检查；没有足够分类质量样本 |
-| R4 | 通过基本用例 | 当前开发主会话原生记录确认为 gpt-6-astra，前述 Sol 与 Pi 任务由它同时提交；三个程序保留实际配置。固定比较另有真实 Astra 分工与审查记录 |
-| R5 | 通过已列操作 | 三个程序真实 open/pause/resume/close/reopen；另检查 Pi 创建的后台进程随所属 worker 关闭。外部 tmux/远程作业不在本机 cgroup 范围内 |
-| R6 | 通过小型任务集 | [固定比较](benchmark.md) 包含三种方式、三个校准样本和两个独立验证任务；计入主会话和各 attempt，无一般收益结论 |
-| E1 | 通过 | 并发重复请求；自动选择之后配置改变仍返回原 task |
-| E2 | 通过基本用例 | revision、暂停不派发、drain 不中断；持续压力测试未执行 |
-| E3 | 通过 | 关闭保留结果与目录，原 ID 重开；关闭父记录不发通知 |
-| E4 | 自动与 Pi 实测通过 | Pi 原生命令运行期间重启独立 broker，worker PID、进程身份和原生会话均未改变，只有一次执行；模拟 CLI 另覆盖杀 worker 后不重发 |
-| E5 | 通过已列用例 | 两个真实修改任务独立 worktree、三个真实只读任务、真实非 Git 副本；快照和补丁用自动断言检查，不承诺恶意同 UID 隔离 |
-| E6 | 通过 | 原生真实任务 + 指定 turn / agent_settled / 终止状态测试 |
-| E7 | 通过自动检查 | 共享并发、不替换指定模型、共享限流等待和明确解除配额等待；没有故意耗尽真实账户配额 |
-| E8 | 通过已列检查 | 父子计数增量、重复事件、恢复、未知价格和部分用量保留；Claude 三轮真实累计差值正确。金额仅为有来源的估算，实际账单未知 |
-| E9 | 离线及 Claude 实测通过 | 问题与 attempt 关联、过期拒绝、没有回答不批准；固定比较中一次真实 Claude 编辑审批只批准指定测试文件。Codex/Pi 的真实交互请求尚待补充 |
-| E10 | 本机通过，Telegram 待授权 | 父暂停/关闭、去重、现有 Telegram 状态读取；真实冷恢复完成三程序任务。独立 Telegram 话题的真实消息尚未测试 |
-| E11 | 通过基本用例 | 三个程序中断后重新打开并追问；明确继续创建新 attempt 的自动检查通过 |
-| E12 | 通过 | 接受正确 attempt 后释放依赖，旧 worker/旧 attempt 无法覆盖新结果 |
+## Autonomous Model Discovery (2026-10-23)
 
-## 本机安装
+66 automated tests + Ruff passed covering catalog caching, pagination, stale error retention, Pi provider filtering, Claude resolved model IDs, and DeepSeek restrictions. Zero-inference catalog queries returned 7 Codex/OpenAI models, 2 Pi/DeepSeek models, and 2 Claude/DeepSeek models. Isolated live model probe (`discovery_smoke.py`): `claude-deepseek` + `deepseek-flash` succeeded (`OK`); `codex-sol` + `gpt-6-luna` timed out after 90s with zero output and cancelled cleanly, confirming catalog visibility alone does not guarantee inference availability.
 
-命令：`~/.local/bin/agent-bridge`。服务：`cli-agent-bridge.service`，已启动，未设置登录后自动启动。MCP：`cli-agent-bridge` 已注册，stdio 运行本项目命令。Skill：`~/.codex/skills/cli-agent-bridge` 链接到仓库内的 skill。
+## Third-Party Review Fixes — Round 1 & Round 2 (2026-10-23)
 
-运行数据与配置：`~/.local/state/cli-agent-bridge`，与上述开发测试状态分开。没有登记任何真实父会话，因此不会主动向主会话或 Telegram 发完成消息。
+- **Round 1 (`F1`-`F13`, 89 tests passing + Ruff + 5 short real follow-up requests)**: Bounded pipe cleanup & worker shutdown timeout (`F1`), model-change quality attribution isolation (`F2`), non-blocking coordinator pause/close/ACK (`F3`), pre-session dispatch validation (`F4`), immediate idle `pause_drain` (`F5`), explicit access-mode mismatch rejection (`F6`), worker-crash `recovery_needed` parent notification (`F7`), retryable helper initialization failures (`F8`), per-retry reservation updates (`F9`), failed patch preservation (`F10`), missing pre-resume usage baseline markers (`F11`), stable error on bad requirements (`F12`), and Pi `tool_execution_start` events (`F13`).
+- **Round 2 (`R1`-`R12`, 114 tests passing + Ruff + 5 real short requests)**: Attempt-scoped interrupts & stop on error (`R1`), FIFO starvation-free delivery rotation via `deliveries.last_attempt` (`R2`), startup failure parent alerts with `queued` preservation (`R3`), paginated `nextCursor` native queue checks (`R4`), ACK while `sending`/`uncertain` (`R5`), state-aware notification instructions (`R6`), null unknown Claude usage intervals (`R7`), Pi preserved answers on stats timeout (`R8`), unstarted retry failure sample retention (`R9`), full-history multi-task parent checks (`R10`), `copy` mode permission diffs (`R11`), and cancel/close precedence over timeout/budget (`R12`).
 
-开发中发现旧 Telegram 服务将真实 CLI 子会话当成普通会话，自动发出 11 条测试回复。这些自动转发不代表完成了计划中的 Telegram 联调。已增加 `external_children` 登记及文字、附件过滤；新 worker 在不支持过滤时禁止执行模型。确认无运行、排队任务和待发送通知后，重载了一次 Telegram 服务，检查过滤版本已生效。已有消息没有删除。
+## Session Groups & Targeted Broadcasts (2026-11-02)
 
-修复后又分别运行一次 Codex 和 Claude 小任务，均正常返回 `OK_LOCAL`；确认登记成功，并等待 bot 扫描后检查，两条原生会话的 outbox 记录均为 0。补充报告位于 `<private-validation-state>/report.json`。连同前面的 17 个 attempt，共真实执行 19 次：16 次正常结束、3 次中断。
+Added `agent_groups`, `agent_group`, `agent_broadcast`, then `native_members`, `agent_group_inbox`, and closed Antigravity wake support (`agy_presence.py`, `agy_wake.py`):
+- 226 tests (groups) -> 242 tests (native Codex queue attachment without waking closed terminals + `clientId` receipt proofs) -> 244 tests (`agent_group_inbox` pagination with readonly cursor) -> 279 tests / 66 subtests (35 new fake-CLI tests for offline AGY auto-resume, presence/flock locking, duplicate process guards, post-baseline `user_input/DONE`, child MCP reaping, and systemd `comm`/`cmdline` matching).
+- Live group `example-agents` attached 4 sessions (3 Codex enqueued via `thread/queue/add`; active dual-instance AGY left unpushed safely, later directory corrected from `~` and MCP registered cleanly without injecting into live terminals).
 
-定时任务服务和共享 Codex daemon 未重启。代码尚未提交或推送。
+## 2026-11-13 Total Task Deadline, Non-UTF-8 Paths, and Per-Task Timeouts
 
-## 后续工作
-
-首版剩余的真实检查是独立 Telegram 话题中的队列、冷恢复与回复，需要此前已询问的发送测试消息授权。
-
-待执行方案：只使用现有私人聊天，新建“agent bridge 测试”话题；运行已通过的本机 Astra/Sol/Pi/Claude 小任务，关闭父进程后继续原会话。父会话最多产生四条短测试回复，子会话仍保持禁止单独转发。核对原生 turn 结束、桥接事件确认、bot outbox 及 Telegram 消息 ID，检查有无重复；异常时停止这组测试，不自动重复发消息。结束后关闭测试会话，保留话题供用户检查，不删除已有消息。这个方案尚未执行。
-
-当前限制：固定比较只有两例独立验证任务，不推广为普遍收益；未做持续压力测试或实际账单核对。输入仍为文本和明确的本机文件，原生图片参数暂不支持。未知价格保持未知，后台远程或 tmux 作业须单独检查，暂停不能撤回已发生的外部操作。
-
-## 费用与选择补充检查
-
-均衡已写入本机默认配置，费用、耗时权重各 0.5；单任务可选费用优先或速度优先。父用量从原生累计计数的指定起点读取，不复制整段聊天；暂停通知和仅统计可分别选择。固定比较的 9 个案例均得到完整原生计数，三种方式各通过 2 个验证任务，详见 [报告](benchmark.md)。
-
-另运行 Claude 三轮小任务：前两轮在同一个运行中的会话，第三轮关闭后恢复，分别报告 2,058、2,978、2,100 个 token，每轮均等于相邻累计值的差，三次均正常结束。报告：`<private-validation-state>/report.json`。新实现不追改旧测试中的部分用量。
-
-本次只重载新建的 cli-agent-bridge 服务，以应用默认策略和统计修改；没有再重启 Telegram、定时任务服务或共享 Codex daemon。
-
-## 冷恢复、文件与进程补充检查
-
-`scripts/cold_resume_smoke.py` 在独立服务中创建 Astra 父会话及暂停的 Sol、Pi 子任务。初始目录查询成功后退出父进程，原生状态确认为 `notLoaded`，再释放子任务。恢复后的 Astra 自行检查代码和两项断言、接受 Sol/Pi 结果、创建 Claude 复查，最终接受三个 attempt，并确认处理三条完成事件。原目录中的错误函数保持原样，修改仅在子 worktree 中。
-
-成功报告：`<private-validation-state>/report.json`。原生记录中的四个 turn context 全部为 `gpt-6-astra`、`low`、`on-request`，没有更换父模型或取消批准要求。父记录和三个子会话均已关闭。
-
-此前两次未通过，分别保存失败报告，没有覆盖或当作成功：
-
-- `cold-example-run-report.json`：测试客户端的回调拒绝了 MCP 调用，但初始检查只读到了模型说 READY。改为检查原生 MCP 调用确实成功；给只读工具正确标记，并仅在独立测试会话中预先允许已授权测试工具。
-- `cold-example-run-report.json`：恢复后原生接口丢失临时 MCP 配置，连到了默认服务，找不到测试任务。新增私有 `resume_config_file` 引用，恢复相同的 MCP 配置，不覆盖父模型、沙箱或批准策略。
-
-失败测试的父队列和活动轮次仅按本次测试的 ID 清理，并确认停止。bot 已扫描这三次测试涉及的七个 Codex/Claude 原生会话，均登记为外部子会话，outbox 记录全部为 0。Pi 后台会话不走该扫描。没有创建 Telegram 话题或发送测试消息。
-
-`scripts/restart_smoke.py` 使用非 Git 文件副本运行真实 Pi 任务。在脚本开始、尚未结束时重启独立 broker；确认 worker PID、启动身份、原生 session 保持一致，输入脚本只运行一次。顶层任务完成时，`sleep` 后台进程仍在该 worker 的 cgroup 中；关闭子会话后，确认后台 PID 已退出、整个 cgroup 没有运行进程。源目录没有产生测试输出。报告：`<private-validation-state>/report.json`。
-
-先前用 Codex 做该检查时，重启与单次执行断言通过，但把沙箱内 PID 3 当成宿主 PID，后台检查未通过，报告保留为 `restart-example-run-report.json`。没有据此声称后台已停止；改用 Pi 验证真实宿主进程，接口文档也说明 cgroup 清单使用宿主 PID。
-
-快照自动检查覆盖已暂存和未暂存修改、删除、二进制、未跟踪文件、符号链接拒绝、请求重试与补丁实际应用。大输出检查重组完整中文结果、核对文件权限和跨任务访问拒绝。服务档位检查覆盖 Codex 启动/恢复/执行和其他程序拒绝不支持字段；未测试付费档位的费用或速度收益。
-
-原生元数据检查确认 `fast` 返回 `priority`，`priority` 和 `default` 原样确认；前者按官方说明作为同一档位处理。该检查没有发起推理，报告为 `<private-validation-state>/report.json`。没有因此更改三个已安装 profile 的档位设置。
-
-## 自主发现模型（2026-10-23）
-
-66 项自动检查通过，包含真实 MCP 参数、Codex 目录分页和查询进程退出、并发缓存、刷新失败保留旧数据、Pi 供应商筛选、Claude 准确 ID、DeepSeek 重定向限制、模型设置检查、会话固定模型及重复请求。`ruff check src tests scripts` 通过。
-
-三个真实目录均查询成功：Codex/OpenAI 7 个、Pi/DeepSeek 2 个、Claude Code/DeepSeek 2 个。后两者列出相同的 2 个 DeepSeek 模型，不能相加当成不同模型。原始目录报告保存在 `<private-validation-state>/report.json`。这些查询没有发送推理请求。
-
-独立服务中的真实执行检查：
-
-| 目标 | 结果 |
-| --- | --- |
-| `claude-deepseek` + `deepseek-flash`（原配置为 `deepseek-v4-flash`） | 通过：目录发现、创建会话、完成一次请求、返回准确模型 ID、检查结果、关闭 worker |
-| `codex-sol` + `gpt-6-luna`（原配置为 `gpt-6.1-sol`） | 未通过调用检查：90 秒内没有输出，测试取消任务并关闭 worker；不能据目录可见声称推理成功 |
-
-两次测试最终均无存活 worker。报告分别为 `<private-validation-state>/report.json` 和 `discovery-example-run.json`，失败任务和取消结果保留在该目录的 SQLite 中。测试子会话由现有 `external_children` 过滤，不登记父会话，也没有执行真实 Telegram 消息测试。没有逐一调用目录内全部模型，未验证 Anthropic 官方账户的真实调用。
-
-可用 `scripts/discovery_smoke.py --state 独立状态目录 --profile 配置名 --model 目录中的新模型ID` 重做指定模型的检查；该脚本会产生一次真实推理请求。它要求模型与配置中的默认模型不同，结果只用于检查接口，不用于费用与速度排名。
-
-完成后重载 `cli-agent-bridge.service`，实际查询确认三个配置和 `objective=balanced` 已生效；服务仍未设置登录自启。独立冷恢复测试服务已停止，其九个子会话均关闭、worker 全部退出，失败报告和工作目录保留。没有重启 Telegram、定时任务服务或共享 Codex daemon，没有提交或推送代码。
-
-## 三方评审后的修复（2026-10-23）
-
-Codex CLI、Claude Code、Pi 的独立评审中，确认并修复了以下 13 项问题。原始评审、重现结果保存在本机 `<private-validation-state>/report`。
-
-| 编号 | 修复 | 对应检查 |
-| --- | --- | --- |
-| F1 | 原生程序退出后，后台进程占住输出管道不再让关闭一直等待；worker 清理也有时限 | 真实继承管道测试；独立 systemd worker 约 10.18 秒关闭，脱离进程组的后台进程和整个 cgroup 均停止 |
-| F2 | 换模型重试时，后一个模型成功不会算成前一个模型成功 | A 失败、B 成功的自动选择测试；总用量仍保留两次执行 |
-| F3 | 父会话暂停、关闭、确认通知不再等待一整批慢请求 | 发送首条通知期间立即暂停，剩余通知保留；同时收到的确认不会被发送结果覆盖 |
-| F4 | 派发参数先检查，再创建会话和工作目录；检查后发生状态变化时关闭新建会话 | 无效指令、依赖、预留、重试 ID、权限和 requirements；派发时状态变化测试 |
-| F5 | 没有正在执行任务的 `pause_drain` 立即暂停 | 空会话、有排队任务和正在执行任务三种情况 |
-| F6 | 已有会话明确指定不同权限时拒绝；省略权限时沿用原值 | CLI 请求和实际 MCP 默认参数检查 |
-| F7 | worker 崩溃时保存任务事件，向已登记父会话安排恢复通知 | 任务保持 `recovery_needed`、通知只创建一次、不自动重放 |
-| F8 | 通知辅助进程尚未启动、入队前初始化失败时可以重试 | 缺失解释器、客户端初始化失败；响应丢失仍保留 `uncertain` |
-| F9 | 重试可以修改下一次执行的 token 预留；旧 attempt 独立保存原预留 | 启用预算后从零预留重试、数据库升级、旧未知用量仍计入预算 |
-| F10 | 提取补丁失败返回 `failed` 和具体错误，同时保留回答、用量、文件 | 真实 Git 提取失败的 worker 测试 |
-| F11 | 恢复时缺少执行前计数不再把历史累计量算成新增用量 | 缺失计数、崩溃后不采用旧计数；真实 Codex 关闭重开后新增量等于累计值之差 |
-| F12 | 无效 requirements 返回稳定参数错误；未知异常保存明确的结果不明状态 | 重复请求得到同一错误，未知异常不会重复执行 |
-| F13 | Pi 保留 `tool_execution_start` 事件 | 实际事件过滤测试；真实只读任务各有一条工具开始和结束事件 |
-
-总览增加 `profile`、`runtime`、`provider`、`model`、`effort`、`service_tier`。实际运行 `agent-bridge call agent_inspect --json '{}'` 已确认生效；认证文件位置不出现在这些新增字段中。README、MCP 参数说明和仓库内 skill 已同步修改。
-
-自动检查由 66 项增至 89 项，全部通过；Ruff 通过。最后补充清理超时的错误类型后，相关 3 项 worker 检查再次通过。检查没有新增第三方依赖。
-
-服务更新前确认无活动 worker，并用 SQLite backup 保存数据库；更新后检查数据库完整性与旧记录迁移。真实短请求使用原有三个配置，全部返回准确答案且报告模型与指定模型一致：Codex / `gpt-6.1-sol` 两轮（中间关闭重开）、Claude Code / `deepseek-v4-flash` 一轮、Pi / `deepseek-flash` 一轮。Codex 保留同一原生会话 ID。所有结果已检查接受，测试会话和所属进程均已关闭；测试结果不参与自动选择的质量与费用统计。
-
-修复前副本、差异、数据库备份和本次报告保存在 `<private-validation-state>/report`。只更新了 cli-agent-bridge 服务；没有重启 Telegram、codex-async 或共享 Codex daemon，没有提交或推送代码。真实 Telegram 消息发送、持续压力测试及实际账单核对未执行。
-
-## 2026-10-23 第二轮修复
-
-第二轮 review 确认的 12 项问题均已修复。修改和新增检查如下：
-
-| 编号 | 修改 | 检查 |
-| --- | --- | --- |
-| R1 | 中断请求和计时对应具体 attempt；下一任务等旧请求结束后才能开始。请求报错或超时时停止 worker，未执行任务保持排队 | 旧中断迟到返回、报错和超时，后续任务不被误取消；未确认的请求不允许下一任务开始 |
-| R2 | 通知按上次尝试时间轮换，顺序保存在 SQLite | 最早 10 条因父会话忙碌、等待唤醒或 Telegram 暂停无法继续时，第 11 条仍能发送；数据库升级保留原记录 |
-| R3 | 启动、连接及执行前的 worker 故障为排队任务保存事件并通知父会话 | 连接失败、空错误消息的超时、启动器失败、已分配但未开始的任务；同次故障不重复通知，也不自动重跑 |
-| R4 | 检查原生通知队列时跟随 `nextCursor` | 目标在第二页、队列中已没有目标、重复游标三种情况 |
-| R5 | 已收到通知可在 `sending` 和 `uncertain` 时确认 | 首次发送尚未返回、返回丢失、后续不重发；`pending` 和其他父会话仍不能确认 |
-| R6 | 通知按事件保存的状态说明后续操作 | 成功才要求 review；结果不明要求检查后 resolve；失败、中断、取消和启动失败分别给出可用操作；重试不改变旧事件说明 |
-| R7 | Claude 缺失或无效累计计数保留为未知值，不当成零 | 空计数、恢复时缺计数、字段不全、计数重置和模型暂时缺失；重新取得有效区间后才报告完整用量 |
-| R8 | Pi 已确认结束后，最终统计失败仍保存终态、回答和文件变化 | 实际 Worker 和 PiRuntime 配合模拟超时，回答与修改保留，已报告 token 保留为不完整统计，费用仍未知 |
-| R9 | 新模型重试尚未开始时，使用原 attempt 的失败结果 | 重试排队、已分配和取消三种状态均保留原模型失败样本，不把未完成任务作为完整费用样本 |
-| R10 | 判断父会话是否处理过多个任务时同时查询当前任务和历史 attempt | 任务迁出后，剩余任务仍不能独占旧父会话的共享开销 |
-| R11 | copy 模式比较并记录文件权限 | 仅 chmod、内容及权限同时修改、新文件、未修改文件；原目录权限保持不变 |
-| R12 | 用户取消、关闭优先于超时和预算中断 | 同时满足取消或关闭、超时、预算条件时记录为取消 |
-
-自动检查由 89 项增至 114 项，全部通过；Ruff 和 skill 格式检查通过。没有新增依赖。README 和 skill 已同步说明通知确认、启动失败处理及不完整统计。
-
-更新前确认没有活动 worker，使用 SQLite backup 保存数据库。更新后数据库完整性检查通过，原有 14 个会话、17 个任务、17 次 attempt、741 条事件全部保留；新增 `deliveries.last_attempt` 用于通知轮换。`agent_inspect` 的软件、供应商和模型字段也已检查。
-
-本机三个程序共完成 5 次真实短请求，回答和指定模型均符合预期：Codex / `gpt-6.1-sol` 两次，Claude Code / `deepseek-v4-flash` 两次，Pi / `deepseek-flash` 一次。Codex、Claude 两次请求之间均关闭并重开，保留原生会话 ID，新增用量等于前后累计计数之差；Pi 工具开始、结束事件正常。所有结果已检查接受，测试会话及所属进程均已关闭。这些测试不参与自动选择的质量和费用统计。
-
-只重启了 `cli-agent-bridge.service`；Telegram、codex-async 的进程未变化，未重启共享 Codex daemon。Codex、Claude 测试子会话已登记过滤；Pi 使用禁用扩展的 RPC。已检查三个测试子会话均无 Telegram outbox 记录，没有主动发送 Telegram 消息。
-
-修复前副本、差异、数据库备份、测试日志和逐项报告保存在 `<private-validation-state>/report`。代码尚未提交或推送。供应商故障使用模拟输入检查，未在真实服务上制造故障；真实 Telegram 发信、长期压力测试和实际账单核对未执行。
-
-## 2026-11-02 分组与指定组广播
-
-新增 `agent_groups`、`agent_group`、`agent_broadcast`，保留原有九个接口及父会话通知。成员使用现有 bridge 会话 ID；广播需要明确的 group_id 和组 revision，各接收方进入原任务队列。使用方法见 [README](../README.md#分组与广播)。
-
-新增 14 项检查，涵盖分组增删、成员增删及重复成员、组外不接收、多个组共享成员、并发重复请求、改变请求内容被拒绝、组成员改变后的原请求重试、服务重启后取回原任务 ID、空组及未知组、暂停与关闭状态、预算限制、写入失败时全部撤销，以及旧数据库升级后保留任务和父通知。
-
-独立进程测试启动三个隔离的模拟 CLI 会话，只将两个加入目标组。组外会话没有收到执行指令；组内一个 worker 被杀后，该任务进入 `recovery_needed`，另一个仍完成。重试原广播没有增加任一成员的执行次数。另有实际 MCP stdio、Unix socket 和 CLI 调用检查，测试不连接真实模型供应商。
-
-```text
-uv run --locked --with pytest python -m pytest -q
-226 passed, 42 subtests passed in 26.39s
-.venv/bin/ruff check src tests scripts
-All checks passed!
-skill-creator/scripts/quick_validate.py skills/cli-agent-bridge
-Skill is valid!
-```
-
-完整检查使用临时 pytest 环境，未修改项目依赖或 uv.lock；原有未跟踪的 tiering 文件保持不变。
-
-本机更新前确认没有活动子会话、未完成的管理请求或发送中的通知，使用 SQLite backup 保存数据库后只重启 bridge 服务。更新后查询 `agent_groups` 返回空组列表；现有会话、任务、attempt、事件、父通知及请求记录的数量和内容哈希保持一致。没有在线创建测试组或测试会话，也没有向任何真实会话广播；Telegram 和 codex-async 服务进程未变化。
-
-本次差异、检查日志和数据库备份位于 `<private-validation-state>/report`。未做真实模型广播或大规模压力测试，代码尚未提交或推送。实际广播会创建执行任务，可能产生推理费用；移除成员或删除组不撤回已排队任务。
-
-## 2026-11-02 原生会话分组与非打断队列
-
-`agent_group` 新增可选 `native_members`，直接登记现有 Codex / Antigravity 原生 ID、目录和名称，不创建替代会话、bridge session 或 worker。原有 `session_ids` 参数和父通知继续使用。新建的两张表保存原生成员及每个目标的发送记录；广播仍在一个事务内保存成员快照与重试记录。
-
-Codex 通过已运行共享服务的 `thread/queue/add` 入队，发送前核对原生 ID、目录和 Telegram 暂停/删除状态。连接设置固定 `start_daemon=False`，没有恢复、抢占、中断或向终端写入输入。Antigravity 目前仅支持登记，发送明确返回 `skipped / unsupported_transport`。
-
-`agent_broadcast_status(refresh=true)` 只查询原生队列与历史。原生队列回执记为 `enqueued`；仅当历史里匹配 `clientUserMessageId` 对应的 `clientId` 时记为 `received`，并保存原生轮次 ID。消息从队列消失但没有匹配记录时不算收到。发送中断、进程重启或回执丢失记为 `uncertain`，不自动重发；只有明确发生在发送前的故障才重试。
-
-新增 16 项测试，涵盖原生与 bridge 成员兼容、原生 ID 保留、组外隔离、重复成员与并发重复请求、成员变化后的旧请求、发送事务失败、预算拒绝、回执丢失、服务重启恢复、Telegram 暂停/删除、队列分页和收到证明。独立 Python helper 测试替换 codex-async 客户端，断言只能连接现有 daemon、核对原会话并入队，不启动模型。MCP stdio 测试覆盖原生成员参数与发送结果查询。
-
-```text
-uv run --locked --with pytest python -m pytest -q
-242 passed, 50 subtests passed in 15.06s
-uv run --locked ruff check src tests scripts
-All checks passed!
-skill-creator/scripts/quick_validate.py skills/cli-agent-bridge
-Skill is valid!
-```
-
-更新前确认 bridge 没有活动 worker、未完成的管理请求或发送中的父通知，并备份数据库。仅重启 bridge 服务；新表创建后，原有所有表的内容哈希不变。测试全部使用临时状态与模拟客户端，没有向无关真实会话发送消息。
-
-经用户授权创建 `example-agents` 组，登记原来的四个会话。三个 Codex 各发送一次正式通知，均取得原生队列回执；是否进入原生历史按每个目标单独查询。AGY 的同一会话有两个现存进程，未找到验证过的安全接入接口，未向其发送。部分 Codex 入队不代表全组已经收到。具体会话、回执和查询时间只保存在本机私有报告中，不提交聊天内容或运行数据库。
-
-本次备份、测试日志和逐目标结果位于 `<private-validation-state>/report`。原有未提交修改与其他 agent 的工作保留，未提交或推送代码。尚不支持原生 AGY 队列、原生预算统计及通过 `agent_cancel` 撤回原生消息；原生关闭会话也不会被这项功能自动唤醒。
-
-## 2026-11-02 AGY 配置与主动读取组消息
-
-核对重启后的 AGY 进程，启动目录为 `/home/user`，原来登记的项目目录对应同一会话的旧进程。通过现有分组接口修正目录，保留原生 ID 和其余三个成员。没有重启、关闭或向这两个 AGY 进程写入终端输入。
-
-用户级 AGY MCP 配置原为空文件。用 `agy mcp add` 添加 `cli-agent-bridge` 的 stdio 命令，两个目录中的 `agy mcp list` 都能列出它。独立 MCP 客户端握手和工具调用成功，但没有从正在运行的 AGY 实例验证工具调用；配置存在和独立客户端成功均不等于原生实例已经接入。官方 `/mcp` 管理面板支持在原窗口重载，尚无证据要求重启整个 AGY。
-
-新增只读 `agent_group_inbox`，按明确的组、runtime 和原生 ID 查询保留的广播。当前成员才能读取，原推送被跳过的消息也能主动查询；游标避免重复处理，限制每页最多 10 条。它不启动会话、不发送消息、不修改回执，因此协调者代查不会把 AGY 的 `skipped` 改成已收到。已有自动队列和父通知不变。
-
-新增两项测试和实际 MCP 工具检查，验证按组及接收方筛选、组外拒绝、原始消息保留、分页无重复、无效参数及移出/删除成员后拒绝读取。完整结果为 `244 passed, 50 subtests passed in 15.11s`，Ruff 和 skill 格式检查通过。
-
-更新时确认 bridge 无活动 worker 或发送中的记录，备份数据库后仅重启 bridge。使用独立 MCP 客户端读取该 AGY 的一条既有通知，所有数据库表哈希保持不变；没有再次向真实组广播。原生 AGY 的实际读取仍未确认，自动推送仍无验证过的安全接口。查到的本地监听端口属于 language server，未将它们当作安全消息队列使用。
-
-检查记录位于 `<private-validation-state>/report`。下一步是在当前目标 AGY 窗口本轮结束后通过 `/mcp` 重载，确认 bridge 已连接，再由原会话调用 `agent_groups` 与 `agent_group_inbox`。原有审批设置保持不变，代码未提交或推送。
-
-## 2026-11-03 AGY 关闭后按组消息自动恢复
-
-原生 AGY 的新组广播现在保存为 `pending`。确认原实例完全关闭后，bridge 用原 native ID 启动一轮 stream-json 会话并发送消息。活动实例、同 ID 多实例、无法识别所属的 `-c/--continue` 进程或无法读取的 AGY 状态都会等待；不向已有终端写入输入。旧 `skipped` 广播不变，不补发过时通知。
-
-`agy_presence.py` 检查 native presence flock、两种 conversation 参数及进程所属。`agy_wake.py` 与现有 Telegram 客户端共用恢复锁，启动前、init 后、写入前都检查活动实例；原生主会话数据库或 summary 缺失时拒绝启动。恢复命令只指定原 ID 和流格式，不覆盖模型、推理强度、认证、MCP、sandbox 或 mode，不传跳过权限参数。恢复的原生主会话仍可调用 bridge。
-
-收件必须由原 ID 返回新的 `user_input/DONE`，步骤编号大于恢复前原生记录的最大编号。收到后马上保存 `received`；其后的推理通过 `processing_status` 单独记录，长推理不会占住其他目标的发送。回执丢失、写入后退出或服务重启均不盲目重发；已经收到而执行失败，也不能当作未送达重跑。首次确认的原生步骤编号不能被后续回执替换。
-
-每一轮只清理本次创建的进程组，包括退出后遗留的 MCP 子进程；不操作原有实例或原有训练。Telegram 检查使用 `antigravity:<native_id>`，继续尊重暂停和删除状态。
-
-新增 35 项测试，包括 fake CLI 的真正独立进程、临时原生数据库和锁：原生 ID 保留、历史重放、缺失记录、活动及不明进程、服务间共享锁、启动中出现新实例、重复请求、两组并发、失回执、长推理先保存收件、服务重启、迟到权限拒绝、错误或冲突回执、后代进程清理。进程识别也覆盖真机 systemd 的 exe 受保护但 comm/cmdline 可读的情况，避免将无关系统进程误当作 AGY。
-
-```text
-uv run --locked --with pytest python -m pytest -q
-279 passed, 66 subtests passed in 15.64s
-uv run --locked ruff check src tests scripts
-All checks passed!
-skill-creator/scripts/quick_validate.py skills/cli-agent-bridge
-Skill is valid!
-```
-
-更新前确认 bridge 没有活动 worker、待完成 API 或发送中记录，保存数据库备份后仅重启 bridge 服务。新列只增加执行状态，原有所有列的值和行数保持一致；原来四个组员和 revision=2 不变，AGY transport 为 `antigravity_resume`。Telegram、codex-async 服务未重启，其他 agent 的未提交文件未改。
-
-09:44 实查原 AGY 仍持有 native presence 锁；排除当前实例检查其他进程时没有误报。该实例未被关闭或重启，本次没有对它做真实的关闭后恢复测试，也没有向组内或其他真实会话发送测试广播。代码和 fake CLI 测试验证了关闭恢复的行为；原会话的真实恢复要在其自然关闭且有新组消息时发生，不能把这次活动锁检查说成已经恢复。
-
-完整检查、部署记录和备份位于 `<private-validation-state>/report`。代码尚未提交或推送。
-
-## 2026-11-13：区分任务总时限与外部暂停
-
-三条同批启动的 Pi 任务在各自运行约 3600 秒后结束，均有 `native_wait_ended.cause=task_timeout`。邻近 stat 会话的暂停请求实际发生在三任务结束约 74 秒后，因此不是这次中断的原因。运行中安装包的 `worker.py` 与检查时的源码一致。
-
-`task_timeout` 默认 3600 秒，表示一次 attempt 的总运行时限；持续有工具输出也不会延长它。它不表示已经确认模型或编译进程卡死。每个 worker 只检查自己的会话和任务，Pi 的 abort 也只写入该会话独立的原生子进程。
-
-修复后，非成功终态的结果保留 `termination`，包含 `cause`、`stage`、`elapsed_seconds`、`task_timeout_seconds`；模糊的原生错误另存为 `native_error`，主错误说明实际的超时、暂停、取消或预算原因。原生已确认成功时继续保留成功结果；中断结果不明时仍为 `recovery_needed`，不推断未执行或自动重跑。
-
-本次不调整 3600 秒配置、不改变总时限规则，也不修改已恢复的编译任务。真实会话和服务未重启，其他会话没有收到测试取消或暂停。
-
-840 项完整 unittest、Ruff 和 `git diff --check` 通过。随后将暂停隔离检查的固定睡眠改为事件等待，21 项 worker 检查再次通过；测试覆盖成功与中断竞争、未知结果、三 worker 隔离和下一 attempt 不继承旧原因。测试使用临时状态和模拟原生程序，没有向真实会话发送中断请求。
-
-## 2026-11-13：非 UTF-8 输出路径与单任务时限
-
-后续 stat 任务在总时限到期后，采集 `git ls-files -z` 输出时因合法 `0xff` 文件名字节发生 UnicodeDecodeError，盖掉原有终态。修复保留 Git 路径 bytes、原始 patch 和可逆清单；公开路径列表安全转义并在必要时附原始 hex。临时 Git apply 检查确认非 UTF-8 文件名、二进制内容和符号链接目标字节保持一致。Worker 的采集异常仅影响文件结果；已知原生终态、回答、用量和中断原因继续保存。
-
-新增 `requirements.task_timeout`，本地和远端派单均保存到任务 details，worker 在每个 attempt 开始时读取并固定。省略沿用默认 3600 秒；本地重试可保留或明确覆盖，不能改运行中任务。校验在创建会话、工作区或发送请求前进行；重复请求返回原结果，变更参数冲突。旧节点、旧 worker 或握手后版本变旧都会明确拒绝覆盖时限，不静默按旧默认执行。数据库仅增加 worker 支持标记，不更改已有 PID、generation、任务状态或节点默认配置。
+- Diagnosed three Pi jobs hitting the default 3600s `task_timeout` (independent of a later pause on another session ~74s afterward); separated structured `termination` (`cause`, `stage`, `elapsed_seconds`, `task_timeout_seconds`) and raw `native_error` cleanly (840 tests passing + 21 worker tests using event waits).
+- Fixed `git ls-files -z` non-UTF-8 byte decoding crash (`0xff`) using escaped display arrays plus parallel raw hex arrays (`untracked_files_raw_hex` / `changed_files_raw_hex`) and raw byte patches; added validated `requirements.task_timeout` checked upfront across local and remote paths with explicit rejection on legacy workers lacking `task_timeout_v1`.

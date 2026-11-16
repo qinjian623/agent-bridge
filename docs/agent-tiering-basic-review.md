@@ -1,273 +1,35 @@
-# Agent 分工设计审查：基础功能与用词
+> Language: English | [中文](zh/agent-tiering-basic-review.md)
 
-审查对象：[agent-tiering.md](agent-tiering.md)，共 485 行。下文行号均指这份原文。本报告只提出修改建议，没有实现记录器、验证脚本或自动选模型功能。
+# Agent Tiering Scope Review: MVP Simplification & Terminology Cleanup
 
-第一期只需做到：写清任务，派发执行，独立检查测试和修改范围，由人或主 agent 判定通过或拒绝，保存记录，再查看通过率和耗时。原文同时展开了模型评估、自动选择、费用核算、缺陷追查和日志恢复；部分功能虽已推迟，第一期记录器仍要为其中多项准备字段和处理规则，明显超出这个目标。
+Reviewed draft: [agent-tiering.md](agent-tiering.md) (485-line initial draft prior to simplification). Recommends stripping speculative metrics and premature complexity down to a ~150-line Phase 1 specification without altering Bridge core APIs.
 
-## 第一部分：说人话——生造黑话与晦涩用词清单
+Phase 1 only needs: author crisp task specs, dispatch work, run independent tests and diff scope checks relative to `snapshot_tree`, let the human/coordinator judge accept/reject, log minimal records, and view raw counts, pass rates, and durations. Deferred features (auto-calibration suites, Beta(2,2) priors, decay weights, exploration quotas, commit trailers, 12 event schemas, multi-writer reconciliation, auto-repair tail truncation) should not dictate Phase 1 record schemas.
 
-以下按原文逐段整理；同义表达合并列出。表中既有含糊的中文，也有缺少解释的英文和过长字段名。英文术语和字段名本身未必有问题，问题在于读者还没看到基本做法，就必须先理解一大批名词。
+## Part 1: Plain-Language Replacements
 
-`UUID`、Git 树、JSONL、`flock`、`fsync`、Beta 分布都是已有技术概念，不应统称为作者造词。应分别判断：是否需要在第一期使用，是否必须出现在正文，能否用一句中文讲清楚。bridge 已有参数名保留原名，中文负责解释；下表对外部设计字段提出的删改不涉及修改 bridge API。
+Replaces opaque jargon across three groups while leaving standard technical concepts (`UUID`, Git trees, JSONL, `flock`, `fsync`, Beta priors) and existing Bridge field names intact:
 
-### 1.1 分工与任务说明
+- **Dispatch & Roles**: Eliminate confusing hierarchy labels (`L0-L3`, `Carrier`, `Orchestrator`, `Triage/Router`, `Executor`, `Summarizer`, `Task DAG`, `business UUID`, `task_key`, `spec_version`, `cumulative diff`, `impact surface`, `configuration identity tuple`). Use plain concepts: primary agent, execution agent, validation script, task ID (`task_id`), `attempt_id`, profile name, resolved model/effort, and "changes relative to input `snapshot_tree`".
+- **Metrics & Selection**: Remove `FPA`, `adjusted FPA`, `defect escape rate`, `false claim honesty rate`, `suspected/confirmed/unknown`, `spec compliance score`, `justified help rate`, `token / effective diff line ratio`, `advisory` mode thresholds, `Beta(2,2)` smoothing, `30d half-life`, `effective sample size`, and `10% random exploration`. Report raw decided counts, plain pass rate (`accepted / decided_total`), mean turnaround time, and concrete factual rejection notes.
+- **Logging & File Handling**: Consolidate 12 premature event types (`task_spec`, `dispatch_intent`, `dispatch_link`, `bridge_event`, `attempt_link`, `outcome`, `review`, `review_result`, `merge`, `defect`, `correction`, `repair`), complex pre-edit effective hashes, event mirroring/replay cursors, and half-line auto-truncation repairs into sequential single-process JSONL appends that halt with file and line numbers on corruption/contradiction without silently dropping rows.
 
-| 原文表达及位置 | 为什么不合适 | 白话替换或处理 |
-|---|---|---|
-| “外部运行器”（4、11 行及全文） | 没有先说明这是一个新程序、脚本还是主 agent 要做的事。 | “调用 bridge、跑检查并写记录的脚本”；第一期也可由主 agent 按步骤操作。 |
-| “载体”（22 行） | 表头没有说清是软件还是人员。 | “由谁执行”。 |
-| “L0 确定性处理”“L0 验证”（24、75、145 行） | 把脚本和模型放在同一等级表，又用等级代指检查动作。 | “用脚本跑测试、检查修改范围”；删除 L0 等级。 |
-| “低阶模型”“轻量模型”“执行模型”“高阶模型”（14、25–27 行） | 标签不能直接告诉读者选哪个配置，也容易把模型名称当成质量保证。 | 直接写配置名；确有比较数据时再说明谁更快、谁通过更多任务。 |
-| “完整配置身份”“配置身份”（30、191–198 行） | 把一组运行设置说成一种新身份，增加理解成本。 | “本次使用的程序、模型和设置”。 |
-| “外部分级”“外部校准”（30 行） | “外部”指谁不清楚，“校准”没有先说明要做哪些任务。 | “主 agent 暂定的分工”“用固定任务试跑”；后者推迟。 |
-| “目录可见不等于推理已验证”（30 行） | 读者可能把目录理解为文件夹。 | “模型列表里有这个名称，不代表已经成功调用过它”。 |
-| “Orchestrator”（36 行及全文） | 已有“主 agent”，反复混用没有增加信息。 | 全文用“主 agent”。 |
-| “Triage / Router”（37 行） | 为“判断任务是否简单”单设角色和两个英文名称。 | “主 agent 判断是否需要派给子 agent”；删除独立角色。 |
-| “Executor”（38 行及全文） | 和中文混写，读者需要反复转换。 | “执行 agent”。 |
-| “Reviewer”“异模型 Reviewer”（39、59、146 行） | 容易把“独立检查”误读成“必须再请一个模型”。 | “审查者”；第一期由人或主 agent 审查。 |
-| “Summarizer”（40 行） | 日志摘要尚无明确需求，却占一个角色。 | “需要时摘要日志”；从第一期角色表删除。 |
-| “拆解为任务 DAG”（50、73 行） | DAG 是标准术语，但第一期派发一个任务不需要先设计依赖图。 | “有依赖的任务按顺序做”；基础流程只写单任务。 |
-| “业务 UUID”“业务任务”（82、88 行） | 与 bridge task 同时出现，却要求读者先理解两层任务。 | 第一期开头直接用“任务”，ID 使用 bridge 返回的 `task_id`。 |
-| “task_key”“外部可读别名”（83 行） | 再增加一个名字，却规定它不能用于关联。 | 需要展示时写任务标题，不设必填别名。 |
-| “派发意图”“外部分配的 bridge_instance_id”（88、385 行） | 为一次调用新增意图和实例两层概念。 | “调用前记下任务说明”；第一期只接一个 bridge，不新增这两个字段。 |
-| “spec_version”“supersedes”（95–96、174 行） | 英文字段和任务替代关系挤进基础任务示例。 | “任务要求改了就重新派发，保留旧结果”；删除版本关系。 |
-| “固定为 instruction”（90 行） | “固定”究竟指写入、冻结还是转换，需要猜。 | “把任务说明原样传给 `instruction`”。 |
-| “派发前固定的反馈版本”“固定入口所指版本”（107、172 行） | 简单的拒绝原因被写成文件发布规则。 | “下一次执行前把拒绝原因给执行 agent”；版本化反馈推迟。 |
-| “固定输出树”“重新固定输入”（123 行） | 连续使用“固定”而不说明具体动作。 | “停止写文件，记下待检查的那份修改；检查期间变了就重新检查”。 |
-| “累计 diff”“累计补丁 hash”（125、182 行） | 只有多轮接力才需要区别这几份修改。 | “从最初输入到现在的全部修改”；接力功能推迟。 |
-| “歧义度”“上下文量”“可验证性”“新颖度”（135–139 行） | 把日常判断包装成打分项，分数仍靠主观判断。 | “要求清楚吗、要读多少文件、能用什么检查、有没有类似代码”；只作写任务时的提醒。 |
-| “影响面”（136 行） | 没有直接指出改动对象。 | “会改哪些文件、接口和数据格式”。 |
-| “降级试探建议”“探索任务”（164、322 行） | 听起来有完整策略，实际只是找机会换较便宜模型试做。 | “人工挑一个风险低的任务试用其他模型”；移到以后再做。 |
-| “原指令重试”“带入前次修改”（166–185 行） | 标题可理解，但正文把基本重做扩成版本、会话、补丁迁移规则。 | “重做时是否保留上次修改”；第一期失败后停下，由人决定。 |
+## Part 2: Scope Trim Summary
 
-### 1.2 评价与选模型
+### 2.1 Removed from Phase 1
+- Multi-tier L0-L3 tables, 1-5 task scoring rubrics, auto escalation/de-escalation, multi-round patch relays, 11-field config identity hashes, 12 event schemas -> compressed to `dispatch` / `result` / `review` (or v1's merged `task` + `review`).
+- External Bridge SQLite mirroring/cursors, generic field `correction` overlays, auto-truncation repair events, Bayesian smoothing, random exploration tracking, heterogeneous Reviewer rubrics, 20-40 benchmark suites, Git commit trailers/`git blame` defect pipelines, and mandatory `retention_days` auto-pruning.
 
-| 原文表达及位置 | 为什么不合适 | 白话替换或处理 |
-|---|---|---|
-| “配置身份 × task_type × difficulty 分桶”（191 行） | 中英文和统计说法混在一起，一句话藏了三层分类。 | “按配置分别统计”；类型和难度分类以后再加。 |
-| “完整元组及版本”（320 行；字段见 194–195 行） | 数学用语增加负担，11 个配置字段也没有基础功能依据。 | “这次运行用了哪些设置”；第一期不设计完整配置版本表。 |
-| “非敏感、不透明标识及版本”（198 行） | “不透明”没有告诉使用者该填什么。 | “随手生成的配置编号，不写账号和密钥”；第一期无需认证配置编号。 |
-| “重新分桶”（198 行） | 需要读者自行还原分组规则。 | “改设置后另起一组统计”。 |
-| “数据覆盖率”（200、243 行） | 未在名称中说明缺少哪种数据。 | “总共多少条，其中多少条有结果／费用”；基础报表直接列数量。 |
-| “首次通过率 FPA”（206 行） | “首次通过率”能理解，缩写和跨任务去重规则给第一期增加负担。 | 第一期开头只定义“任务通过率”，不使用 FPA，也不暗称它衡量首次成功。 |
-| “最终通过率”（207 行） | 定义限定为“未升级”，与日常理解的最终成功不一致。 | 若以后保留，改为“未换模型时的最终通过率”；第一期删除。 |
-| “原始 FPA”“调整后 FPA”“排除规则”（200、212、321 行） | 同时报两种通过率，需要额外审批哪些失败不算，读者容易只看较好看的数字。 | “包含全部失败的通过率”“去掉指定原因后的通过率”；第一期只算前一种，原因照实保留。 |
-| “缺陷逃逸率”“同等观察期”（209 行） | 属于已有质量术语，但需要合入后观察和人工确认，超出当前任务。 | “通过后又发现缺陷的任务比例”；移出第一期。 |
-| “可靠性与诚实度”“虚报完成率”（218–228 行） | 测试失败并不能直接说明执行者是否诚实，名字容易引出过度判断。 | 记事实：“声称测试通过，独立重跑失败”；第一期写拒绝原因即可。 |
-| “suspected / confirmed / unknown”（222、228 行） | 三个英文状态被用来支撑一套新评价流程。 | “待确认／已确认／不清楚”；第一期不建这套分类。 |
-| “规格遵循度”（224 行） | 一串任务要求被折算为一个比例，反而掩盖哪些要求没满足。 | “哪些要求没完成”；写进拒绝原因。 |
-| “合理求助率”“真实歧义”（226 行） | 分母仍需人工逐条判断，统计成本大，名称也不能指导当前动作。 | “要求不清楚时是否及时提问”；保留行为要求，删除指标。 |
-| “Executor-only”“executor_cost_per_accept”（234、241 行） | 英文和长字段名盖过了简单的费用计算，还引出额外计量要求。 | “执行 agent 每完成一个通过任务花了多少钱”；第一期不计算。 |
-| “父会话开销”“parent_overhead”（236 行） | 不熟悉 bridge 的读者不知道“父”指哪个会话。 | “主 agent 的用量”；费用分摊推迟。 |
-| “墙钟时间”（237 行） | 是已有技术用语，但这里不用术语更清楚。 | “从派发到确定通过或拒绝，实际过了多久”。 |
-| “token 效率”“有效 diff 行数”（238 行） | “有效行”没有清楚标准，多改行也不代表做得好。 | 若需排查，展示 token 数和改动行数；删除比值。 |
-| “cost_scope”“price_date”“catalog_estimate”（243 行） | 一次引入费用范围、价格日期和估价概念，基础报表用不到。 | “统计了谁的费用、用哪天价格、是否只是估价”；整段移出。 |
-| “多模型接力”（245 行） | 字面可懂，但隐去需要处理多轮输入和费用的具体工作。 | “多个模型先后修改同一任务”；第一期不支持自动接续。 |
-| “规格缺陷率”“定级准确率”（251、254 行） | 还没有稳定任务样本，就先建立评价主 agent 的指标。 | “哪些任务没写清要求、哪些任务选错执行者”；先写备注。 |
-| “用户最终通过率”（257 行） | 与 agent 审查通过并列时，容易混淆两种结论。 | “用户确认完成的请求比例”；第一期不把用户确认扩成新统计流程。 |
-| “受控报告引用”（267、434 行） | “受控”没有说明谁能读、在哪里读。 | “仅本机用户可读的报告文件”；基础记录只存检查摘要。 |
-| “数据版本摘要”“missing_source”（292 行） | 为重新查询旧数据又增加一层记录状态。 | “原始记录找不到”；直接保存基础时间，避免为了算耗时再查数据库。 |
-| “mode=advisory”“参考阈值”“硬性过滤”“自动淘汰”（298 行） | 把暂不执行的选模型规则也写成了一套模式。 | “只展示结果，由人选模型”；删除阈值和模式字段。 |
-| “候选资格”“验证资格”（302、305 行） | 没有直接说清楚检查什么。 | “这个配置是否能调用、权限是否满足任务要求”。 |
-| “measurement_status=insufficient”（303 行） | 一个英文状态替代了普通说明。 | “只有 3 条记录，暂不比较”；不增加状态字段。 |
-| “归一化公式”“balanced 评分”（304、313 行） | 属于已有算法术语，但第一期无需复述自动选模型的内部计算。 | “费用和耗时各占一半计算总分”；从正文删除算法。 |
-| “Unmeasured”“profile 生命周期状态”（312 行） | 为避免误读一个内部返回字符串，展开了读者暂时用不到的辨析。 | “没有足够测量数据时按默认顺序选”；需要时查 bridge 文档。 |
-| “小样本与衰减”“Beta(2,2) 先验”“平滑值”（319 行） | 术语本身正确，但没有展示它们解决了第一期哪个实际问题。 | “样本少时不下结论”；删除概率公式。 |
-| “30 天半衰期”“有效样本量 N_eff”（319 行） | 需要解释加权、时间衰减和样本资格，维护成本远高于原始计数。 | “先显示实际有几条记录”；删除加权和衰减。 |
-| “归因”“归到首次配置”（206、320、324 行） | 需要区分任务、尝试、模型和缺陷，正文读起来像研究方案。 | 分别写“这次执行用了谁”“哪个改动造成了缺陷”；后者推迟。 |
-| “探索”“候选集、抽样概率、随机种子”（322 行） | 描述的是随机试用模型的实验，不是基本派发。 | “偶尔人工试用其他模型”；不要求 10%，不记录抽样数据。 |
-| “Reviewer 偏差”“小样本双评”（323、471 行） | 为审查者再设计评分实验，增加第二套工作。 | “必要时请第二人复查”；以后按实际分歧决定是否增加。 |
-| “校准任务集”“检测退化”（326–332 行） | 没有先证明需要定期评估，就要求维护 20–40 个任务。 | “用固定任务比较模型”“看是否比以前更容易失败”；移到后续计划。 |
-| “缺陷归因：commit trailer”“贡献类型 mixed”（334–356 行） | 标准 Git 概念和多方贡献统计混在一起，远超派发和审查。 | “提交说明里记任务编号”“人工和 agent 都改过”；第一期不要求。 |
-| “不透明标识”“不透明 ID”（338、356 行） | 隐私意图合理，措辞却让普通编号显得特殊。 | “不含账号、项目名的随机编号”；没有公开导出时不用展开。 |
+### 2.2 Kept in P0 / P1
+- **P0**: Complete end-to-end flow for one task (explicit spec + `allowed_files` + test command -> dispatch -> independent diff/test verification -> human/primary decision -> append records -> summary metrics), keeping accepted, test-failed, and startup-failed paths cleanly tested; single-process append under `flock`, mode `0700` dir / `0600` files, zero secrets/chats stored.
+- **P1**: Wrap repeatable commands in scripts and add date/profile filters, pending-review queries, and CSV/Markdown exports using identical definitions.
 
-### 1.3 记录与文件处理
+## Part 3: Minimal v1 Specification Outline
 
-| 原文表达及位置 | 为什么不合适 | 白话替换或处理 |
-|---|---|---|
-| “元数据存储”（358 行） | 没有直接告诉读者文件记什么。 | “任务记录：每行一条 JSON”。 |
-| “字段演进”“schema_version”（360、397 行） | 记录格式尚未投入使用，就先写兼容版本协议。 | “以后改字段时，再说明旧记录怎么读”；第一期不要求格式版本管理。 |
-| “幂等键”“idempotency_key”（364、396 行） | 幂等是标准术语，但在 bridge 已有 `request_id` 之外又设计一套键。 | “同一条记录不要重复统计”；外部先用事件名、任务 ID 和尝试 ID 区分。 |
-| “task_spec”（368 行） | 把任务说明单独变成一种事件。 | “任务要求”；并入派发记录。 |
-| “dispatch_intent / dispatch_link”（369–370 行） | 一次派发拆成调用前意图和调用后关联，两种事件都要解释。 | “派发记录”；第一期不做调用中断后的自动补录。 |
-| “bridge_event / attempt_link”（371–372 行） | 为已经存在的 bridge 事件再建镜像和关联记录。 | “执行结果中保存本次尝试 ID”；不复制事件流。 |
-| “outcome”（373 行） | 同时包办结束、启动失败和状态恢复，范围过大。 | “执行结果”；不确定时写“不确定”，停止自动处理。 |
-| “review / review_result”（374–375 行） | 分别记拟提交与实际保存，要求读者理解两阶段评价。 | “确认 bridge 保存成功后，追加一条审查结论”。 |
-| “correction”“字段白名单内的 changes”（378、401 行） | 为少量人工打标先实现可编辑字段协议。 | “评价写错了如何处理”；第一期发现冲突就报错，由人核对。 |
-| “expected_effective_hash”（378、401–403、449 行） | 字段名很难读懂，还要求计算应用历史修正后的整条记录。 | 白话是“确认这条记录没有被别人改过”；第一期删除该字段及相关规则。 |
-| “派发、领取与异步补录”（383 行） | 标题掩盖了事件乱序、关联和恢复的整套实现。 | “拿到执行结果后补上尝试 ID”；第一期不做异步补录。 |
-| “派生关联”“派生记录”“持久写入”（387–388 行） | 没有先指明生成哪条记录、写到哪个文件。 | “根据 bridge 返回值补任务记录”“写入 JSONL”。 |
-| “跨库事务”（388 行） | 是准确的数据库术语，但选用 JSONL 后又以事务问题推动复杂设计。 | “bridge 和记录文件可能只写成功一个”；基础版遇到这种情况停止并提示核对。 |
-| “cursor 前移”“重放并去重”（290、388 行） | 属于事件系统做法，基础统计不需要自己管理已读事件的位置。 | “记住已读到哪里，重读时跳过重复项”；从第一期实现中删除。 |
-| “确认丢失”“生成时间等非业务字段”（396 行） | 为记录重试细分内容和传输字段，规则比任务内容还复杂。 | “写成功但调用方没收到答复”；先报告不确定，不自动重试写入。 |
-| “修正前有效记录 hash”“多个修正按文件顺序生效”（401–403、449 行） | 要先理解历史修正叠加，才能理解一条评价。 | “这条评价现在是什么内容”；第一期不实现多轮字段覆盖。 |
-| “损坏尾部”“显式修复工具”“受控备份引用”（399–405 行） | “最后一行没写完”被扩成残片、截断、备份、修复事件等操作。 | “最后一行损坏时停止读写并报行号，由人备份后处理”。 |
-| “残片 hash”“原字节位置”（405 行） | 文件恢复的细节占据基础设计正文。 | “坏行内容和位置”；删除自动截断和修复事件。 |
-| “白名单字段、短结论、内容 hash 和受控引用”（459 行） | 多个抽象要求连用，读者仍不知道具体该存什么。 | 直接列允许保存的字段，并写明“不存聊天、密钥和认证文件”。 |
-| “retention_days”“按完整业务任务及其关联组处理”（459 行） | 为保留期和关联删除增加必填配置，甚至不填就不能启用。 | “记录保留多久、谁负责删除”；第一期手工管理，不把自动清理设为启动条件。 |
-| “advisory 参考表”“阈值自动淘汰”（472–485 行） | 中英文重复，而且已经暂缓的功能仍支配实施顺序。 | “通过率和耗时表”；不在第一期设计自动选模型。 |
+1. **Five core steps**: Author & dispatch (`agent_open` + `agent_dispatch`, save `snapshot_tree`) -> await & record execution (`task_id`, `attempt_id`, `status`) -> run independent checks (re-run test command, inspect `git diff --no-renames "$snapshot_tree"` + `git ls-files --others -z`, confirm no mid-check edits) -> coordinator review (`agent_review` with concrete `evidence`) -> append terminal verdict & summarize.
+2. **Event records**: `dispatch`, `result`, terminal `review` (one JSON object per line using timezone-aware timestamps, verbatim Bridge UUIDs, explicit `null` when required checks did not run; never duplicate Bridge transcripts).
+3. **Two computed metrics alongside raw counts**: Task pass rate `accepted / (accepted + rejected + failed + interrupted_cancelled)` and arithmetic mean duration across decided tasks (`review.time` or terminal `result.time` minus `dispatch.time`), omitting incomplete/pending counts from averages while displaying them explicitly alongside decided totals.
 
-任务描述中的几个例子需要按原文准确引用：“配置身份元组”对应原文的“完整配置身份”和“完整元组及版本”；“不透明 UUID”对应“业务 UUID”和“不透明标识”等不同表达；“衰减平滑有效样本量”对应 319 行的一组统计要求。改写时分别处理，避免把合并后的说法当作原句。
+## Part 4: Target Structural Verification
 
-## 第二部分：瘦身清单——过度设计与非基础功能剥离
-
-### 2.1 应从第一期删除的内容
-
-| 原文设计及位置 | 为什么超出第一期 | 具体修改建议 |
-|---|---|---|
-| 四个等级、五种角色、分流与摘要（18–76 行） | 派发一个任务只需要主 agent 和执行 agent；独立验证也不要求多请一个模型。 | 正文只保留这两方；人或主 agent 负责审查。其他角色以后有明确需求再加。 |
-| 五项各 1–5 分的定级表（129–148 行） | 还没有任务记录，主观分数却先决定执行者和审查方式。 | 主 agent 直接选已配置的执行者；简单任务直接做，不先分类打分。 |
-| 升级与降级规则、次数累计、反馈版本和换模型带补丁（152–185 行） | 需要处理重试、规格变化、工作目录和历史贡献，远超一次执行。 | 第一版失败或拒绝后停止，不自动重派；人工决定后再派新任务，保留旧失败。 |
-| 多层任务 ID、规格替代关系和 11 项配置身份（78–117、191–198 行） | 主要服务于跨实例、多轮重试和历史模型比较。 | 使用 bridge 的 `task_id`、结果里的 `attempt_id`；记配置名、实际模型及推理强度。一次统计期间固定配置，其余设置变化时另起配置名。 |
-| 12 种事件（366–379 行） | 每一种都带来生成、读取、关联和异常处理代码。 | 压成 `dispatch`、`result`、`review` 三种；任务要求并入派发记录，结果直接带尝试 ID。 |
-| 多处规格、输入、反馈、报告及参数 hash，修正前再比较 hash（117、123、172–185、267、401–403 行） | 基础目标是检查实际修改，外部摘要并不能代替检查，还引入计算和管理工作。 | 保留 bridge 返回的 `snapshot_tree` 用于 Git diff；外部检查直接记命令、结果和原因，不要求所有文件计算摘要。 |
-| bridge 事件镜像、cursor、乱序补关联、重启重放和内部 SQLite 查询（275–292、383–390 行） | 为记录文件再做一个能够重建状态的事件系统。 | 用现成等待、结果和查询接口取得任务状态；不复制完整事件流，不读内部数据库。结果不清楚时停止并让人核对。 |
-| 通用 `correction`、可改字段列表、`expected_effective_hash`、修正叠加（399–403 行） | 多人并发改评价尚无需求，先实现了一套修改协议。 | 第一版只追加正常记录。发现写错或冲突就报错、保留原文件，暂停正式汇总，由人核对；不自动覆盖已有评价。 |
-| 尾行备份、摘要、截断及 `repair` 事件（405 行） | “坏行不能悄悄跳过”有必要，完整自动修复程序没有必要。 | 保留检查并报错；删除第一期修复工具和修复事件。文件中间损坏同样停止，不能丢行后继续统计。 |
-| 通用并发写入、独立事件幂等键、格式版本兼容协议（392–397 行） | 这些规则为多个写入者和长期升级准备，第一期可以限制使用方式。 | 只允许一个本机进程顺序写一个文件；完整写一行再继续，重复记录不重复计数。暂不支持多进程共写、跨机共写或在线格式升级。 |
-| Beta(2,2)、30 天半衰期、加权成功数与有效样本量（319 行） | 改进估计之前，应先确认基本记录是否完整、通过率怎么算。当前没有证据说明这些参数适合本项目。 | 全部删除。显示原始成功数、总数及通过率；样本少就如实显示，不据此排名。 |
-| 约 10% 探索、候选集、概率、随机种子（322 行） | 已经是在设计试验和自动选模型。 | 不设置探索比例，不保存抽样概率和随机种子；人工试用其他模型即可。 |
-| 质量／费用／耗时综合评分、参考阈值、自动淘汰的准备工作（296–315、485 行） | 即使标为“仅供参考”，仍需实现分组、完整性判断、评分和参考表。 | 第一版只展示通过率和平均耗时，由人决定下一次用谁；不加外部路由规则。bridge 自带选择功能保持原样。 |
-| 虚报率、求助率、定级准确率、评分、返工、费用分摊和 token／diff 比值（202–257 行） | 同时收集几十类判断，许多分母还需要人工额外标注。 | 保留拒绝原因；报表只算任务通过率和平均耗时。测试失败、超出文件范围直接写事实，不另开评分项目。 |
-| 异模型审查、三项 1–5 分评分表和双评（39、210、323、471 行） | 多付一次模型费用，也增加排队和结论分歧的处理。 | 第一版由人或主 agent 审查；有必要时单独请人复查，不把异模型审查设为必需步骤。 |
-| 20–40 个校准任务、每月重跑（326–332 行） | 在基本使用尚未开始时就承担长期维护任务集的工作。 | 移到未来计划；等实际任务记录显示有比较需求，再选固定任务。 |
-| commit trailer、blame、缺陷观察期、混合贡献和 squash 关联（334–356 行） | 处理的是合入后的缺陷追查，与派发、检查和记录没有直接依赖。 | 从基础设计删除；将来确需追查缺陷时单独设计。 |
-| 自动保留期、关联清理、强制 `retention_days`、一万行后评估数据库迁移（459–461 行） | 第一版还没有数据，却先要求关联清理并讨论更换存储。行数也不能直接证明 JSONL 已经不够用。 | 保留文件权限和禁止存敏感内容的要求，注明人工管理保留期；自动清理和数据库迁移推迟。 |
-
-原文实际列出 **12 种事件**，并非 9 种：`task_spec`、`dispatch_intent`、`dispatch_link`、`bridge_event`、`attempt_link`、`outcome`、`review`、`review_result`、`merge`、`defect`、`correction`、`repair`。第一期删除这些额外分类，不应只给它们换名字后继续保留全部职责。
-
-原文没有定义数字签名或前后日志逐条相连的签名链。准确的问题是：多处 hash 和修正前 hash 比较，把简单记录扩成了复杂的检查与修正规则。Git 的 `snapshot_tree` 虽然也是内容标识，却用于确定实际输入，应该保留；不能把它和额外设计的报告摘要一起删掉。
-
-### 2.2 P0、P1 应保留什么
-
-原文 P0 先做复杂记录器，独立验证到 P1，基本报表到 P3（469–472 行）。这样很可能先完成大量记账代码，却还没有一次完整的任务检查。应把最小可用的整套步骤放进 P0。
-
-| 阶段 | 保留内容 | 完成时应看到什么 |
-|---|---|---|
-| P0：完成一次任务的全过程 | 写清目标、允许修改的文件和检查命令；选一个固定配置派发；独立跑检查；人工或主 agent 通过／拒绝；追加三类记录；输出数量、通过率和平均耗时。 | 一项真实任务有派发、执行结果、审查结论；检查失败时不能记通过，执行失败也有记录。 |
-| P0：避免记录错误 | 区分执行结束和审查通过；保留失败及等待中的任务；同一结果不重复计数；写入失败或遇到坏行就停止并报错。 | 报表数字能逐条查回原记录，不能只留下成功任务。 |
-| P0：必要的文件要求 | 检查相对输入 `snapshot_tree` 的修改，包括未跟踪文件；记录期间单进程写文件；目录权限 700、文件 600；不写密钥、认证状态或原始聊天。 | 文件范围检查没有把原有未提交内容误算成执行 agent 的改动，记录不含敏感内容。 |
-| P1：让已有功能更方便 | 将 P0 的检查命令整理成脚本；支持按日期和固定配置筛选、导出表格、列出待审任务。 | 少做重复手工操作，统计定义不变，不要求增加事件种类。 |
-
-第一期正文末尾只留一小段“以后可能增加”：人工重试管理、固定任务比较、费用统计。概率选模型、时间衰减、缺陷追查、自动修复和通用修正协议都应移出；需要讨论时另写文档，不作为 P0/P1 的依赖。
-
-## 第三部分：基础功能（MVP）极简规格定义
-
-### 3.1 范围与五个步骤
-
-第一版只接一个 bridge，优先支持 Git worktree 中目标明确、检查方法明确的任务。主 agent 选一个已有配置，不先给任务打分。配置名在同一批统计中保持相同程序、供应商和运行设置；设置改变就用新配置名，模型和推理强度取会话实际值，不从配置名称猜。
-
-不增加自动重试、换模型接续或改规格后接着执行。失败或拒绝后停止，由人决定是否再派一项任务；重新派发得到新的 `task_id`，旧结果保留。下面的通过率按 bridge task 统计，不称“业务任务首次通过率”，不用于证明某个模型天生更强。
-
-1. **写清要求并派发。** 记下目标、允许修改的文件、测试命令和执行配置。调用现有 `agent_open`、`agent_dispatch`；取得任务 ID 后追加 `dispatch`。使用创建 worktree 时返回的 `snapshot_tree` 作为检查起点。
-2. **等执行结束，保存执行结果。** 通过现有等待和结果接口取得状态及本次尝试 ID，追加 `result`。启动失败也记录，尚无尝试 ID 时填 `null`。`completed` 只表示执行结束；失败、取消、结果不明分别保留。
-3. **独立检查。** 执行 agent 停止修改后，主 agent 或验证脚本在同一份输出上重跑约定测试，检查相对 `snapshot_tree` 的完整文件变化。新增、未跟踪、删除和重命名文件不能漏；检查前后文件变了，就重新检查。保留命令、退出码及超出范围的文件。
-4. **审查并打标。** 人或主 agent 对照任务要求和实际 diff 判断通过／拒绝，写一句具体原因。测试失败、修改了不允许的文件或没完成要求时不能通过；测试成功也不能代替阅读 diff。对当前 `completed` 尝试调用 `agent_review`，使用最新 revision 和现有请求 ID 规则。执行失败或结果不明不强行调用这个接口。
-5. **追加结论并统计。** 确认 bridge 已保存审查结论后，追加一条 `review`；拒绝必须写原因，通过也写检查摘要。按任务汇总通过数、未通过数、等待数、通过率和平均耗时。不要为“准备提交的结论”另增一种事件。
-
-验证仍须在任务允许的执行环境里运行。worktree 只分开工作文件，不是操作系统沙箱；这一句提醒保留即可，不在基础设计里另写一套沙箱方案。
-
-`agent_review` 已有参数为 `task_id`、`attempt_id`、`decision`、`evidence`、`expected_revision`、`request_id`，见 [接口定义](../src/agent_bridge/mcp_server.py)和[结果检查](../src/agent_bridge/store.py)。`evidence` 可以写具体检查摘要；源码要求它是非空字符串，没有要求必须写报告 hash。以下 JSONL 字段不作为额外参数传给 bridge。
-
-### 3.2 三种 JSONL 记录
-
-三种已经足够。只在审查时写一条记录，会漏掉失败或一直没审查的任务；增加派发和执行结果两条，正好补上这个缺口。**每次审查只追加一条最终结论**，不再同时保存拟提交和确认后的两套事件。
-
-共同字段只有 `event`、`time`、`task_id`。`time` 使用带时区的时间。ID 直接使用 bridge 返回值；示例的 `task-001`、`attempt-001` 是缩写展示，实际不生成这些假 ID。
-
-| 事件 | 何时写 | 额外字段 |
-|---|---|---|
-| `dispatch`：派发 | bridge 返回任务 ID 后 | `profile`、`model`、`effort`、`goal`、`allowed_files`、`test_command`、`snapshot_tree`。 |
-| `result`：执行结果 | 查到执行结束或需要人工核对时 | `attempt_id`、`status`、`reason`；失败原因写短说明，没有尝试时 ID 为 `null`。 |
-| `review`：审查结论 | 人或主 agent 检查完成，且 bridge 确认保存后 | `attempt_id`、`decision`、`reason`、`test_exit_code`、`out_of_scope_files`、`reviewer`。 |
-
-一项通过任务的记录如下，每个对象占一整行：
-
-```jsonl
-{"event":"dispatch","time":"2026-10-28T12:00:00+08:00","task_id":"task-001","profile":"codex-sol","model":"gpt-6-sol","effort":"high","goal":"修复解析器收到空输入时报错的问题","allowed_files":["src/parser.py","tests/test_parser.py"],"test_command":"pytest -q tests/test_parser.py","snapshot_tree":"<agent_open 返回的 snapshot_tree>"}
-{"event":"result","time":"2026-10-28T12:03:00+08:00","task_id":"task-001","attempt_id":"attempt-001","status":"completed","reason":"执行结束，等待独立检查"}
-{"event":"review","time":"2026-10-28T12:05:00+08:00","task_id":"task-001","attempt_id":"attempt-001","decision":"accepted","reason":"独立重跑测试通过；只改了允许的两个文件；空输入行为符合要求","test_exit_code":0,"out_of_scope_files":[],"reviewer":"main-agent"}
-```
-
-同样的 `completed` 结果，独立测试失败时应记为拒绝；下面只展示另一项任务的审查行，它之前同样应有派发和结果记录：
-
-```jsonl
-{"event":"review","time":"2026-10-28T12:15:00+08:00","task_id":"task-002","attempt_id":"attempt-002","decision":"rejected","reason":"空输入测试仍报 IndexError","test_exit_code":1,"out_of_scope_files":[],"reviewer":"main-agent"}
-```
-
-启动失败、尚无尝试 ID 时，只追加执行结果，不编造审查：
-
-```jsonl
-{"event":"result","time":"2026-10-28T12:20:05+08:00","task_id":"task-003","attempt_id":null,"status":"failed","reason":"执行程序启动失败"}
-```
-
-字段和读写规则保持简单：
-
-- `dispatch` 中的要求是派发当时的要求。第一期用明确文件清单，不另做文件匹配规则语言。完整 instruction 继续由 bridge 保存，JSONL 不复制原始对话和代码。
-- `test_exit_code=0` 表示独立测试通过；未跑或任务事先约定没有自动测试时为 `null`，原因说明替代检查。代码任务要求的测试未跑，不能记为通过。`out_of_scope_files=[]` 只表示实际查过且没有超出范围；没查填 `null`，不能通过。
-- `result.status` 使用 bridge 实际返回状态。`completed` 没有 `review` 时是待审；`recovery_needed` 等结果不明状态是待核对，不当作成功或确定失败。确认启动失败，即使 `attempt_id=null` 也算未通过。
-- 同一任务的 `dispatch` 只统计一次；`result`、`review` 用任务 ID 和尝试 ID 区分。同一记录完全重复时只算一次，出现互相矛盾的结论就报错并暂停正式汇总，不另加外部事件 UUID、幂等键或修正协议。
-- 单个本机进程逐行追加，写入成功再继续；写失败或读到坏行，报告文件及行号并停止，不跳过、不自动截断。不同主会话使用不同记录文件，第一期不做多个写入者协调。
-- 调用 bridge 结果不明，或 bridge 保存成功而 JSONL 未写成功时，停止后续派发，提示人工用已有任务和请求信息核对。不能为补记录更换请求 ID 再执行一次，也不能把未核对的数据当作完整报表。
-
-这版不承诺进程崩溃后自动补齐全部记录，也不做中途更换 bridge 状态目录后的自动合并。明确这两个使用限制，足以省掉派发意图、实例编号、事件镜像和自动补录；以后确有恢复需求，再补具体功能。
-
-### 3.3 两个指标，附原始数量
-
-按任务 ID 统计，不把 `dispatch`、`result`、`review` 三行当成三个任务。报表按派发时间筛选一批任务，并写明统计截止时间；配置名称、实际模型或推理强度不同的记录分别展示，不生成综合排名。
-
-| 显示项 | 最简单的定义 |
-|---|---|
-| 原始数量 | 通过、审查拒绝、执行失败、中断／取消、运行或排队中、待审、待核对各有多少任务。每项任务只占其中一类。 |
-| 任务通过率 | 通过数 ÷（通过数 + 审查拒绝数 + 执行失败数 + 中断／取消数）。等待、待审、结果不明暂不进分母，必须同时显示其数量；分母为 0 显示“暂无已确定结果”。 |
-| 平均耗时 | 对上述已确定结果的任务，计算从 `dispatch.time` 到确定结论的时间，再取算术平均。通过／拒绝用 `review.time`，执行失败／中断／取消用 `result.time`。包括排队、执行、独立测试和等审时间；未结束的不算，另外显示其数量。 |
-
-平均耗时覆盖通过与未通过任务，不只挑成功任务计算；它表示这一批任务得到确定结果用了多久，不称“模型推理速度”。基础时间直接留在 JSONL，无需每次统计再查询 bridge 数据库。
-
-例如：通过 6 项、拒绝 2 项、执行失败 1 项、取消 1 项，另有 2 项待审，则通过率是 `6 / 10 = 60%`，同时显示“待审 2 项”。执行失败不能因为没进入审查就被漏掉，待审也不能当成功。
-
-不用 Beta 先验、不衰减、不加权、不算有效样本量、不混入主 agent 评分或费用。拒绝原因先写具体句子，例如“改了不允许的 configs/a.yaml”“要求新增的测试没有写”；等实际记录显示常见原因后，再考虑分类。
-
-## 第四部分：对原文的精简改写提纲
-
-### 4.1 将 485 行压到约 150–180 行
-
-建议标题改为“Agent 任务派发、检查与记录（第一版）”。标题直接说明这一版做什么；自动分级和选模型暂时没有实现，不应继续占据正文主体。
-
-| 新章节 | 具体写什么 | 大约行数 |
-|---|---|---|
-| 1. 第一版做什么 | 一个任务从派发到审查、记录、统计；不自动重试或选模型；明确哪些是待实现功能。 | 10 |
-| 2. 谁负责什么 | 主 agent 写要求、派发并审查；执行 agent 修改和自测；脚本独立检查。删除等级和五角色表。 | 10 |
-| 3. 任务怎么写 | 一个短示例，只含目标、允许文件、测试命令；说明实际执行配置和输入快照来自哪里。 | 15 |
-| 4. 一次任务怎么做完 | 五步流程；通过和失败各一条分支；`completed` 仍需审查，执行失败不调用 review。 | 25 |
-| 5. 独立检查什么 | 重跑测试；相对输入快照检查全部文件变化；读 diff；检查期间文件变化就重做。 | 20 |
-| 6. 记录什么 | 三种 JSONL 及一组完整示例；一行一条、单进程追加、重复和损坏时怎么处理。 | 35 |
-| 7. 怎么看结果 | 原始数量、通过率、平均耗时；分母为零和等待中的处理。 | 15 |
-| 8. 实施与限制 | P0 完成整套基本步骤，P1 减少手工操作；文件权限、敏感内容限制、异常时停下、简短未来计划。 | 20 |
-
-约 150 行用于必要内容，再留少量说明和空行。行数是编辑目标，重点是每段都能对应实际要做的动作，不用把复杂段落改成更长的单行来凑数。
-
-### 4.2 原章节逐项怎么改
-
-| 原章节及行号 | 修改动作 |
-|---|---|
-| 开头说明、设计原则（1–14） | 保留 bridge 已提供什么、哪些仍待实现，以及执行结束不等于通过。删掉提前指向多处复杂统计规则的说明。第 4 行链接的 `agent-tiering-review.md` 在当前 worktree 中不存在；改写时应改链到实际存在的文档或源码。 |
-| 分级与角色（18–40） | 删除 L0–L3 表和五角色表，改成主 agent、执行 agent、检查脚本的职责说明，不规定主 agent 必须使用 L3。 |
-| 协作流程、标识、任务规格（44–117） | 删除分流、DAG、升级和依赖图分支；用五步流程替换。任务示例删除业务 UUID、规格版本、反馈文件、难度和预算对象，只保留目标、文件与检查方法。 |
-| 独立验证（119–125） | 保留输入 `snapshot_tree`、全部文件变化、检查期间不能改文件，以及 worktree 不提供操作系统隔离。删除跨轮累计 diff 和多种模式通用设计；第一期先写清 Git worktree 的做法。 |
-| 任务定级（129–148） | 整节删除。正文一句话说明由主 agent 根据任务选择已有配置即可。 |
-| 升级、重试与带入修改（152–185） | 替换为“失败或拒绝后停下，由人决定下一步；重新派发保留旧记录”。bridge 的详细重试接口放到已有使用文档，不在这里重写。 |
-| 评价指标（189–269） | 大幅删除，仅留原始数量、通过率、平均耗时、具体拒绝原因，以及 review 的必要调用条件。bridge 自带 quality 与外部统计不可混称，一句解释足够。 |
-| 数据来源、路由与内部选择算法（275–315） | 保留“通过公开结果接口查询”的短说明；删除内部 SQLite 读取、balanced 算法、完整费用样本条件和参考阈值。不改 bridge 已有自动选择。 |
-| 统计、校准、缺陷追查（317–356） | 整段移出基础正文；未来计划只写是否需要比较模型、是否需要统计费用等具体问题，不保留公式、概率或 trailer 协议。 |
-| JSONL 存储（358–461） | 以第三部分的三类记录替换；删除复杂 ID、事件镜像、自动补录、修正、修复和关联清理。允许直接存基础时间，避免统计依赖外部数据库。 |
-| 实施步骤与待决问题（465–485） | 合并成 P0/P1 两步。删去与自动淘汰、缺陷和复杂计量有关的“已定”要求；是否增加这些功能以后单独决定。 |
-
-### 4.3 改完后逐条检查
-
-- 读者能在开头看懂：谁派任务、谁跑检查、谁决定通过；不需要先学等级、配置身份或评分算法。
-- 用文中的示例可以完成一次派发、一次独立测试和文件范围检查、一次审查及记录；启动失败和拒绝也有明确记录方式。
-- 只有三种 JSONL 事件，只有通过率和平均耗时两个计算指标；每个字段都能说出它在基本步骤中的用途。
-- 没有“虽然后面再做，但第一期必须先实现它所需全部记录”的要求。自动选模型需要的数据不提前塞进基础格式。
-- 不因瘦身删除必要检查：执行结束仍需审查，测试和文件范围仍须独立检查，失败不消失，写入错误不能假装成功。
-- 正文没有未经解释的新名词，没有把待实现功能写成已经存在；使用限制和异常时需要人工核对的地方都说清楚。
+Ensures the streamlined ~150-180 line `agent-tiering.md` spec keeps essential safety checks intact (no blind trust in worker claims, mandatory independent diff and test reruns relative to `snapshot_tree`, preserved failures, halt on write/parse corruption, and explicit working links into [MCP interface](../src/agent_bridge/mcp_server.py) and [review checks](../src/agent_bridge/store.py)).

@@ -1,9 +1,22 @@
 [project]
 name = "cli-agent-bridge"
 version = "0.2.12"
-description = "Local sessions and tasks across Codex, Claude Code, Pi and Antigravity"
+description = "Local and multi-host sessions and tasks across Codex, Claude Code, Pi and Antigravity"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["mcp==1.30.0", "claude-agent-sdk==0.2.172"]
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+[project.urls]
+Repository = "https://github.com/qinjian623/cli-agent-bridge"
+Issues = "https://github.com/qinjian623/cli-agent-bridge/issues"
 
 [project.scripts]
 agent-bridge = "agent_bridge.cli:main"

@@ -99,7 +99,7 @@ def _build_native_fixture(root: Path) -> tuple[Path, Path]:
     (agy_home / "annotations").mkdir(parents=True)
     codex_home.mkdir(parents=True)
 
-    conv_agy = "00000000-0000-7000-8000-000000000014"
+    conv_agy = "11111111-1111-4111-8111-111111111111"
     lock_file = agy_home / "presence" / f"{conv_agy}.lock"
     lock_file.write_text("")
     lock_st = lock_file.stat()
@@ -107,7 +107,7 @@ def _build_native_fixture(root: Path) -> tuple[Path, Path]:
     lock_min = os.minor(lock_st.st_dev)
     (agy_home / "annotations" / f"{conv_agy}.pbtxt").write_text('title: "AGY Live Review"\n')
 
-    conv_codex = "00000000-0000-7000-8000-000000000001"
+    conv_codex = "22222222-2222-4222-8222-222222222222"
     (codex_home / "session_index.jsonl").write_text(
         json.dumps({"id": conv_codex, "thread_name": "Codex Native Task"}) + "\n"
     )
@@ -135,7 +135,7 @@ def _build_native_fixture(root: Path) -> tuple[Path, Path]:
         comm="bash",
         exe="/usr/bin/bash",
         cwd="/repo/agy",
-        args=["/bin/bash", "/home/user/.local/bin/agy"],
+        args=["/bin/bash", "/home/alice/.local/bin/agy"],
     )
 
     # 2. AGY headless worker
@@ -307,7 +307,7 @@ class NativeAndApiMonitorTests(unittest.TestCase):
         self.assertEqual("antigravity", pids[2001]["runtime"])
         self.assertEqual("agy", pids[2001]["display_runtime"])
         self.assertEqual("AGY Live Review", pids[2001]["name"])
-        self.assertEqual("00000000-0000-7000-8000-000000000014", pids[2001]["native_id"])
+        self.assertEqual("11111111-1111-4111-8111-111111111111", pids[2001]["native_id"])
 
         # AGY headless worker
         self.assertEqual("worker", pids[2003]["kind"])
@@ -565,7 +565,7 @@ class NativeAndApiMonitorTests(unittest.TestCase):
                 ppid=1,
                 comm="bash",
                 exe="/usr/bin/bash",
-                args=["/bin/bash", "/home/user/.local/bin/agy"],
+                args=["/bin/bash", "/home/alice/.local/bin/agy"],
             )
             _write_proc(
                 proc_root,

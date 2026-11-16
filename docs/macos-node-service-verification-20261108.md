@@ -1,33 +1,35 @@
-# Captain 服务检查（2026-11-08）
+> Language: English | [中文](zh/macos-node-service-verification-20261108.md)
 
-Captain 使用 SSH 别名 `macos-node`，仓库为 `/Users/user/gits/cli-agent-bridge`。本机通过 SSH 执行远端 `agent-bridge relay`，不需要 Captain 再通过反向 SSH 登录本机。
+# Secondary Node (`macos-node`) Service Verification (2026-11-08)
 
-## 服务与配置
+The remote macOS host (anonymized SSH alias `macos-node`) holds checkout under `~/gits/cli-agent-bridge`. The Linux coordinator executes `agent-bridge relay` over SSH; the remote node never requires reverse SSH access back to the coordinator.
 
-- Captain：安装并加载用户服务 `gui/502/local.cli-agent-bridge`，配置文件为 `/Users/user/Library/LaunchAgents/local.cli-agent-bridge.plist`。启用 `RunAtLoad`、`KeepAlive` 和 10 秒重启间隔。
-- 两端使用各自的 `~/.local/state/cli-agent-bridge`，没有复制认证或共享 SQLite。
-- 本机 `hosts.macos-node` 指向远端绝对命令和状态目录。SSH 使用非交互认证、已知主机密钥检查、连接超时及保活，关闭 agent forwarding；沿用已登记的节点身份。
-- 本机仅重启 Broker 加载主机配置。已有 Pi worker 属于独立 systemd unit，没有停止它们。
+## Services and Configuration
 
-Captain 原数据库有 18 个 `open/stopped`、没有原生 ID 和 worker 的旧会话，以及 7 条排队任务。启动 Broker 会自动拉起这些会话，因此启动前使用 `pause_drain` 暂停它们，保留队列和历史。没有取消或执行这些任务；需要继续时，应明确选择会话后再 `resume`。
+- Remote macOS node (`macos-node`): installed and loaded user `LaunchAgent` `gui/<uid>/local.cli-agent-bridge` (`~/Library/LaunchAgents/local.cli-agent-bridge.plist`) with `RunAtLoad`, `KeepAlive`, and a 10-second throttle interval.
+- Both hosts maintain independent `~/.local/state/cli-agent-bridge` directories without copying credentials or sharing SQLite files.
+- Coordinator `hosts.macos-node` points to the remote binary and state directory. SSH enforces non-interactive authentication, known-host key checks, connect timeouts, keepalives, disabled agent forwarding, and pinned node identity.
+- Only the coordinator broker was restarted to reload host configuration; existing independent Pi systemd workers remained running.
 
-## 本次修复
+The remote database already held 18 historical `open/stopped` sessions (with no native IDs or workers) and 7 queued tasks. Before bringing up the remote broker, those sessions were switched via `pause_drain` so history and queued items stayed preserved without auto-executing stale tasks; resume explicitly only when selected.
 
-持续运行检查发现，后台轮询每次创建 SSH 连接却不关闭，约 70 秒积累了 42 条连接并导致 Captain 拒绝新 SSH。现改为每个主机复用同一客户端，Broker 退出时关闭连接。
+## Fixes Applied During Bring-Up
 
-每次远端请求先在同一 SSH 连接上握手并核对节点身份；握手后连接发生变化时拒绝发送本次请求，下次新请求重新握手。身份异常保持禁止发送，直到管理员重新登记。断线不重发结果不明的原请求。
+Continuous runtime polling exposed an issue where background host pollers opened fresh SSH processes without closing them (~42 accumulated connections over ~70s, exhausting `macos-node` SSH limits). Updated `PeerClient` to reuse one multiplexed SSH subprocess per host cleanly until broker exit or host reconfiguration.
 
-监控原先每次重新创建主机清单，导致已连接的主机仍显示 `offline`。Broker 内部监控改为使用运行中的主机清单；独立终端和 Web 监控通过本机 Broker 读取快照，请求失败时仍可查看本地数据。
+Each remote RPC verifies peer handshake identity on the shared SSH connection; connection replacement between handshake and request rejects the call, while identity mismatches lock out sends until manual administrator re-pinning. Unexpected disconnects never blindly resend uncertain requests.
 
-## 实际检查
+Monitor snapshots previously rebuilt a fresh host registry and showed connected nodes as `offline`. Internal broker monitoring now queries the active runtime registry directly; CLI and web monitors fetch live broker snapshots and retain read-only local data on failure.
 
-- Captain 本机 `agent_inspect` 调用成功，`doctor` 显示 `broker_socket=true`。
-- SSH `peer.hello` 与 `peer.inspect(kind=node)` 返回同一节点，并匹配已有身份登记；协议版本为 1，节点状态为 `ready`。
-- 本机 `agent_hosts` 返回 `macos-node=online`，最近通信时间持续更新；`agent_catalog(host_id=macos-node)` 读到远端 3 个配置；MCP 和独立终端监控均显示在线。
-- 连续观察 30.5 秒，四次取样始终只有同一个 SSH 子进程，主机和监控始终在线；此前的连接增长没有再发生。
-- 向 Captain 的 Broker 发送正常 `SIGTERM` 后，launchd 自动拉起新实例，原生接口恢复，18 个会话仍暂停，7 条任务仍排队，没有模型 worker。
-- 610 项自动测试通过，Ruff 与 `git diff --check` 通过。测试覆盖连接复用、主机隔离、关闭、并发、身份不符、握手后断线、重连、原请求不重发及监控读取。
+## Observed Verification
 
-未执行远端模型推理、训练或真实会话广播。远端模型配置仍标记为未验证。本次 launchd 检查发生在用户已登录的情况下，未验证登出或整机重启后的恢复。
+- `agent_inspect` on `macos-node` succeeded; `doctor` reported `broker_socket=true`.
+- SSH `peer.hello` and `peer.inspect(kind=node)` matched the pinned node identity (`protocol_version=1`, `state=ready`).
+- Coordinator `agent_hosts` reported `macos-node=online` with updating contact timestamps, `agent_catalog(host_id=macos-node)` returned 3 remote profiles, and MCP/TUI monitors displayed `online`.
+- Across 4 samples over 30.5 seconds, only a single SSH child process remained active without connection leaks.
+- Sending `SIGTERM` to the remote broker caused `launchd` to restart it automatically while preserving the 18 paused sessions and 7 queued tasks with zero unexpected workers.
+- Automated suite at check time: 610 tests passed, Ruff and `git diff --check` clean (covering connection reuse, host isolation, cleanup, concurrency, identity mismatch, disconnect/reconnect, no blind retries, and monitoring reads).
 
-详细检查结果保存在本机私有目录 `<private-validation-state>/report`，Captain 服务检查保存在远端 `<private-validation-state>/report`；不在仓库保存数据库、令牌或原始会话内容。
+Remote model inference, training jobs, and live broadcasts were not executed in this verification pass (remote profiles stayed `verified=false`), and `launchd` was verified only within an active logged-in session rather than pre-login/post-reboot.
+
+Detailed artifacts remain in local private state (`<private-validation-state>/report` and remote `deployments/macos-node-service-20261108/`); no databases, tokens, or raw chats were committed.
