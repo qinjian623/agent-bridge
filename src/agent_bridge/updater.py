@@ -1,4 +1,8 @@
-"""Install checked GitHub wheels beside existing code; drain and hot-swap the broker while compatible workers run."""
+"""Install checked GitHub or Tailscale/HTTPS mirror wheels; drain and hot-swap the broker while compatible workers run.
+
+Mirror trust boundary: without independent artifact signatures, SHA256SUMS detects corruption and filename
+mismatch, while Tailscale routing/ACLs or HTTPS TLS protect transport and the mirror host is trusted as publisher.
+"""
 
 from __future__ import annotations
 
@@ -7,17 +11,24 @@ import asyncio
 import contextlib
 import fcntl
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shlex
 import shutil
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -223,17 +234,340 @@ def busy_snapshot(
     return {"busy": bool(reasons), "reasons": reasons, "counts": counts, "hot": hot}
 
 
+_TAILSCALE_IPV4_NET = ipaddress.ip_network("100.64.0.0/10")
+_TAILSCALE_IPV6_NET = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def _is_tailscale_or_loopback_ip(raw_ip: str) -> bool:
+    host = raw_ip.strip().split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.is_loopback:
+        return True
+    if isinstance(addr, ipaddress.IPv4Address):
+        return addr in _TAILSCALE_IPV4_NET
+    return addr in _TAILSCALE_IPV6_NET
+
+
+def _is_tailscale_or_loopback_host(hostname: str) -> bool:
+    host = hostname.strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".ts.net"):
+        return True
+    return _is_tailscale_or_loopback_ip(host)
+
+
+def validate_release_url(url: str) -> str:
+    """Validate and normalize an HTTP(S) OTA release base URL."""
+    if not isinstance(url, str):
+        raise ValueError("Invalid release_url")
+    cleaned = url.strip()
+    if not cleaned or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+        raise ValueError("Invalid release_url")
+    parsed = urllib.parse.urlsplit(cleaned)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("release_url must use http or https")
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError("release_url must not contain credentials, query parameters, or fragments")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("Invalid release_url host")
+    _ = parsed.port
+    if any(seg == ".." for seg in parsed.path.split("/")):
+        raise ValueError("release_url path must not contain '..'")
+    if scheme == "http" and not _is_tailscale_or_loopback_host(host):
+        raise ValueError("Plain HTTP release URLs are restricted to Tailscale or loopback hosts")
+    return cleaned.rstrip("/")
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 3
+
+class _DownloadDeadline:
+    """Enforces an overall wall-clock deadline across DNS, TLS, headers, redirects, and body reads."""
+
+    def __init__(self, timeout: float) -> None:
+        total = float(timeout)
+        if total <= 0:
+            raise TimeoutError("Release download deadline exceeded")
+        self.deadline = time.monotonic() + total
+        self.expired = threading.Event()
+        self._lock = threading.Lock()
+        self._socks: set[socket.socket] = set()
+        self._timer = threading.Timer(total, self._abort)
+        self._timer.daemon = True
+
+    def __enter__(self) -> _DownloadDeadline:
+        self._timer.start()
+        return self
+
+    def __exit__(self, *args) -> None:
+        self._timer.cancel()
+        with self._lock:
+            self._socks.clear()
+
+    def check(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if self.expired.is_set() or remaining <= 0:
+            self.expired.set()
+            raise TimeoutError("Release download deadline exceeded")
+        return remaining
+
+    def track(self, sock: socket.socket) -> None:
+        with self._lock:
+            if self.expired.is_set() or time.monotonic() >= self.deadline:
+                self.expired.set()
+                with contextlib.suppress(OSError):
+                    sock.close()
+                raise TimeoutError("Release download deadline exceeded")
+            self._socks.add(sock)
+
+    def untrack(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._socks.discard(sock)
+
+    def _abort(self) -> None:
+        self.expired.set()
+        with self._lock:
+            socks = list(self._socks)
+        for sock in socks:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 3
+
+    def __init__(self, expected_scheme: str, expected_host: str, expected_port: int, guard: _DownloadDeadline) -> None:
+        self._expected_scheme = expected_scheme
+        self._expected_host = expected_host
+        self._expected_port = expected_port
+        self._guard = guard
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = validate_release_url(newurl)
+        parsed = urllib.parse.urlsplit(target)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or (443 if scheme == "https" else 80)
+        if scheme != self._expected_scheme:
+            raise ValueError("Refusing cross-scheme release redirect")
+        if host != self._expected_host or port != self._expected_port:
+            raise ValueError("Refusing cross-origin release redirect")
+        return super().redirect_request(req, fp, code, msg, headers, target)
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        try:
+            self._guard.check()
+            location = headers.get("location") or headers.get("uri")
+            if not location:
+                return None
+            newurl = urllib.parse.urljoin(req.full_url, location.strip())
+            new = self.redirect_request(req, fp, code, msg, headers, newurl)
+            if new is None:
+                return None
+            visited = getattr(req, "redirect_dict", {})
+            if len(visited) >= self.max_redirections or visited.get(newurl, 0) >= 1:
+                raise ValueError("Too many release redirects")
+            new.redirect_dict = {**visited, newurl: visited.get(newurl, 0) + 1}
+        finally:
+            # Close redirect response immediately without draining unbounded or slow bodies.
+            with contextlib.suppress(OSError):
+                fp.close()
+        return self.parent.open(new, timeout=self._guard.check())
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
+def _resolve_addrs_with_deadline(host: str, port: int, guard: _DownloadDeadline):
+    done = threading.Event()
+    box: list[tuple[str, object]] = []
+
+    def _lookup() -> None:
+        try:
+            box.append(("ok", socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)))
+        except BaseException as error:
+            box.append(("err", error))
+        finally:
+            done.set()
+
+    threading.Thread(target=_lookup, daemon=True).start()
+    if not done.wait(timeout=guard.check()):
+        guard.expired.set()
+        raise TimeoutError("Release download DNS resolution exceeded deadline")
+    guard.check()
+    kind, payload = box[0]
+    if kind == "err":
+        raise payload  # type: ignore[misc]
+    return payload
+
+
+def _open_guarded_socket(
+    host: str,
+    port: int,
+    guard: _DownloadDeadline,
+    *,
+    tailscale_only: bool,
+) -> socket.socket:
+    guard.check()
+    addrs = _resolve_addrs_with_deadline(host, port, guard)
+    if not addrs:
+        raise OSError("Could not resolve mirror host")
+    if tailscale_only:
+        for _, _, _, _, sockaddr in addrs:
+            if not _is_tailscale_or_loopback_ip(str(sockaddr[0])):
+                raise ValueError("Plain HTTP release host resolved outside Tailscale or loopback ranges")
+    last_err: OSError | None = None
+    for family, socktype, proto, _, sockaddr in addrs:
+        sock = None
+        try:
+            remaining = guard.check()
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(remaining)
+            guard.track(sock)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as error:
+            last_err = error
+            if sock is not None:
+                guard.untrack(sock)
+                with contextlib.suppress(OSError):
+                    sock.close()
+    guard.check()
+    if last_err is not None:
+        raise last_err
+    raise OSError("Failed to connect to mirror host")
+
+
+class _VerifiedTailscaleHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection pinning DNS results to Tailscale/loopback IPs under the download deadline."""
+
+    def __init__(self, host: str, *, guard: _DownloadDeadline, **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self._guard = guard
+
+    def connect(self):
+        self.sock = _open_guarded_socket(self.host, self.port, self._guard, tailscale_only=True)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection enforcing the shared download deadline across TCP connect and TLS handshake."""
+
+    def __init__(self, host: str, *, guard: _DownloadDeadline, **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self._guard = guard
+
+    def connect(self):
+        raw = _open_guarded_socket(self.host, self.port, self._guard, tailscale_only=False)
+        wrapped = None
+        try:
+            raw.settimeout(self._guard.check())
+            wrapped = self._context.wrap_socket(raw, server_hostname=self.host, do_handshake_on_connect=False)
+            self._guard.track(wrapped)
+            self._guard.untrack(raw)
+            wrapped.settimeout(self._guard.check())
+            wrapped.do_handshake()
+        except Exception:
+            if wrapped is not None:
+                self._guard.untrack(wrapped)
+                with contextlib.suppress(OSError):
+                    wrapped.close()
+            else:
+                self._guard.untrack(raw)
+                with contextlib.suppress(OSError):
+                    raw.close()
+            raise
+        self.sock = wrapped
+
+
+class _BoundedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, guard: _DownloadDeadline) -> None:
+        super().__init__()
+        self._guard = guard
+
+    def http_open(self, req):
+        req.timeout = self._guard.check()
+        return self.do_open(lambda host, **kw: _VerifiedTailscaleHTTPConnection(host, guard=self._guard, **kw), req)
+
+
+class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, guard: _DownloadDeadline, *, context: ssl.SSLContext) -> None:
+        super().__init__(context=context)
+        self._guard = guard
+
+    def https_open(self, req):
+        req.timeout = self._guard.check()
+        return self.do_open(
+            lambda host, **kw: _DeadlineHTTPSConnection(host, guard=self._guard, **kw),
+            req,
+            context=self._context,
+        )
+
+
+def _download_bytes(url: str, *, max_bytes: int, timeout: float = 30.0) -> bytes:
+    """Download a bounded release payload within a total wall-clock deadline."""
+    clean = validate_release_url(url)
+    parsed = urllib.parse.urlsplit(clean)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    with _DownloadDeadline(timeout) as guard:
+        handlers: list[urllib.request.BaseHandler] = [
+            _SameOriginRedirectHandler(scheme, host, port, guard),
+            _BoundedHTTPHandler(guard),
+        ]
+        if _is_tailscale_or_loopback_host(host):
+            handlers.append(urllib.request.ProxyHandler({}))
+        if scheme == "https":
+            handlers.append(_BoundedHTTPSHandler(guard, context=ssl.create_default_context()))
+        opener = urllib.request.build_opener(*handlers)
+        request = urllib.request.Request(clean, headers={"Accept": "application/json, application/octet-stream"})
+        chunks = bytearray()
+        try:
+            with opener.open(request, timeout=guard.check()) as response:
+                guard.check()
+                while True:
+                    remaining = guard.check()
+                    raw_stream = getattr(getattr(response, "fp", None), "raw", None)
+                    raw_sock = getattr(raw_stream, "_sock", None)
+                    if raw_sock is not None:
+                        with contextlib.suppress(OSError):
+                            raw_sock.settimeout(remaining)
+                    read_fn = getattr(response, "read1", response.read)
+                    chunk = read_fn(65_536)
+                    guard.check()
+                    if not chunk:
+                        break
+                    if len(chunks) + len(chunk) > max_bytes:
+                        raise ValueError("Release asset exceeds size limit")
+                    chunks.extend(chunk)
+        except (OSError, http.client.HTTPException):
+            if guard.expired.is_set() or time.monotonic() >= guard.deadline:
+                raise TimeoutError("Release download deadline exceeded") from None
+            raise
+    return bytes(chunks)
+
+
 def load_settings(state: Path):
     path = state / "update.json"
     _private(path)
     value = json.loads(path.read_text())
-    if not isinstance(value, dict) or set(value) != {
+    required = {
         "repository",
         "root",
         "service_kind",
         "service_name",
         "bootstrap_python",
-    }:
+    }
+    if not isinstance(value, dict) or not required <= set(value) <= (required | {"release_url"}):
         raise ValueError("Invalid update settings")
     if any(not isinstance(item, str) for item in value.values()):
         raise ValueError("Update settings must be strings")
@@ -250,16 +584,46 @@ def load_settings(state: Path):
             or "\n" in value[key]
         ):
             raise ValueError(f"Invalid {key}")
+    if "release_url" in value:
+        validate_release_url(value["release_url"])
     _private(Path(value["root"]), directory=True)
     return value
 
 
-def latest_release(repository):
-    data = json.loads(
-        _run(["gh", "api", "--hostname", "github.com", f"repos/{repository}/releases/latest"], timeout=30)
-    )
-    if not isinstance(data, dict) or type(data.get("id")) is not int or data["id"] <= 0:
-        raise ValueError("Invalid GitHub release response")
+def build_release_manifest(
+    tag: str,
+    wheel_size: int,
+    checksums_size: int,
+    *,
+    release_id: int | None = None,
+) -> dict[str, object]:
+    """Build and validate a release mirror manifest (`latest.json`) sharing the release parser contract."""
+    _version(tag)
+    wheel = f"cli_agent_bridge-{tag[1:]}-py3-none-any.whl"
+    payload: dict[str, object] = {
+        "tag_name": tag,
+        "draft": False,
+        "prerelease": False,
+        "assets": [
+            {"name": wheel, "size": wheel_size},
+            {"name": "SHA256SUMS", "size": checksums_size},
+        ],
+    }
+    if release_id is not None:
+        payload["id"] = release_id
+    _parse_release_payload(payload, require_positive_id=False)
+    return payload
+
+
+def _parse_release_payload(data, *, require_positive_id: bool = True):
+    if not isinstance(data, dict):
+        raise ValueError("Invalid release response")
+    release_id = data.get("id")
+    if require_positive_id:
+        if type(release_id) is not int or release_id <= 0:
+            raise ValueError("Invalid GitHub release response")
+    elif release_id is not None and (type(release_id) is not int or release_id < 0):
+        raise ValueError("Invalid release response")
     tag = data.get("tag_name")
     if not isinstance(tag, str) or not TAG.fullmatch(tag) or data.get("draft") or data.get("prerelease"):
         raise ValueError("Only stable vX.Y.Z releases can be installed automatically")
@@ -271,7 +635,19 @@ def latest_release(repository):
         matches = [a for a in assets if a.get("name") == name]
         if len(matches) != 1 or type(matches[0].get("size")) is not int or not 0 < matches[0]["size"] <= limit:
             raise ValueError("Release must contain exactly one bounded wheel and SHA256SUMS")
-    return {"tag": tag, "wheel": wheel, "release_id": data["id"]}
+    return {"tag": tag, "wheel": wheel, "release_id": release_id}
+
+
+def latest_release(repository, *, release_url: str | None = None):
+    if release_url is not None:
+        base = validate_release_url(release_url)
+        raw = _download_bytes(f"{base}/latest.json", max_bytes=262_144, timeout=30)
+        data = json.loads(raw.decode("utf-8"))
+        return _parse_release_payload(data, require_positive_id=False)
+    data = json.loads(
+        _run(["gh", "api", "--hostname", "github.com", f"repos/{repository}/releases/latest"], timeout=30)
+    )
+    return _parse_release_payload(data, require_positive_id=True)
 
 
 def verify_wheel(directory: Path, filename: str):
@@ -301,6 +677,18 @@ def _version(tag):
     return tuple(map(int, match.groups()))
 
 
+@contextlib.contextmanager
+def _acquire_update_lock(root: Path):
+    lock_path = root / "update.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        _private(lock_path)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 class Updater:
     def __init__(self, state: Path):
         self.state = state
@@ -322,7 +710,11 @@ class Updater:
         return data
 
     def check(self):
-        release = latest_release(self.settings["repository"])
+        release_url = self.settings.get("release_url")
+        if release_url is not None:
+            release = latest_release(self.settings["repository"], release_url=release_url)
+        else:
+            release = latest_release(self.settings["repository"])
         installed = self.installed()
         return {
             "available": release,
@@ -371,15 +763,14 @@ class Updater:
 
     @contextlib.contextmanager
     def _locked(self):
-        descriptor = os.open(self.root / "update.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            _private(self.root / "update.lock")
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with _acquire_update_lock(self.root):
             yield
-        finally:
-            os.close(descriptor)
 
     def stage(self, release):
+        _version(release["tag"])
+        expected_wheel = f"cli_agent_bridge-{release['tag'][1:]}-py3-none-any.whl"
+        if release.get("wheel") != expected_wheel:
+            raise ValueError("Release wheel filename does not match tag version")
         releases = self.root / "releases"
         releases.mkdir(mode=0o700, exist_ok=True)
         _private(releases, directory=True)
@@ -388,27 +779,37 @@ class Updater:
         try:
             with tempfile.TemporaryDirectory(prefix="download-", dir=self.root) as name:
                 download = Path(name)
-                _run(
-                    [
-                        "gh",
-                        "release",
-                        "download",
-                        release["tag"],
-                        "--repo",
-                        "github.com/" + self.settings["repository"],
-                        "--dir",
-                        str(download),
-                        "--pattern",
-                        release["wheel"],
-                        "--pattern",
-                        "SHA256SUMS",
-                    ],
-                    timeout=120,
-                )
-                digest = verify_wheel(download, release["wheel"])
+                release_url = self.settings.get("release_url")
+                if release_url is not None:
+                    base = validate_release_url(release_url)
+                    (download / expected_wheel).write_bytes(
+                        _download_bytes(f"{base}/releases/{release['tag']}/{expected_wheel}", max_bytes=100_000_000, timeout=120)
+                    )
+                    (download / "SHA256SUMS").write_bytes(
+                        _download_bytes(f"{base}/releases/{release['tag']}/SHA256SUMS", max_bytes=65_536, timeout=30)
+                    )
+                else:
+                    _run(
+                        [
+                            "gh",
+                            "release",
+                            "download",
+                            release["tag"],
+                            "--repo",
+                            "github.com/" + self.settings["repository"],
+                            "--dir",
+                            str(download),
+                            "--pattern",
+                            expected_wheel,
+                            "--pattern",
+                            "SHA256SUMS",
+                        ],
+                        timeout=120,
+                    )
+                digest = verify_wheel(download, expected_wheel)
                 _run(["uv", "venv", "--python", self.settings["bootstrap_python"], str(target)], timeout=120)
                 _run(
-                    ["uv", "pip", "install", "--python", str(target / "bin/python"), str(download / release["wheel"])],
+                    ["uv", "pip", "install", "--python", str(target / "bin/python"), str(download / expected_wheel)],
                     timeout=300,
                 )
             compatibility = self.preflight(target, release["tag"])
@@ -674,7 +1075,15 @@ def _launcher(root: Path, bootstrap: Path, module: str):
 
 
 def install(
-    state: Path, repository=REPOSITORY, service_kind=None, service_name=None, root=None, interval=3600, enable=False
+    state: Path,
+    repository=REPOSITORY,
+    service_kind=None,
+    service_name=None,
+    root=None,
+    interval=3600,
+    enable=False,
+    *,
+    release_url: str | None = None,
 ):
     """Write launchers and timer only; migrating an existing broker service is a separate, deliberate step."""
     if type(interval) is not int or interval < 300:
@@ -695,6 +1104,8 @@ def install(
         "service_name": name,
         "bootstrap_python": str(bootstrap),
     }
+    if release_url is not None:
+        settings["release_url"] = validate_release_url(release_url)
     path = state / "update.json"
     if path.exists() and json.loads(path.read_text()) != settings:
         raise ValueError("Existing update settings differ; edit the private config explicitly")
@@ -756,6 +1167,53 @@ def install(
     }
 
 
+def set_release_url(state: Path, release_url: str | None):
+    """Set or clear the HTTP(S) OTA mirror URL in private update settings.
+
+    Upgrade hosts running versions older than 0.2.11 before adding ``release_url``, because older
+    ``load_settings()`` parsers reject unrecognized keys in ``update.json``.
+    """
+    updater = Updater(state)
+    normalized = validate_release_url(release_url) if release_url else None
+    with updater._locked():
+        current = load_settings(state)
+        updated = dict(current)
+        if normalized is not None:
+            updated["release_url"] = normalized
+        else:
+            updated.pop("release_url", None)
+        _write(state / "update.json", updated)
+        load_settings(state)
+    return {"status": "configured", "release_url": updated.get("release_url")}
+
+
+def _has_protected_update_status(state: Path) -> bool:
+    """Return True if update-status.json holds an in-progress or uncertain recovery journal."""
+    path = state / "update-status.json"
+    if not path.exists():
+        return False
+    try:
+        if path.is_symlink():
+            return True
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return True
+    return isinstance(data, dict) and data.get("status") in {"activating", "uncertain"}
+
+
+def _record_cli_failure(state: Path, result: dict[str, object]) -> None:
+    try:
+        root = Path(load_settings(state)["root"])
+        _private(root, directory=True)
+        with _acquire_update_lock(root):
+            if _has_protected_update_status(state):
+                return
+            _private(state, directory=True)
+            _write(state / "update-status.json", {**result, "checked_at": time.time()})
+    except (OSError, ValueError):
+        return
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path)
@@ -766,37 +1224,53 @@ def main(argv=None):
     parser.add_argument("--interval", type=int, default=3600)
     parser.add_argument("--enable", action="store_true")
     parser.add_argument("--jitter", type=int, default=0)
+    parser.add_argument("--release-url", help="Optional Tailscale/HTTPS OTA release mirror base URL")
     parser.add_argument(
         "--drain-workers",
         action="store_true",
         help="Wait until all live workers and active tasks stop before switching versions",
     )
-    parser.add_argument("action", choices=["check", "run", "install", "bootstrap"])
+    parser.add_argument("action", choices=["check", "run", "install", "bootstrap", "set-url"])
     args = parser.parse_args(argv)
     from .config import state_directory
 
+    record_cli_failure = False
     try:
         state = state_directory(str(args.state) if args.state else None)
+        if args.release_url is not None and args.action not in {"install", "set-url"}:
+            raise ValueError("--release-url is only valid with install or set-url")
         if not 0 <= args.jitter <= 300:
             raise ValueError("Jitter must be between 0 and 300 seconds")
         if args.jitter:
             time.sleep(secrets.randbelow(args.jitter + 1))
         if args.action == "install":
+            record_cli_failure = True
             result = install(
-                state, args.repository, args.service_kind, args.service_name, args.root, args.interval, args.enable
+                state,
+                args.repository,
+                args.service_kind,
+                args.service_name,
+                args.root,
+                args.interval,
+                args.enable,
+                release_url=args.release_url,
             )
+        elif args.action == "set-url":
+            if args.release_url is None:
+                raise ValueError("--release-url is required for set-url")
+            result = set_release_url(state, args.release_url)
         elif args.action == "run":
+            record_cli_failure = True
             result = Updater(state).run(drain_workers=args.drain_workers)
         else:
+            record_cli_failure = True
             updater = Updater(state)
             result = getattr(updater, args.action)()
-    except (OSError, ValueError, RuntimeError, BridgeError) as error:
-        # Error class is sufficient for logs; never echo gh/credential diagnostics.
+    except (OSError, ValueError, RuntimeError, BridgeError, http.client.HTTPException) as error:
+        # Error class is sufficient for logs; never echo gh/credential/URL diagnostics.
         result = {"status": "failed", "error_type": type(error).__name__}
-        if "state" in locals():
-            with contextlib.suppress(OSError, ValueError):
-                _private(state, directory=True)
-                _write(state / "update-status.json", {**result, "checked_at": time.time()})
+        if record_cli_failure and "state" in locals() and not isinstance(error, BlockingIOError):
+            _record_cli_failure(state, result)
     print(json.dumps(result, ensure_ascii=False))
     if result.get("status") in {"failed", "uncertain", "rolled_back"}:
         raise SystemExit(1)
