@@ -88,7 +88,10 @@ jobs:
           uv venv "$SMOKE_ENV" --python 3.11
           uv pip install --python "$SMOKE_ENV/bin/python" dist/*.whl
           "$SMOKE_ENV/bin/agent-bridge" --help
-          "$SMOKE_ENV/bin/agent-bridge" --state "$SMOKE_STATE" init
+          "$SMOKE_ENV/bin/agent-bridge" --state "$SMOKE_STATE" init \
+            --non-interactive --profile name=smoke,runtime=codex,provider=openai-codex,model=gpt-5
+          "$SMOKE_ENV/bin/agent-bridge" --state "$SMOKE_STATE" init --non-interactive
+          "$SMOKE_ENV/bin/agent-bridge" --state "$SMOKE_STATE" doctor
           "$SMOKE_ENV/bin/python" - <<'PY'
           import os
           from pathlib import Path
@@ -96,17 +99,26 @@ jobs:
           config = Config.load(Path(os.environ["SMOKE_STATE"]) / "config.json")
           assert config.profiles and not any(p.verified for p in config.profiles.values())
           PY
-      - name: Write SHA256SUMS
+      - name: Write SHA256SUMS and latest.json
         run: |
-          python - <<'PY'
-          import hashlib
+          "$SMOKE_ENV/bin/python" - <<'PY'
+          import hashlib, json, tomllib
           from pathlib import Path
-          files = sorted([*Path("dist").glob("*.whl"), *Path("dist").glob("*.tar.gz")])
-          assert len(files) == 2, files
-          Path("dist/SHA256SUMS").write_text("".join(
+          from agent_bridge.updater import build_release_manifest
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          assert len(wheels) == 1 and len(sdists) == 1, (wheels, sdists)
+          files = sorted([*wheels, *sdists])
+          sums = Path("dist/SHA256SUMS")
+          sums.write_text("".join(
               f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n" for p in files
           ))
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          manifest = build_release_manifest(f"v{version}", wheels[0].stat().st_size, sums.stat().st_size)
+          Path("dist/latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
           PY
+        env:
+          SMOKE_ENV: ${{ runner.temp }}/bridge-package-smoke
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cli-agent-bridge-${{ matrix.os }}
@@ -114,6 +126,7 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             dist/SHA256SUMS
+            dist/latest.json
           if-no-files-found: error
           retention-days: 14
 
@@ -138,6 +151,6 @@ jobs:
         run: |
           cd dist
           sha256sum --check SHA256SUMS
-          gh release create "$RELEASE_TAG" *.whl *.tar.gz SHA256SUMS \
+          gh release create "$RELEASE_TAG" *.whl *.tar.gz SHA256SUMS latest.json \
             --draft --verify-tag --title "$RELEASE_TAG" --generate-notes
           gh release edit "$RELEASE_TAG" --draft=false --latest
