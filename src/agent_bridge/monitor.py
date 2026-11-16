@@ -213,9 +213,17 @@ def _is_pid_alive(pid: int | None) -> bool:
 
 
 def _format_relative_time(epoch: float | None) -> str:
-    if not epoch:
+    if not epoch or isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
         return "-"
-    delta = time.time() - epoch
+    try:
+        epoch_f = float(epoch)
+    except (OverflowError, TypeError, ValueError):
+        return "-"
+    if not math.isfinite(epoch_f):
+        return "-"
+    delta = time.time() - epoch_f
+    if not math.isfinite(delta):
+        return "-"
     if delta < 0:
         return "now"
     if delta < 60:
@@ -224,13 +232,21 @@ def _format_relative_time(epoch: float | None) -> str:
         return f"{int(delta // 60)}m ago"
     if delta < 86400:
         return f"{int(delta // 3600)}h ago"
-    return f"{int(delta // 86400)}d ago"
+    days = delta // 86400
+    if not math.isfinite(days):
+        return "-"
+    return f"{int(days)}d ago"
 
 
 def _format_bytes(size: int | float | None) -> str:
-    if size is None:
+    if size is None or isinstance(size, bool):
         return "-"
-    size = float(size)
+    try:
+        size = float(size)
+    except (OverflowError, TypeError, ValueError):
+        return "-"
+    if not math.isfinite(size):
+        return "-"
     for unit in ("B", "KB", "MB", "GB"):
         if size < 1024:
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
@@ -415,10 +431,22 @@ class MonitorCollector:
             return isinstance(val, bool)
 
         def _is_int(val: Any) -> bool:
-            return isinstance(val, int) and not isinstance(val, bool)
+            return isinstance(val, int) and not isinstance(val, bool) and -(1 << 63) <= val <= (1 << 63) - 1
 
         def _is_num(val: Any) -> bool:
-            return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val))
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                return False
+            try:
+                f = float(val)
+            except OverflowError:
+                return False
+            return math.isfinite(f)
+
+        def _is_timestamp(val: Any) -> bool:
+            return _is_num(val) and 0.0 <= float(val) <= 253402300799.0
+
+        def _is_cost(val: Any) -> bool:
+            return _is_num(val) and 0.0 <= float(val) <= 1e12
 
         def _is_dict(val: Any) -> bool:
             return isinstance(val, dict)
@@ -426,10 +454,38 @@ class MonitorCollector:
         def _opt(obj: dict[str, Any], pred: Any, *keys: str) -> bool:
             return all((obj.get(k) is None or pred(obj.get(k))) for k in keys)
 
+        def _if_present(obj: dict[str, Any], pred: Any, *keys: str) -> bool:
+            return all((k not in obj or pred(obj[k])) for k in keys)
+
         if not isinstance(data, dict):
             return False
-        if not _opt(data, _is_num, "timestamp") or not _opt(data, _is_int, "collector_version") or not _opt(
-            data, _is_bool, "events_truncated"
+
+        # Reject any non-str dict keys, integers outside signed 64-bit, or non-finite floats anywhere in payload.
+        stack: list[Any] = [data]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    if not isinstance(k, str):
+                        return False
+                    stack.append(v)
+            elif isinstance(cur, list):
+                stack.extend(cur)
+            elif isinstance(cur, bool) or cur is None or isinstance(cur, str):
+                continue
+            elif isinstance(cur, int):
+                if not (-(1 << 63) <= cur <= (1 << 63) - 1):
+                    return False
+            elif isinstance(cur, float):
+                if not math.isfinite(cur):
+                    return False
+            else:
+                return False
+
+        if (
+            not _if_present(data, _is_timestamp, "timestamp")
+            or not _if_present(data, _is_int, "collector_version")
+            or not _if_present(data, _is_bool, "events_truncated")
         ):
             return False
 
@@ -458,19 +514,27 @@ class MonitorCollector:
                 return False
             if not _opt(item, _is_str, "ssh_target", "remote_executable", "node_id", "state_generation", "last_contact_rel", "detail"):
                 return False
-            if not _opt(item, _is_num, "last_contact") or not _opt(item, _is_int, "protocol_version") or not _opt(item, _is_dict, "projects"):
+            if not _opt(item, _is_timestamp, "last_contact") or not _opt(item, _is_int, "protocol_version") or not _if_present(item, _is_dict, "projects"):
                 return False
 
         for item in sessions:
             if not isinstance(item, dict) or not _is_str(item.get("id")):
                 return False
-            if not _opt(item, _is_str, "name", "host_id", "runtime", "display_runtime", "model", "profile", "status", "observed", "source", "native_id"):
+            if not _opt(item, _is_str, "name", "host_id", "runtime", "display_runtime", "model", "profile", "status", "observed", "source", "native_id", "cwd"):
                 return False
-            if not _opt(item, _is_bool, "alive", "waiting_question", "cost_complete", "has_attempts", "managed"):
+            if not _if_present(item, _is_bool, "alive", "waiting_question", "cost_complete", "has_attempts", "managed"):
                 return False
-            if not _opt(item, _is_int, "worker_pid", "revision") or not _opt(item, _is_num, "cost_usd") or not _opt(item, _is_dict, "attempt"):
+            if (
+                not _opt(item, _is_int, "worker_pid", "revision")
+                or not _opt(item, _is_cost, "cost_usd")
+                or not _opt(item, _is_timestamp, "created")
+                or not _opt(item, _is_dict, "attempt", "task")
+            ):
                 return False
-            if isinstance(item.get("attempt"), dict) and not _opt(item["attempt"], _is_num, "cost_usd"):
+            if isinstance(item.get("attempt"), dict) and (
+                not _opt(item["attempt"], _is_cost, "cost_usd")
+                or not _if_present(item["attempt"], _is_bool, "cost_complete")
+            ):
                 return False
 
         for item in events:
@@ -480,10 +544,10 @@ class MonitorCollector:
                 return False
             if not _opt(item, _is_str, "session_id", "session_name", "runtime", "task_id", "summary", "created_rel"):
                 return False
-            if not _opt(item, _is_num, "created"):
+            if not _opt(item, _is_timestamp, "created"):
                 return False
 
-        if not _opt(
+        if not _if_present(
             metrics,
             _is_int,
             "latest_event_seq",
@@ -501,31 +565,35 @@ class MonitorCollector:
             "known_cost_sessions",
         ):
             return False
-        if not _opt(metrics, _is_num, "total_cost_usd") or not _opt(metrics, _is_bool, "cost_complete", "has_cost_gaps"):
+        if not _opt(metrics, _is_cost, "total_cost_usd") or not _if_present(metrics, _is_bool, "cost_complete", "has_cost_gaps"):
             return False
 
-        native_sessions = data.get("native_sessions")
-        if native_sessions is not None:
+        if "native_sessions" in data:
+            native_sessions = data["native_sessions"]
             if not isinstance(native_sessions, list):
                 return False
             for item in native_sessions:
                 if not isinstance(item, dict):
                     return False
-                if not _opt(item, _is_str, "runtime", "display_runtime", "mode", "name", "model", "cwd", "kind", "native_id"):
+                if not _opt(item, _is_str, "id", "runtime", "display_runtime", "mode", "name", "model", "cwd", "kind", "native_id", "host_id", "status", "observed", "profile"):
                     return False
                 if not _opt(item, _is_int, "pid"):
                     return False
+                if "native_ids" in item:
+                    nids = item["native_ids"]
+                    if not isinstance(nids, list) or not all(_is_str(x) for x in nids):
+                        return False
 
-        runtimes = data.get("runtimes")
-        if runtimes is not None:
+        if "runtimes" in data:
+            runtimes = data["runtimes"]
             if not isinstance(runtimes, dict):
                 return False
             for rt_key, info in runtimes.items():
                 if not _is_str(rt_key) or not isinstance(info, dict):
                     return False
-                if not _opt(info, _is_str, "display_name"):
+                if not _if_present(info, _is_str, "runtime", "display_name"):
                     return False
-                if not _opt(
+                if not _if_present(
                     info,
                     _is_int,
                     "bridge_active",
@@ -536,38 +604,45 @@ class MonitorCollector:
                     "bridge_stopped",
                     "native_active",
                     "native_workers",
+                    "native_interactive",
                     "native_daemons",
+                    "total_live",
                     "known_cost_sessions",
                 ):
                     return False
-                if not _opt(info, _is_num, "total_cost_usd") or not _opt(info, _is_bool, "cost_complete"):
+                if not _if_present(info, _is_cost, "total_cost_usd") or not _if_present(info, _is_bool, "cost_complete"):
                     return False
 
-        pending_questions = data.get("pending_questions")
-        if pending_questions is not None:
+        if "pending_questions" in data:
+            pending_questions = data["pending_questions"]
             if not isinstance(pending_questions, list):
                 return False
             for q in pending_questions:
                 if not isinstance(q, dict):
                     return False
-                if not _opt(q, _is_str, "id", "session_id", "session_name", "tool", "command", "description", "created_rel") or not _opt(q, _is_num, "created"):
+                if not _opt(q, _is_str, "id", "session_id", "session_name", "tool", "command", "description", "created_rel") or not _opt(q, _is_timestamp, "created"):
                     return False
 
-        groups = data.get("groups")
-        if groups is not None:
+        if "groups" in data:
+            groups = data["groups"]
             if not isinstance(groups, list):
                 return False
             for g in groups:
                 if not isinstance(g, dict):
                     return False
-                if not _opt(g, _is_str, "group_id", "created_rel") or not _opt(g, _is_int, "bridge_members", "native_members", "remote_members", "total_members"):
+                if (
+                    not _opt(g, _is_str, "group_id", "created_rel")
+                    or not _opt(g, _is_timestamp, "created")
+                    or not _if_present(g, _is_int, "bridge_members", "native_members", "remote_members", "total_members")
+                ):
                     return False
-                rhosts = g.get("remote_hosts")
-                if rhosts is not None and (not isinstance(rhosts, list) or not all(_is_str(x) for x in rhosts)):
-                    return False
+                if "remote_hosts" in g:
+                    rhosts = g["remote_hosts"]
+                    if not isinstance(rhosts, list) or not all(_is_str(x) for x in rhosts):
+                        return False
 
-        broadcasts = data.get("broadcasts")
-        if broadcasts is not None:
+        if "broadcasts" in data:
+            broadcasts = data["broadcasts"]
             if not isinstance(broadcasts, list):
                 return False
             for b in broadcasts:
@@ -575,14 +650,14 @@ class MonitorCollector:
                     return False
                 if not _is_int(b.get("received")) or not _is_int(b.get("total")):
                     return False
-                if not _opt(b, _is_int, "pending", "sending", "uncertain", "failed"):
+                if not _if_present(b, _is_int, "pending", "sending", "uncertain", "failed"):
                     return False
-                if not _opt(b, _is_str, "broadcast_id", "group_id", "message_preview", "created_rel") or not _opt(b, _is_num, "created"):
+                if not _opt(b, _is_str, "broadcast_id", "group_id", "message_preview", "created_rel") or not _opt(b, _is_timestamp, "created"):
                     return False
 
-        peer_queues = data.get("peer_queues")
-        if peer_queues is not None:
-            if not isinstance(peer_queues, dict) or not _opt(peer_queues, _is_dict, "inbox", "outbox", "member_outbox", "operations"):
+        if "peer_queues" in data:
+            peer_queues = data["peer_queues"]
+            if not isinstance(peer_queues, dict) or not _if_present(peer_queues, _is_dict, "inbox", "outbox", "member_outbox", "operations"):
                 return False
 
         return True
@@ -714,6 +789,17 @@ class MonitorCollector:
                 async def live_snapshot(call_args: dict[str, Any]):
                     return await asyncio.wait_for(request(self.state, "agent_monitor", call_args), 2)
 
+                broker_reply_errors = (
+                    BridgeError,
+                    OSError,
+                    ValueError,
+                    TimeoutError,
+                    TypeError,
+                    KeyError,
+                    AttributeError,
+                    ArithmeticError,
+                )
+
                 try:
                     reply = asyncio.run(live_snapshot(rpc_args))
                     if self._is_valid_broker_snapshot_reply(reply):
@@ -776,15 +862,7 @@ class MonitorCollector:
                                     filtered = wide_filtered
                                 else:
                                     widening_failed = True
-                            except (
-                                BridgeError,
-                                OSError,
-                                ValueError,
-                                TimeoutError,
-                                TypeError,
-                                KeyError,
-                                AttributeError,
-                            ):
+                            except broker_reply_errors:
                                 widening_failed = True
                         if widening_failed:
                             truncated = True
@@ -812,15 +890,7 @@ class MonitorCollector:
                         return filtered
                     if isinstance(reply, dict) and "sessions" not in reply:
                         return reply
-                except (
-                    BridgeError,
-                    OSError,
-                    ValueError,
-                    TimeoutError,
-                    TypeError,
-                    KeyError,
-                    AttributeError,
-                ):
+                except broker_reply_errors:
                     pass
         now = time.time()
         hostname = socket.gethostname()

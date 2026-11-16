@@ -3776,6 +3776,88 @@ class NativeAndApiMonitorTests(unittest.TestCase):
                         "events": [{"seq": 1}],
                         "metrics": {"latest_event_seq": 600},
                     },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                        "runtimes": {"claude": {"bridge_running": None}},
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                        "broadcasts": None,
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                        "native_sessions": None,
+                    },
+                    {
+                        "timestamp": 10**400,
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [{"id": "s1", "cost_usd": 10**400}],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                    },
+                    {
+                        "coordinator": {"db_size": 10**400},
+                        "hosts": [],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [{"id": "s1", "created": 10**400}],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                        "groups": [{"group_id": "g1", "extra_nested": {"huge": 10**400}}],
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [{"host_id": "remote-1", "state": "online", "last_contact": -1.7e308}],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [{"id": "s1", "created": -1.7e308}],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600},
+                    },
+                    {
+                        "coordinator": {},
+                        "hosts": [],
+                        "sessions": [],
+                        "events": [],
+                        "metrics": {"latest_event_seq": 600, "total_cost_usd": 1.7e308},
+                    },
                 ]
                 for bad_wide in bad_wide_replies:
                     async def _fake_v2_wide_bad(
@@ -3800,6 +3882,7 @@ class NativeAndApiMonitorTests(unittest.TestCase):
                         self.assertEqual(600, wt_snap["metrics"]["latest_event_seq"])
                         self.assertGreater(len(wt_snap["sessions"]), 0)
                         self.assertIn("remote-1", render_tui(wt_snap, width=100))
+                        self.assertGreater(len(unified_sessions(wt_snap)), 0)
             finally:
                 proxy_sock2.unlink(missing_ok=True)
 
