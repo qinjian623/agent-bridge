@@ -1,14 +1,17 @@
 """Coordinator-side host registry interface (phase A)."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
@@ -269,7 +272,7 @@ class ConfigHostRegistry:
                 protocol_version=current.protocol_version,
                 detail=None,
             )
-            self._save_pins()
+            self._save_pins(updated_host_id=host_id)
 
     def mark(self, host_id: str, state: HostState, detail: str | None = None) -> None:
         with self._lock:
@@ -312,12 +315,15 @@ class ConfigHostRegistry:
         path = self._state_dir / HOST_PINS_FILENAME
         if not path.exists():
             return hosts
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            raise BridgeError("invalid_host_pins", f"Cannot read {path}: {error}") from error
-        if not isinstance(data, dict) or not isinstance(data.get("hosts"), dict):
-            raise BridgeError("invalid_host_pins", f"{HOST_PINS_FILENAME} must contain a hosts object")
+        lock_ctx = (
+            persisted_pins_lock(self._state_dir, shared=True)
+            if os.access(self._state_dir, os.W_OK | os.X_OK) or (self._state_dir / ".host_pins.lock").exists()
+            else contextlib.nullcontext()
+        )
+        with lock_ctx:
+            data = _read_persisted_pins_data(self._state_dir)
+        if data is None:
+            return hosts
         result = dict(hosts)
         for host_id, raw in data["hosts"].items():
             if host_id not in result:
@@ -325,35 +331,127 @@ class ConfigHostRegistry:
             result[host_id] = replace(result[host_id], pinned=_parse_node_ref(host_id, raw, "invalid_host_pins"))
         return result
 
-    def _save_pins(self) -> None:
+    def _save_pins(self, *, updated_host_id: str | None = None) -> None:
         if self._state_dir is None:
             return
         self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        pinned: dict[str, dict[str, str]] = {}
-        for host_id, config in self._hosts.items():
-            if config.pinned is None:
-                continue
-            pinned[host_id] = {
-                "host_id": config.pinned.host_id,
-                "node_id": config.pinned.node_id,
-                "state_generation": config.pinned.state_generation,
-            }
-        payload = json.dumps({"version": 1, "hosts": pinned}, sort_keys=True) + "\n"
-        descriptor, temporary = tempfile.mkstemp(prefix=f".{HOST_PINS_FILENAME}.", dir=self._state_dir)
-        try:
-            os.fchmod(descriptor, HOST_PINS_FILE_MODE)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-                file.write(payload)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary, self._state_dir / HOST_PINS_FILENAME)
-            _fsync_directory(self._state_dir)
-        except BaseException:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+        with persisted_pins_lock(self._state_dir):
+            pinned: dict[str, dict[str, str]] = {}
+            version = 1
+            if updated_host_id is not None and (self._state_dir / HOST_PINS_FILENAME).exists():
+                existing = _read_persisted_pins_data(self._state_dir)
+                if existing is not None:
+                    version = int(existing.get("version", 1)) if isinstance(existing.get("version"), int) else 1
+                    for hid, entry in existing["hosts"].items():
+                        if isinstance(entry, dict):
+                            pinned[hid] = dict(entry)
+                updated_cfg = self._hosts.get(updated_host_id)
+                if updated_cfg is not None and updated_cfg.pinned is not None:
+                    pinned[updated_host_id] = {
+                        "host_id": updated_cfg.pinned.host_id,
+                        "node_id": updated_cfg.pinned.node_id,
+                        "state_generation": updated_cfg.pinned.state_generation,
+                    }
+                else:
+                    pinned.pop(updated_host_id, None)
+            else:
+                for host_id, config in self._hosts.items():
+                    if config.pinned is None:
+                        continue
+                    pinned[host_id] = {
+                        "host_id": config.pinned.host_id,
+                        "node_id": config.pinned.node_id,
+                        "state_generation": config.pinned.state_generation,
+                    }
+            _write_persisted_pins_payload(self._state_dir, {"version": version, "hosts": pinned})
+
+
+@contextlib.contextmanager
+def persisted_pins_lock(state_dir: Path, *, shared: bool = False) -> Iterator[None]:
+    """Serialize host_pins.json updates across broker and CLI processes."""
+    lock_path = state_dir / ".host_pins.lock"
+    if lock_path.is_symlink():
+        raise BridgeError("invalid_host_pins", f"Refusing to lock symlinked {lock_path.name}")
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, HOST_PINS_FILE_MODE)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise BridgeError("invalid_host_pins", f"{lock_path.name} must be a private owned regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _read_persisted_pins_data(state_dir: Path) -> dict | None:
+    path = state_dir / HOST_PINS_FILENAME
+    if path.is_symlink():
+        raise BridgeError("invalid_host_pins", f"Refusing to read symlinked {HOST_PINS_FILENAME}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise BridgeError("invalid_host_pins", f"{HOST_PINS_FILENAME} must be a regular file")
+    info = path.lstat()
+    if info.st_uid != os.getuid():
+        raise BridgeError("invalid_host_pins", f"{HOST_PINS_FILENAME} belongs to a different user")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise BridgeError("invalid_host_pins", f"Cannot read {path}: {error}") from error
+    if not isinstance(data, dict) or not isinstance(data.get("hosts"), dict):
+        raise BridgeError("invalid_host_pins", f"{HOST_PINS_FILENAME} must contain a hosts object")
+    return data
+
+
+def _write_persisted_pins_payload(state_dir: Path, payload_data: dict) -> None:
+    payload = json.dumps(payload_data, sort_keys=True) + "\n"
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{HOST_PINS_FILENAME}.", dir=state_dir)
+    try:
+        os.fchmod(descriptor, HOST_PINS_FILE_MODE)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, state_dir / HOST_PINS_FILENAME)
+        _fsync_directory(state_dir)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
+
+
+def clear_persisted_host_pins(state_dir: Path, host_ids: set[str], *, check_only: bool = False) -> bool:
+    """Validate and optionally clear persisted host identity pins under cross-process lock."""
+    if not host_ids:
+        return False
+    pins_path = state_dir / HOST_PINS_FILENAME
+    if pins_path.is_symlink():
+        raise BridgeError("invalid_host_pins", f"Refusing to edit symlinked {HOST_PINS_FILENAME}")
+    if not state_dir.exists() or not pins_path.exists():
+        return False
+    if not os.access(state_dir, os.W_OK | os.X_OK):
+        raise BridgeError("invalid_host_pins", f"Cannot update {pins_path}: state directory is not writable")
+    with persisted_pins_lock(state_dir):
+        if not pins_path.exists():
+            return False
+        if not os.access(state_dir, os.W_OK | os.X_OK):
+            raise BridgeError("invalid_host_pins", f"Cannot update {pins_path}: state directory is not writable")
+        data = _read_persisted_pins_data(state_dir)
+        if data is None:
+            return False
+        pins_hosts = dict(data["hosts"])
+        removed = False
+        for hid in host_ids:
+            if hid in pins_hosts:
+                del pins_hosts[hid]
+                removed = True
+        if not removed or check_only:
+            return removed
+        _write_persisted_pins_payload(state_dir, {**data, "hosts": pins_hosts})
+        return True
 
 
 def _fsync_directory(directory: Path) -> None:
