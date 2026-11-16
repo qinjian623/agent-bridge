@@ -1,8 +1,4 @@
-"""Install checked GitHub or Tailscale/HTTPS mirror wheels; drain and hot-swap the broker while compatible workers run.
-
-Mirror trust boundary: without independent artifact signatures, SHA256SUMS detects corruption and filename
-mismatch, while Tailscale routing/ACLs or HTTPS TLS protect transport and the mirror host is trusted as publisher.
-"""
+"""Install checked public GitHub Release wheels; drain and hot-swap the broker while compatible workers run."""
 
 from __future__ import annotations
 
@@ -12,7 +8,6 @@ import contextlib
 import fcntl
 import hashlib
 import http.client
-import ipaddress
 import json
 import os
 import re
@@ -27,15 +22,28 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any
 from xml.sax.saxutils import escape
 
 from .errors import BridgeError
 
 REPOSITORY = "qinjian623/cli-agent-bridge"
+GITHUB_WEB_ORIGIN = "https://github.com"
+GITHUB_API_ORIGIN = "https://api.github.com"
+_GITHUB_CDN_HOSTS = frozenset(
+    {
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "github-releases.githubusercontent.com",
+    }
+)
+_GITHUB_RELEASE_HOSTS = frozenset({"github.com", "api.github.com", *_GITHUB_CDN_HOSTS})
+_DEFAULT_SSL_CONTEXT: ssl.SSLContext | None = None
 TAG = re.compile(r"v(\d+)\.(\d+)\.(\d+)\Z")
 VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)\Z")
 NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
@@ -234,60 +242,34 @@ def busy_snapshot(
     return {"busy": bool(reasons), "reasons": reasons, "counts": counts, "hot": hot}
 
 
-_TAILSCALE_IPV4_NET = ipaddress.ip_network("100.64.0.0/10")
-_TAILSCALE_IPV6_NET = ipaddress.ip_network("fd7a:115c:a1e0::/48")
-
-
-def _is_tailscale_or_loopback_ip(raw_ip: str) -> bool:
-    host = raw_ip.strip().split("%", 1)[0]
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
-    if addr.is_loopback:
-        return True
-    if isinstance(addr, ipaddress.IPv4Address):
-        return addr in _TAILSCALE_IPV4_NET
-    return addr in _TAILSCALE_IPV6_NET
-
-
-def _is_tailscale_or_loopback_host(hostname: str) -> bool:
-    host = hostname.strip().lower().rstrip(".")
-    if not host:
-        return False
-    if host == "localhost" or host.endswith(".ts.net"):
-        return True
-    return _is_tailscale_or_loopback_ip(host)
-
-
-def validate_release_url(url: str) -> str:
-    """Validate and normalize an HTTP(S) OTA release base URL."""
+def _validate_github_url(
+    url: str,
+    *,
+    allowed_hosts: frozenset[str] | None = None,
+    allow_query: bool = False,
+) -> str:
+    """Validate an HTTPS GitHub Release or official GitHub asset CDN URL."""
     if not isinstance(url, str):
-        raise ValueError("Invalid release_url")
+        raise ValueError("Invalid release URL")
     cleaned = url.strip()
     if not cleaned or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
-        raise ValueError("Invalid release_url")
+        raise ValueError("Invalid release URL")
     parsed = urllib.parse.urlsplit(cleaned)
-    scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https"}:
-        raise ValueError("release_url must use http or https")
-    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-        raise ValueError("release_url must not contain credentials, query parameters, or fragments")
-    host = parsed.hostname
-    if not host:
-        raise ValueError("Invalid release_url host")
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Release URLs must use https")
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ValueError("Release URL must not contain credentials or fragments")
+    if parsed.query and not allow_query:
+        raise ValueError("Unexpected query string on GitHub release URL")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = _GITHUB_RELEASE_HOSTS if allowed_hosts is None else allowed_hosts
+    if not host or host not in allowed:
+        raise ValueError("Release URL host is not an allowed GitHub release host")
     _ = parsed.port
     if any(seg == ".." for seg in parsed.path.split("/")):
-        raise ValueError("release_url path must not contain '..'")
-    if scheme == "http" and not _is_tailscale_or_loopback_host(host):
-        raise ValueError("Plain HTTP release URLs are restricted to Tailscale or loopback hosts")
-    return cleaned.rstrip("/")
+        raise ValueError("Release URL path must not contain '..'")
+    return cleaned
 
-
-class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
-    max_redirections = 3
 
 class _DownloadDeadline:
     """Enforces an overall wall-clock deadline across DNS, TLS, headers, redirects, and body reads."""
@@ -343,25 +325,20 @@ class _DownloadDeadline:
                 sock.close()
 
 
-class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
-    max_redirections = 3
+class _RejectHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        raise ValueError("Plain HTTP release downloads are disabled")
 
-    def __init__(self, expected_scheme: str, expected_host: str, expected_port: int, guard: _DownloadDeadline) -> None:
-        self._expected_scheme = expected_scheme
-        self._expected_host = expected_host
-        self._expected_port = expected_port
+
+class _GitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+
+    def __init__(self, guard: _DownloadDeadline) -> None:
         self._guard = guard
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        target = validate_release_url(newurl)
-        parsed = urllib.parse.urlsplit(target)
-        scheme = parsed.scheme.lower()
-        host = (parsed.hostname or "").lower()
-        port = parsed.port or (443 if scheme == "https" else 80)
-        if scheme != self._expected_scheme:
-            raise ValueError("Refusing cross-scheme release redirect")
-        if host != self._expected_host or port != self._expected_port:
-            raise ValueError("Refusing cross-origin release redirect")
+        host = (urllib.parse.urlsplit(newurl).hostname or "").lower().rstrip(".")
+        target = _validate_github_url(newurl, allow_query=(host in _GITHUB_CDN_HOSTS))
         return super().redirect_request(req, fp, code, msg, headers, target)
 
     def http_error_302(self, req, fp, code, msg, headers):
@@ -410,21 +387,11 @@ def _resolve_addrs_with_deadline(host: str, port: int, guard: _DownloadDeadline)
     return payload
 
 
-def _open_guarded_socket(
-    host: str,
-    port: int,
-    guard: _DownloadDeadline,
-    *,
-    tailscale_only: bool,
-) -> socket.socket:
+def _open_guarded_socket(host: str, port: int, guard: _DownloadDeadline) -> socket.socket:
     guard.check()
     addrs = _resolve_addrs_with_deadline(host, port, guard)
     if not addrs:
-        raise OSError("Could not resolve mirror host")
-    if tailscale_only:
-        for _, _, _, _, sockaddr in addrs:
-            if not _is_tailscale_or_loopback_ip(str(sockaddr[0])):
-                raise ValueError("Plain HTTP release host resolved outside Tailscale or loopback ranges")
+        raise OSError("Could not resolve release host")
     last_err: OSError | None = None
     for family, socktype, proto, _, sockaddr in addrs:
         sock = None
@@ -444,33 +411,33 @@ def _open_guarded_socket(
     guard.check()
     if last_err is not None:
         raise last_err
-    raise OSError("Failed to connect to mirror host")
-
-
-class _VerifiedTailscaleHTTPConnection(http.client.HTTPConnection):
-    """HTTPConnection pinning DNS results to Tailscale/loopback IPs under the download deadline."""
-
-    def __init__(self, host: str, *, guard: _DownloadDeadline, **kwargs) -> None:
-        super().__init__(host, **kwargs)
-        self._guard = guard
-
-    def connect(self):
-        self.sock = _open_guarded_socket(self.host, self.port, self._guard, tailscale_only=True)
+    raise OSError("Failed to connect to release host")
 
 
 class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPSConnection enforcing the shared download deadline across TCP connect and TLS handshake."""
+    """HTTPSConnection enforcing the shared download deadline across CONNECT proxies, TCP, and TLS."""
 
     def __init__(self, host: str, *, guard: _DownloadDeadline, **kwargs) -> None:
         super().__init__(host, **kwargs)
         self._guard = guard
 
     def connect(self):
-        raw = _open_guarded_socket(self.host, self.port, self._guard, tailscale_only=False)
+        raw = _open_guarded_socket(self.host, self.port, self._guard)
         wrapped = None
         try:
+            server_hostname = self.host
+            if self._tunnel_host:
+                server_hostname = self._tunnel_host
+                raw.settimeout(self._guard.check())
+                self.sock = raw
+                try:
+                    self._tunnel()
+                finally:
+                    self.sock = None
             raw.settimeout(self._guard.check())
-            wrapped = self._context.wrap_socket(raw, server_hostname=self.host, do_handshake_on_connect=False)
+            wrapped = self._context.wrap_socket(
+                raw, server_hostname=server_hostname, do_handshake_on_connect=False
+            )
             self._guard.track(wrapped)
             self._guard.untrack(raw)
             wrapped.settimeout(self._guard.check())
@@ -488,16 +455,6 @@ class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
         self.sock = wrapped
 
 
-class _BoundedHTTPHandler(urllib.request.HTTPHandler):
-    def __init__(self, guard: _DownloadDeadline) -> None:
-        super().__init__()
-        self._guard = guard
-
-    def http_open(self, req):
-        req.timeout = self._guard.check()
-        return self.do_open(lambda host, **kw: _VerifiedTailscaleHTTPConnection(host, guard=self._guard, **kw), req)
-
-
 class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
     def __init__(self, guard: _DownloadDeadline, *, context: ssl.SSLContext) -> None:
         super().__init__(context=context)
@@ -513,23 +470,23 @@ class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
 
 
 def _download_bytes(url: str, *, max_bytes: int, timeout: float = 30.0) -> bytes:
-    """Download a bounded release payload within a total wall-clock deadline."""
-    clean = validate_release_url(url)
-    parsed = urllib.parse.urlsplit(clean)
-    scheme = parsed.scheme.lower()
-    host = (parsed.hostname or "").lower()
-    port = parsed.port or (443 if scheme == "https" else 80)
+    """Download a bounded HTTPS release payload within a total wall-clock deadline."""
+    clean = _validate_github_url(url)
+    context = _DEFAULT_SSL_CONTEXT if _DEFAULT_SSL_CONTEXT is not None else ssl.create_default_context()
     with _DownloadDeadline(timeout) as guard:
         handlers: list[urllib.request.BaseHandler] = [
-            _SameOriginRedirectHandler(scheme, host, port, guard),
-            _BoundedHTTPHandler(guard),
+            _GitHubRedirectHandler(guard),
+            _RejectHTTPHandler(),
+            _BoundedHTTPSHandler(guard, context=context),
         ]
-        if _is_tailscale_or_loopback_host(host):
-            handlers.append(urllib.request.ProxyHandler({}))
-        if scheme == "https":
-            handlers.append(_BoundedHTTPSHandler(guard, context=ssl.create_default_context()))
         opener = urllib.request.build_opener(*handlers)
-        request = urllib.request.Request(clean, headers={"Accept": "application/json, application/octet-stream"})
+        request = urllib.request.Request(
+            clean,
+            headers={
+                "Accept": "application/vnd.github+json, application/json, application/octet-stream",
+                "User-Agent": "cli-agent-bridge-updater",
+            },
+        )
         chunks = bytearray()
         try:
             with opener.open(request, timeout=guard.check()) as response:
@@ -567,10 +524,13 @@ def load_settings(state: Path):
         "service_name",
         "bootstrap_python",
     }
-    if not isinstance(value, dict) or not required <= set(value) <= (required | {"release_url"}):
+    optional = {"interval"}
+    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(required | optional):
         raise ValueError("Invalid update settings")
-    if any(not isinstance(item, str) for item in value.values()):
+    if any(not isinstance(value[key], str) for key in required):
         raise ValueError("Update settings must be strings")
+    if "interval" in value and (type(value["interval"]) is not int or value["interval"] < 300):
+        raise ValueError("Update interval must be an integer >= 300")
     repo = value["repository"]
     if not isinstance(repo, str) or len(repo.split("/")) != 2 or not all(NAME.fullmatch(x) for x in repo.split("/")):
         raise ValueError("Invalid GitHub repository")
@@ -584,8 +544,6 @@ def load_settings(state: Path):
             or "\n" in value[key]
         ):
             raise ValueError(f"Invalid {key}")
-    if "release_url" in value:
-        validate_release_url(value["release_url"])
     _private(Path(value["root"]), directory=True)
     return value
 
@@ -597,7 +555,7 @@ def build_release_manifest(
     *,
     release_id: int | None = None,
 ) -> dict[str, object]:
-    """Build and validate a release mirror manifest (`latest.json`) sharing the release parser contract."""
+    """Build and validate a GitHub release manifest (`latest.json`) matching the release parser."""
     _version(tag)
     wheel = f"cli_agent_bridge-{tag[1:]}-py3-none-any.whl"
     payload: dict[str, object] = {
@@ -638,16 +596,28 @@ def _parse_release_payload(data, *, require_positive_id: bool = True):
     return {"tag": tag, "wheel": wheel, "release_id": release_id}
 
 
-def latest_release(repository, *, release_url: str | None = None):
-    if release_url is not None:
-        base = validate_release_url(release_url)
-        raw = _download_bytes(f"{base}/latest.json", max_bytes=262_144, timeout=30)
-        data = json.loads(raw.decode("utf-8"))
-        return _parse_release_payload(data, require_positive_id=False)
-    data = json.loads(
-        _run(["gh", "api", "--hostname", "github.com", f"repos/{repository}/releases/latest"], timeout=30)
-    )
-    return _parse_release_payload(data, require_positive_id=True)
+def latest_release(repository: str):
+    if not isinstance(repository, str) or len(repository.split("/")) != 2 or not all(NAME.fullmatch(x) for x in repository.split("/")):
+        raise ValueError("Invalid GitHub repository")
+    try:
+        raw = _download_bytes(
+            f"{GITHUB_WEB_ORIGIN}/{repository}/releases/latest/download/latest.json",
+            max_bytes=262_144,
+            timeout=30,
+        )
+        require_positive_id = False
+    except urllib.error.HTTPError as error:
+        with contextlib.closing(error):
+            if error.code != 404:
+                raise
+        raw = _download_bytes(
+            f"{GITHUB_API_ORIGIN}/repos/{repository}/releases/latest",
+            max_bytes=262_144,
+            timeout=30,
+        )
+        require_positive_id = True
+    data = json.loads(raw.decode("utf-8"))
+    return _parse_release_payload(data, require_positive_id=require_positive_id)
 
 
 def verify_wheel(directory: Path, filename: str):
@@ -710,11 +680,7 @@ class Updater:
         return data
 
     def check(self):
-        release_url = self.settings.get("release_url")
-        if release_url is not None:
-            release = latest_release(self.settings["repository"], release_url=release_url)
-        else:
-            release = latest_release(self.settings["repository"])
+        release = latest_release(self.settings["repository"])
         installed = self.installed()
         return {
             "available": release,
@@ -779,33 +745,22 @@ class Updater:
         try:
             with tempfile.TemporaryDirectory(prefix="download-", dir=self.root) as name:
                 download = Path(name)
-                release_url = self.settings.get("release_url")
-                if release_url is not None:
-                    base = validate_release_url(release_url)
-                    (download / expected_wheel).write_bytes(
-                        _download_bytes(f"{base}/releases/{release['tag']}/{expected_wheel}", max_bytes=100_000_000, timeout=120)
-                    )
-                    (download / "SHA256SUMS").write_bytes(
-                        _download_bytes(f"{base}/releases/{release['tag']}/SHA256SUMS", max_bytes=65_536, timeout=30)
-                    )
-                else:
-                    _run(
-                        [
-                            "gh",
-                            "release",
-                            "download",
-                            release["tag"],
-                            "--repo",
-                            "github.com/" + self.settings["repository"],
-                            "--dir",
-                            str(download),
-                            "--pattern",
-                            expected_wheel,
-                            "--pattern",
-                            "SHA256SUMS",
-                        ],
+                repo = self.settings["repository"]
+                tag = release["tag"]
+                (download / expected_wheel).write_bytes(
+                    _download_bytes(
+                        f"{GITHUB_WEB_ORIGIN}/{repo}/releases/download/{tag}/{expected_wheel}",
+                        max_bytes=100_000_000,
                         timeout=120,
                     )
+                )
+                (download / "SHA256SUMS").write_bytes(
+                    _download_bytes(
+                        f"{GITHUB_WEB_ORIGIN}/{repo}/releases/download/{tag}/SHA256SUMS",
+                        max_bytes=65_536,
+                        timeout=30,
+                    )
+                )
                 digest = verify_wheel(download, expected_wheel)
                 _run(["uv", "venv", "--python", self.settings["bootstrap_python"], str(target)], timeout=120)
                 _run(
@@ -1074,6 +1029,172 @@ def _launcher(root: Path, bootstrap: Path, module: str):
     )
 
 
+def _systemd_exec_start(args: list[str]) -> str:
+    return " ".join('"' + a.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"' for a in args)
+
+
+def _launchd_path_env() -> str:
+    return escape(
+        str(Path.home() / ".local/bin")
+        + ":"
+        + str(Path.home() / ".local/share/mise/shims")
+        + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    )
+
+
+def _validate_repository(repository: str) -> None:
+    if (
+        not isinstance(repository, str)
+        or len(repository.split("/")) != 2
+        or not all(NAME.fullmatch(x) for x in repository.split("/"))
+    ):
+        raise ValueError("Invalid GitHub repository")
+
+
+def _expected_launchers(root: Path) -> tuple[Path, Path, dict[str, tuple[str, Path]]]:
+    bootstrap = Path(sys.executable).parent.resolve() / Path(sys.executable).name
+    binary = root / "bin"
+    entries = {
+        filename: (_launcher(root, bootstrap, module), binary / filename)
+        for filename, module in (("agent-bridge", "agent_bridge.cli"), ("agent-bridge-update", "agent_bridge.updater"))
+    }
+    return bootstrap, binary, entries
+
+
+_DARWIN_SYSTEM_SYMLINKS = frozenset({Path("/tmp"), Path("/var")}) if sys.platform == "darwin" else frozenset()
+
+
+def _validate_write_target(
+    path: Path,
+    *,
+    label: str,
+    stop_at: Path | None = None,
+    expect_dir: bool = False,
+) -> None:
+    if path.is_symlink():
+        raise ValueError(f"Refusing to write symlinked {label}: {path}")
+    if path.exists():
+        if expect_dir:
+            if not path.is_dir():
+                raise ValueError(f"Expected directory for {label}: {path}")
+            if not os.access(path, os.W_OK | os.X_OK):
+                raise ValueError(f"Directory is not writable for {label}: {path}")
+        elif not path.is_file():
+            raise ValueError(f"Expected regular file for {label}: {path}")
+
+    boundary = stop_at if (stop_at is not None and path.is_relative_to(stop_at)) else None
+    cur = path.parent
+    checked_existing_parent = False
+    while True:
+        if cur.is_symlink() and cur not in _DARWIN_SYSTEM_SYMLINKS:
+            raise ValueError(f"Refusing to write under symlinked directory for {label}: {cur}")
+        if cur.exists():
+            if not checked_existing_parent:
+                if not cur.is_dir():
+                    raise ValueError(f"Expected directory for {label}: {cur}")
+                if not os.access(cur, os.W_OK | os.X_OK):
+                    raise ValueError(f"Directory is not writable for {label}: {cur}")
+                checked_existing_parent = True
+            elif not cur.is_dir():
+                raise ValueError(f"Expected directory for {label}: {cur}")
+        if (boundary is not None and cur == boundary) or cur == cur.parent:
+            break
+        cur = cur.parent
+
+
+def _check_launcher_conflicts(root: Path) -> None:
+    _validate_write_target(root, label="managed root", expect_dir=True)
+    if root.exists():
+        _private(root, directory=True)
+    binary = root / "bin"
+    _validate_write_target(binary, label="managed bin directory", stop_at=root, expect_dir=True)
+    _, _, entries = _expected_launchers(root)
+    for expected, command in entries.values():
+        if command.is_symlink():
+            raise ValueError("Refusing to overwrite a symlinked managed launcher")
+        if command.exists() and (not command.is_file() or command.read_text() != expected):
+            raise ValueError("Refusing to overwrite an unrelated managed launcher")
+
+
+def _ensure_launchers(root: Path) -> tuple[Path, Path]:
+    bootstrap, binary, entries = _expected_launchers(root)
+    _check_launcher_conflicts(root)
+    binary.mkdir(mode=0o700, exist_ok=True)
+    for expected, command in entries.values():
+        _write(command, expected)
+        command.chmod(0o700)
+    return bootstrap, binary
+
+
+def _resolve_root_and_service(
+    root: Path | None,
+    service_kind: str | None,
+    service_name: str | None,
+    *,
+    create: bool = True,
+):
+    resolved_root = (Path(root) if root else Path.home() / ".local/share/cli-agent-bridge").expanduser().absolute()
+    if resolved_root.is_symlink():
+        raise ValueError("Managed root must not be a symlink")
+    if create:
+        resolved_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        _private(resolved_root, directory=True)
+    kind = service_kind or ("launchd" if sys.platform == "darwin" else "systemd")
+    if kind not in {"systemd", "launchd"}:
+        raise ValueError("Unsupported service_kind")
+    name = service_name or ("com.cli-agent-bridge.broker" if kind == "launchd" else "cli-agent-bridge.service")
+    if not NAME.fullmatch(name):
+        raise ValueError("Invalid update service")
+    return resolved_root, kind, name
+
+
+def validate_update_install(
+    state: Path,
+    *,
+    repository=REPOSITORY,
+    service_kind=None,
+    service_name=None,
+    root=None,
+    interval=3600,
+    update_existing: bool = False,
+) -> tuple[Path, str, str, dict[str, object]]:
+    """Validate updater configuration and check file conflicts without mutating disk."""
+    if type(interval) is not int or interval < 300:
+        raise ValueError("Update interval must be at least 300 seconds")
+    _validate_repository(repository)
+    _validate_write_target(state, label="state directory", expect_dir=True)
+    if state.exists():
+        _private(state, directory=True)
+    resolved_root, kind, name = _resolve_root_and_service(root, service_kind, service_name, create=False)
+    _check_launcher_conflicts(resolved_root)
+    bootstrap = Path(sys.executable).parent.resolve() / Path(sys.executable).name
+    settings: dict[str, object] = {
+        "repository": repository,
+        "root": str(resolved_root),
+        "service_kind": kind,
+        "service_name": name,
+        "bootstrap_python": str(bootstrap),
+        "interval": interval,
+    }
+    path = state / "update.json"
+    _validate_write_target(path, label="update.json", stop_at=state)
+    if kind == "systemd":
+        directory = Path.home() / ".config/systemd/user"
+        _validate_write_target(directory / "cli-agent-bridge-update.service", label="updater service file")
+        _validate_write_target(directory / "cli-agent-bridge-update.timer", label="updater timer file")
+    else:
+        directory = Path.home() / "Library/LaunchAgents"
+        _validate_write_target(directory / "com.cli-agent-bridge.update.plist", label="updater LaunchAgent file")
+    if path.exists() and not update_existing:
+        existing = json.loads(path.read_text())
+        if not isinstance(existing, dict):
+            raise ValueError("Invalid update settings")
+        normalized = {**existing, "interval": existing.get("interval", 3600)}
+        if normalized != settings:
+            raise ValueError("Existing update settings differ; edit the private config explicitly")
+    return resolved_root, kind, name, settings
+
+
 def install(
     state: Path,
     repository=REPOSITORY,
@@ -1083,42 +1204,29 @@ def install(
     interval=3600,
     enable=False,
     *,
-    release_url: str | None = None,
+    update_existing: bool = False,
+    on_write: Any = None,
 ):
     """Write launchers and timer only; migrating an existing broker service is a separate, deliberate step."""
-    if type(interval) is not int or interval < 300:
-        raise ValueError("Update interval must be at least 300 seconds")
-    root = Path(root) if root else Path.home() / ".local/share/cli-agent-bridge"
-    root = root.expanduser().absolute()
-    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    resolved_root, kind, name, settings = validate_update_install(
+        state,
+        repository=repository,
+        service_kind=service_kind,
+        service_name=service_name,
+        root=root,
+        interval=interval,
+        update_existing=update_existing,
+    )
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
-    _private(root, directory=True)
     _private(state, directory=True)
-    bootstrap = Path(sys.executable).parent.resolve() / Path(sys.executable).name
-    kind = service_kind or ("launchd" if sys.platform == "darwin" else "systemd")
-    name = service_name or ("com.cli-agent-bridge.broker" if kind == "launchd" else "cli-agent-bridge.service")
-    settings = {
-        "repository": repository,
-        "root": str(root),
-        "service_kind": kind,
-        "service_name": name,
-        "bootstrap_python": str(bootstrap),
-    }
-    if release_url is not None:
-        settings["release_url"] = validate_release_url(release_url)
+    resolved_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _private(resolved_root, directory=True)
     path = state / "update.json"
-    if path.exists() and json.loads(path.read_text()) != settings:
-        raise ValueError("Existing update settings differ; edit the private config explicitly")
     _write(path, settings)
     load_settings(state)
-    binary = root / "bin"
-    binary.mkdir(mode=0o700, exist_ok=True)
-    for filename, module in (("agent-bridge", "agent_bridge.cli"), ("agent-bridge-update", "agent_bridge.updater")):
-        command = binary / filename
-        if command.exists() and command.read_text() != _launcher(root, bootstrap, module):
-            raise ValueError("Refusing to overwrite an unrelated managed launcher")
-        _write(command, _launcher(root, bootstrap, module))
-        command.chmod(0o700)
+    if on_write is not None:
+        on_write("update.json")
+    _, binary = _ensure_launchers(resolved_root)
     if enable and not Updater(state).service_managed():
         raise ValueError("Migrate the broker service to its managed launcher before enabling updates")
     args = [str(binary / "agent-bridge-update"), "--state", str(state), "--jitter", "300", "run"]
@@ -1127,7 +1235,7 @@ def install(
         directory.mkdir(parents=True, exist_ok=True)
         service = directory / "cli-agent-bridge-update.service"
         timer = directory / "cli-agent-bridge-update.timer"
-        exec_start = " ".join('"' + a.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"' for a in args)
+        exec_start = _systemd_exec_start(args)
         _write(
             service,
             f"[Unit]\nDescription=Check Bridge GitHub releases\n[Service]\nType=oneshot\nExecStart={exec_start}\nUMask=0077\nEnvironment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\n",
@@ -1136,6 +1244,8 @@ def install(
             timer,
             f"[Unit]\nDescription=Check Bridge updates periodically\n[Timer]\nOnBootSec=10m\nOnUnitActiveSec={interval}s\nRandomizedDelaySec=5m\nPersistent=true\n[Install]\nWantedBy=timers.target\n",
         )
+        if on_write is not None:
+            on_write("updater")
         if enable:
             _run(["systemctl", "--user", "daemon-reload"], timeout=15)
             _run(["systemctl", "--user", "enable", "--now", timer.name], timeout=15)
@@ -1145,17 +1255,13 @@ def install(
         directory.mkdir(parents=True, exist_ok=True)
         timer_path = directory / "com.cli-agent-bridge.update.plist"
         arguments = "".join(f"<string>{escape(value)}</string>" for value in args)
-        path_env = escape(
-            str(Path.home() / ".local/bin")
-            + ":"
-            + str(Path.home() / ".local/share/mise/shims")
-            + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-        )
         _write(
             timer_path,
             '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-            + f'<plist version="1.0"><dict><key>Label</key><string>com.cli-agent-bridge.update</string><key>ProgramArguments</key><array>{arguments}</array><key>StartInterval</key><integer>{interval}</integer><key>EnvironmentVariables</key><dict><key>PATH</key><string>{path_env}</string></dict></dict></plist>\n',
+            + f'<plist version="1.0"><dict><key>Label</key><string>com.cli-agent-bridge.update</string><key>ProgramArguments</key><array>{arguments}</array><key>StartInterval</key><integer>{interval}</integer><key>EnvironmentVariables</key><dict><key>PATH</key><string>{_launchd_path_env()}</string></dict></dict></plist>\n',
         )
+        if on_write is not None:
+            on_write("updater")
         if enable:
             _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(timer_path)], timeout=15)
     return {
@@ -1163,28 +1269,400 @@ def install(
         "launcher": str(binary / "agent-bridge"),
         "timer": str(timer_path),
         "enabled": enable,
-        "broker_service_migrated": False,
+        "broker_service_migrated": Updater(state).service_managed() if enable else False,
     }
 
 
-def set_release_url(state: Path, release_url: str | None):
-    """Set or clear the HTTP(S) OTA mirror URL in private update settings.
+def _broker_service_spec(
+    state: Path,
+    *,
+    root: Path | None = None,
+    service_kind: str | None = None,
+    service_name: str | None = None,
+) -> tuple[Path, str, str, str, Path, str]:
+    resolved_root, kind, name = _resolve_root_and_service(root, service_kind, service_name, create=False)
+    launcher = str(resolved_root / "bin/agent-bridge")
+    args = [launcher, "--state", str(state), "serve"]
+    if kind == "systemd":
+        unit_name = name if name.endswith(".service") else f"{name}.service"
+        service_path = Path.home() / ".config/systemd/user" / unit_name
+        content = (
+            "[Unit]\nDescription=CLI Agent Bridge broker service\n\n"
+            f"[Service]\nType=simple\nExecStart={_systemd_exec_start(args)}\n"
+            "Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:%h/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\n"
+            "UMask=0077\nRestart=on-failure\nRestartSec=3\n\n"
+            "[Install]\nWantedBy=default.target\n"
+        )
+    else:
+        label = name[:-6] if name.endswith(".plist") else name
+        service_path = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+        arguments = "".join(f"<string>{escape(value)}</string>" for value in args)
+        content = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            + f'<plist version="1.0"><dict><key>Label</key><string>{escape(label)}</string>'
+            + f"<key>ProgramArguments</key><array>{arguments}</array>"
+            + "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>"
+            + f"<key>EnvironmentVariables</key><dict><key>PATH</key><string>{_launchd_path_env()}</string></dict></dict></plist>\n"
+        )
+    return resolved_root, kind, name, launcher, service_path, content
 
-    Upgrade hosts running versions older than 0.2.11 before adding ``release_url``, because older
-    ``load_settings()`` parsers reject unrecognized keys in ``update.json``.
-    """
-    updater = Updater(state)
-    normalized = validate_release_url(release_url) if release_url else None
-    with updater._locked():
-        current = load_settings(state)
-        updated = dict(current)
-        if normalized is not None:
-            updated["release_url"] = normalized
+
+def _probe_broker_service_state(kind: str, name: str, launcher: str) -> tuple[bool, int | None, bool]:
+    """Return (is_active, main_pid, uses_managed_launcher) from the user service manager."""
+    if kind == "systemd":
+        try:
+            output = _run(
+                ["systemctl", "--user", "show", name, "-p", "ActiveState", "-p", "MainPID", "-p", "ExecStart"],
+                timeout=10,
+            )
+        except (OSError, RuntimeError):
+            return False, None, False
+        fields: dict[str, str] = {}
+        for line in output.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                fields[k.strip()] = v.strip()
+        active = fields.get("ActiveState") in {"active", "activating", "reloading"}
+        raw_pid = fields.get("MainPID", "0")
+        pid = int(raw_pid) if raw_pid.isdigit() and int(raw_pid) > 0 else None
+        exec_val = fields.get("ExecStart", "")
+        managed = re.search(r"(?:^|[ ;{])path=" + re.escape(launcher) + r"\s*;", exec_val) is not None
+        return active, pid, managed
+    label = name[:-6] if name.endswith(".plist") else name
+    try:
+        output = _run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], timeout=10)
+    except (OSError, RuntimeError):
+        return False, None, False
+    active = any(line.strip() == "state = running" for line in output.splitlines())
+    pid: int | None = None
+    for line in output.splitlines():
+        m = re.match(r"^\s*pid\s*=\s*(\d+)\s*$", line)
+        if m and int(m.group(1)) > 0:
+            pid = int(m.group(1))
+            break
+    managed = any(line.strip() == "program = " + launcher for line in output.splitlines())
+    return active, pid, managed
+
+
+def _expected_managed_version(root: Path) -> str | None:
+    current = root / "current"
+    if current.is_symlink():
+        try:
+            target = current.resolve(strict=True)
+            data = json.loads((target / "release.json").read_text())
+            tag = data.get("tag")
+            if isinstance(tag, str) and tag.startswith("v"):
+                return tag[1:]
+        except (OSError, ValueError):
+            return None
+    try:
+        from . import __version__
+
+        return __version__
+    except ImportError:
+        return None
+
+
+_BROKER_HEALTH_TIMEOUT = 10.0
+
+
+def _verify_migrated_broker(
+    state: Path,
+    root: Path,
+    kind: str,
+    name: str,
+    launcher: str,
+    *,
+    previous_pid: int | None,
+    restarted: bool,
+) -> tuple[int, str]:
+    expected_version = _expected_managed_version(root)
+    if not isinstance(expected_version, str) or not expected_version:
+        raise RuntimeError(
+            "Broker service migration incomplete: could not determine expected managed broker version"
+        )
+
+    async def _poll_status() -> dict[str, object]:
+        from .broker import request
+
+        end = time.monotonic() + _BROKER_HEALTH_TIMEOUT
+        while time.monotonic() < end:
+            try:
+                async with asyncio.timeout(1):
+                    status = await request(state, "agent_update_status", {})
+                new_pid = status.get("pid")
+                if restarted and previous_pid is not None and new_pid == previous_pid:
+                    await asyncio.sleep(0.1)
+                    continue
+                if status.get("version") != expected_version:
+                    raise RuntimeError(
+                        f"Broker service migration incomplete: expected version {expected_version}, got {status.get('version')}"
+                    )
+                if type(new_pid) is not int or new_pid <= 0:
+                    raise RuntimeError(
+                        f"Broker service migration incomplete: invalid broker PID {new_pid!r}"
+                    )
+                return status
+            except (OSError, TimeoutError, BridgeError):
+                await asyncio.sleep(0.1)
+        if restarted and previous_pid is not None:
+            raise RuntimeError(
+                f"Broker service migration incomplete: broker did not switch cleanly away from PID {previous_pid}"
+            )
+        raise RuntimeError("Broker service migration incomplete: candidate broker did not become healthy")
+
+    status = asyncio.run(_poll_status())
+    active, live_pid, managed = _probe_broker_service_state(kind, name, launcher)
+    if not active or not managed:
+        raise RuntimeError("Broker service migration incomplete: service is not running the managed launcher")
+    reported_pid = status.get("pid")
+    if type(reported_pid) is not int or reported_pid <= 0:
+        raise RuntimeError(f"Broker service migration incomplete: invalid reported PID {reported_pid!r}")
+    if type(live_pid) is not int or live_pid <= 0:
+        raise RuntimeError(
+            f"Broker service migration incomplete: service manager did not report a live MainPID ({live_pid!r})"
+        )
+    if reported_pid != live_pid:
+        raise RuntimeError(
+            f"Broker service migration incomplete: unit MainPID {live_pid} differs from broker PID {reported_pid}"
+        )
+    version = status.get("version")
+    if version != expected_version:
+        raise RuntimeError(
+            f"Broker service migration incomplete: expected version {expected_version}, got {version!r}"
+        )
+    return reported_pid, version
+
+
+def _acquire_migration_lease(state: Path, expected_pid: int) -> str:
+    from .broker import request
+
+    try:
+        lease = asyncio.run(request(state, "agent_update_prepare", {"hot": False}))
+    except BridgeError as error:
+        if error.code == "invalid_request":
+            try:
+                lease = asyncio.run(request(state, "agent_update_prepare", {}))
+            except (OSError, TimeoutError, BridgeError) as inner:
+                raise RuntimeError(
+                    f"Refusing to restart broker service without a maintenance lease: {inner}"
+                ) from inner
         else:
-            updated.pop("release_url", None)
-        _write(state / "update.json", updated)
-        load_settings(state)
-    return {"status": "configured", "release_url": updated.get("release_url")}
+            raise RuntimeError(
+                f"Refusing to restart broker service without a maintenance lease: {error}"
+            ) from error
+    except (OSError, TimeoutError) as error:
+        raise RuntimeError(
+            f"Refusing to restart broker service without a maintenance lease: {error}"
+        ) from error
+
+    if not isinstance(lease, dict):
+        raise RuntimeError("Refusing to restart broker service: invalid maintenance lease payload")
+    token = lease.get("token")
+    expires_at = lease.get("expires_at")
+    if (
+        not isinstance(token, str)
+        or not token
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, (int, float))
+        or expires_at < time.time() + 30
+    ):
+        if isinstance(token, str) and token:
+            with contextlib.suppress(OSError, TimeoutError, BridgeError, RuntimeError):
+                asyncio.run(request(state, "agent_update_finish", {"token": token}))
+        raise RuntimeError("Refusing to restart broker service: invalid or too-short maintenance lease")
+    lease_pid = lease.get("broker_pid")
+    if type(lease_pid) is not int or lease_pid <= 0:
+        try:
+            status = asyncio.run(request(state, "agent_update_status", {}))
+            lease_pid = status.get("pid") if isinstance(status, dict) else None
+        except (OSError, TimeoutError, BridgeError):
+            lease_pid = None
+    if lease_pid != expected_pid:
+        with contextlib.suppress(OSError, TimeoutError, BridgeError, RuntimeError):
+            asyncio.run(request(state, "agent_update_finish", {"token": token}))
+        raise RuntimeError(
+            f"Refusing to restart broker service PID {expected_pid}: "
+            f"maintenance lease came from broker PID {lease_pid!r}"
+        )
+    return token
+
+
+def validate_broker_service_install(
+    state: Path,
+    *,
+    root: Path | None = None,
+    service_kind: str | None = None,
+    service_name: str | None = None,
+    enable: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Validate broker service unit/launcher constraints and live migration readiness without writing disk."""
+    _validate_write_target(state, label="state directory", expect_dir=True)
+    if state.exists():
+        _private(state, directory=True)
+    resolved_root, kind, name, launcher, service_path, content = _broker_service_spec(
+        state, root=root, service_kind=service_kind, service_name=service_name
+    )
+    _check_launcher_conflicts(resolved_root)
+    _validate_write_target(service_path, label="broker service file")
+    existing_content = service_path.read_text() if service_path.exists() else None
+    content_changed = existing_content != content
+    if existing_content is not None and content_changed and not force:
+        raise ValueError(
+            "Refusing to replace existing broker service"
+            if kind == "systemd"
+            else "Refusing to replace existing broker LaunchAgent"
+        )
+    was_active, old_pid, already_managed = (False, None, False)
+    if enable:
+        was_active, old_pid, already_managed = _probe_broker_service_state(kind, name, launcher)
+        needs_restart = was_active and (content_changed or not already_managed)
+        if needs_restart:
+            if type(old_pid) is not int or old_pid <= 0:
+                raise ValueError("Refusing to migrate running broker service without a known MainPID")
+            if (state / "bridge.sqlite").exists() or (state / "broker.sock").exists():
+                snapshot = busy_snapshot(state, broker_pid=old_pid, hot=False, check_inflight=True)
+                if snapshot["busy"]:
+                    raise ValueError(
+                        "Refusing to migrate running broker service while busy: "
+                        + ", ".join(snapshot["reasons"])
+                    )
+    return {
+        "root": resolved_root,
+        "kind": kind,
+        "name": name,
+        "launcher": launcher,
+        "service_path": service_path,
+        "content": content,
+        "content_changed": content_changed,
+        "was_active": was_active,
+        "old_pid": old_pid,
+        "already_managed": already_managed,
+    }
+
+
+def install_broker_service(
+    state: Path,
+    *,
+    root: Path | None = None,
+    service_kind: str | None = None,
+    service_name: str | None = None,
+    enable: bool = False,
+    force: bool = False,
+    on_write: Any = None,
+) -> dict[str, object]:
+    """Create or migrate the user-level broker service pointing to the managed launcher."""
+    plan = validate_broker_service_install(
+        state,
+        root=root,
+        service_kind=service_kind,
+        service_name=service_name,
+        enable=enable,
+        force=force,
+    )
+    resolved_root: Path = plan["root"]
+    kind: str = plan["kind"]
+    name: str = plan["name"]
+    launcher: str = plan["launcher"]
+    service_path: Path = plan["service_path"]
+    content: str = plan["content"]
+
+    def _write_service_files() -> None:
+        state.mkdir(parents=True, mode=0o700, exist_ok=True)
+        _private(state, directory=True)
+        resolved_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        _private(resolved_root, directory=True)
+        _ensure_launchers(resolved_root)
+        service_path.parent.mkdir(parents=True, exist_ok=True)
+        _write(service_path, content)
+        if on_write is not None:
+            on_write("broker_service")
+
+    restarted = False
+    verified_pid: int | None = None
+    verified_version: str | None = None
+    if enable:
+        was_active: bool = bool(plan["was_active"])
+        old_pid: int | None = plan["old_pid"]
+        needs_restart = was_active and (bool(plan["content_changed"]) or not bool(plan["already_managed"]))
+        if needs_restart:
+            if type(old_pid) is not int or old_pid <= 0:
+                raise RuntimeError("Refusing to restart broker service without a known MainPID")
+            token = _acquire_migration_lease(state, old_pid)
+            try:
+                if (state / "bridge.sqlite").exists() or (state / "broker.sock").exists():
+                    snapshot = busy_snapshot(state, broker_pid=old_pid, hot=False, check_inflight=True)
+                    if snapshot["busy"]:
+                        raise ValueError(
+                            "Refusing to migrate running broker service while busy: "
+                            + ", ".join(snapshot["reasons"])
+                        )
+                _write_service_files()
+                if kind == "systemd":
+                    unit_name = service_path.name
+                    _run(["systemctl", "--user", "daemon-reload"], timeout=15)
+                    _run(["systemctl", "--user", "enable", unit_name], timeout=15)
+                    _run(["systemctl", "--user", "restart", unit_name], timeout=45)
+                else:
+                    label = name[:-6] if name.endswith(".plist") else name
+                    _run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], timeout=15)
+                    _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service_path)], timeout=15)
+                restarted = True
+                verified_pid, verified_version = _verify_migrated_broker(
+                    state,
+                    resolved_root,
+                    kind,
+                    name,
+                    launcher,
+                    previous_pid=old_pid,
+                    restarted=True,
+                )
+            finally:
+                if sys.exc_info()[0] not in {UpdateUncertain, KeyboardInterrupt, SystemExit}:
+                    from .broker import request
+
+                    try:
+                        finished = asyncio.run(request(state, "agent_update_finish", {"token": token}))
+                        if not isinstance(finished, dict) or finished.get("maintenance"):
+                            raise RuntimeError("Maintenance was not released")
+                    except (OSError, TimeoutError, BridgeError, RuntimeError) as error:
+                        raise UpdateUncertain("Maintenance release could not be confirmed") from error
+        else:
+            _write_service_files()
+            if kind == "systemd":
+                unit_name = service_path.name
+                _run(["systemctl", "--user", "daemon-reload"], timeout=15)
+                _run(["systemctl", "--user", "enable", unit_name], timeout=15)
+                if not was_active:
+                    _run(["systemctl", "--user", "start", unit_name], timeout=15)
+            elif not was_active:
+                _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service_path)], timeout=15)
+            verified_pid, verified_version = _verify_migrated_broker(
+                state,
+                resolved_root,
+                kind,
+                name,
+                launcher,
+                previous_pid=old_pid,
+                restarted=False,
+            )
+    else:
+        _write_service_files()
+
+    result: dict[str, object] = {
+        "service_kind": kind,
+        "service_name": name,
+        "service_path": str(service_path),
+        "launcher": launcher,
+        "enabled": enable,
+        "restarted": restarted,
+    }
+    if enable:
+        result["pid"] = verified_pid
+        result["version"] = verified_version
+        result["service_managed"] = True
+    return result
 
 
 def _has_protected_update_status(state: Path) -> bool:
@@ -1224,21 +1702,18 @@ def main(argv=None):
     parser.add_argument("--interval", type=int, default=3600)
     parser.add_argument("--enable", action="store_true")
     parser.add_argument("--jitter", type=int, default=0)
-    parser.add_argument("--release-url", help="Optional Tailscale/HTTPS OTA release mirror base URL")
     parser.add_argument(
         "--drain-workers",
         action="store_true",
         help="Wait until all live workers and active tasks stop before switching versions",
     )
-    parser.add_argument("action", choices=["check", "run", "install", "bootstrap", "set-url"])
+    parser.add_argument("action", choices=["check", "run", "install", "bootstrap"])
     args = parser.parse_args(argv)
     from .config import state_directory
 
     record_cli_failure = False
     try:
         state = state_directory(str(args.state) if args.state else None)
-        if args.release_url is not None and args.action not in {"install", "set-url"}:
-            raise ValueError("--release-url is only valid with install or set-url")
         if not 0 <= args.jitter <= 300:
             raise ValueError("Jitter must be between 0 and 300 seconds")
         if args.jitter:
@@ -1253,12 +1728,7 @@ def main(argv=None):
                 args.root,
                 args.interval,
                 args.enable,
-                release_url=args.release_url,
             )
-        elif args.action == "set-url":
-            if args.release_url is None:
-                raise ValueError("--release-url is required for set-url")
-            result = set_release_url(state, args.release_url)
         elif args.action == "run":
             record_cli_failure = True
             result = Updater(state).run(drain_workers=args.drain_workers)
@@ -1267,7 +1737,7 @@ def main(argv=None):
             updater = Updater(state)
             result = getattr(updater, args.action)()
     except (OSError, ValueError, RuntimeError, BridgeError, http.client.HTTPException) as error:
-        # Error class is sufficient for logs; never echo gh/credential/URL diagnostics.
+        # Error class is sufficient for logs; never echo credential or URL diagnostics.
         result = {"status": "failed", "error_type": type(error).__name__}
         if record_cli_failure and "state" in locals() and not isinstance(error, BlockingIOError):
             _record_cli_failure(state, result)

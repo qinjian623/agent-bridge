@@ -6,15 +6,17 @@ import io
 import json
 import os
 import plistlib
+import select
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-import urllib.request
+import urllib.error
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -231,7 +233,7 @@ class ChildProcessTests(unittest.TestCase):
     def test_macos_ignores_zombie_status_suffixes_and_reads_full_executable_without_arguments(self):
         processes = "\n".join(
             (
-                "10 1 Ss /Users/user/managed/bin/python",
+                "10 1 Ss /Users/alice/managed/bin/python",
                 "11 10 Z+ /opt/homebrew/bin/python3",
                 "12 10 S /usr/bin/ssh",
                 "13 10 S+ /opt/homebrew/bin/antigravity-real",
@@ -282,12 +284,36 @@ class ReleaseValidationTests(UpdateFixture):
         }
 
     def test_only_exact_wheel_from_configured_repository_is_selected(self):
-        with patch.object(updater, "_run", return_value=json.dumps(self.release())) as run:
+        manifest = updater.build_release_manifest("v0.2.0", 123, 90)
+        with patch.object(updater, "_download_bytes", return_value=json.dumps(manifest).encode()) as dl:
             release = updater.latest_release(updater.REPOSITORY)
         self.assertEqual("cli_agent_bridge-0.2.0-py3-none-any.whl", release["wheel"])
         self.assertEqual(
-            ["gh", "api", "--hostname", "github.com", "repos/qinjian623/cli-agent-bridge/releases/latest"],
-            run.call_args.args[0],
+            "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json",
+            dl.call_args.args[0],
+        )
+
+    def test_latest_release_falls_back_to_github_api_on_404_manifest(self):
+        import urllib.error
+
+        not_found = urllib.error.HTTPError(
+            "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json",
+            404,
+            "Not Found",
+            {},
+            None,
+        )
+        with patch.object(
+            updater,
+            "_download_bytes",
+            side_effect=[not_found, json.dumps(self.release()).encode()],
+        ) as dl:
+            release = updater.latest_release(updater.REPOSITORY)
+        self.assertEqual("v0.2.0", release["tag"])
+        self.assertEqual(1, release["release_id"])
+        self.assertEqual(
+            "https://api.github.com/repos/qinjian623/cli-agent-bridge/releases/latest",
+            dl.call_args_list[1].args[0],
         )
 
     def test_unstable_tags_and_missing_duplicate_or_oversized_assets_are_rejected(self):
@@ -312,7 +338,7 @@ class ReleaseValidationTests(UpdateFixture):
         for data in cases:
             with (
                 self.subTest(data=data),
-                patch.object(updater, "_run", return_value=json.dumps(data)),
+                patch.object(updater, "_download_bytes", return_value=json.dumps(data).encode()),
                 self.assertRaises(ValueError),
             ):
                 updater.latest_release(updater.REPOSITORY)
@@ -526,15 +552,17 @@ class ActivationTests(UpdateFixture):
     def test_stage_persists_preflight_compatibility_metadata(self):
         release = {"tag": "v0.2.0", "wheel": "cli_agent_bridge-0.2.0-py3-none-any.whl", "release_id": 1}
         generated = {}
+        sums = hashlib.sha256(b"test-wheel").hexdigest() + "  " + release["wheel"] + "\n"
+
+        def download(url, **_):
+            if url.endswith("/" + release["wheel"]):
+                return b"test-wheel"
+            if url.endswith("/SHA256SUMS"):
+                return sums.encode()
+            raise AssertionError(f"Unexpected URL: {url}")
 
         def command(argv, **_):
-            if argv[:3] == ["gh", "release", "download"]:
-                download = Path(argv[argv.index("--dir") + 1])
-                (download / release["wheel"]).write_bytes(b"test-wheel")
-                (download / "SHA256SUMS").write_text(
-                    hashlib.sha256(b"test-wheel").hexdigest() + "  " + release["wheel"] + "\n"
-                )
-            elif argv[:2] == ["uv", "venv"]:
+            if argv[:2] == ["uv", "venv"]:
                 generated["target"] = Path(argv[-1])
                 (generated["target"] / "bin").mkdir()
             elif argv[0] == str(generated["target"] / "bin/python"):
@@ -546,6 +574,7 @@ class ActivationTests(UpdateFixture):
 
         compat = {"requires_worker_drain": False, "min_worker_version": "0.2.5"}
         with (
+            patch.object(updater, "_download_bytes", side_effect=download),
             patch.object(updater, "_run", side_effect=command),
             patch.object(self.updater, "preflight", return_value=compat),
         ):
@@ -623,7 +652,7 @@ class TimerAndLauncherTests(UpdateFixture):
 
     def test_partial_stage_is_removed_if_install_or_preflight_fails(self):
         release = {"tag": "v0.2.0", "wheel": "cli_agent_bridge-0.2.0-py3-none-any.whl", "release_id": 1}
-        with patch.object(updater, "_run", side_effect=RuntimeError("download failed")):
+        with patch.object(updater, "_download_bytes", side_effect=RuntimeError("download failed")):
             with self.assertRaises(RuntimeError):
                 self.updater.stage(release)
         self.assertEqual({"old", "new"}, {p.name for p in (self.root / "releases").iterdir()})
@@ -721,16 +750,19 @@ class CrashAndHealthTests(UpdateFixture):
     def test_stage_exports_packaged_skill_and_never_installs_over_source_checkout(self):
         release = {"tag": "v0.2.0", "wheel": "cli_agent_bridge-0.2.0-py3-none-any.whl", "release_id": 1}
         generated = {}
+        sums = hashlib.sha256(b"test-wheel").hexdigest() + "  " + release["wheel"] + "\n"
+        seen_urls: list[str] = []
+
+        def download(url, **_):
+            seen_urls.append(url)
+            if url.endswith("/" + release["wheel"]):
+                return b"test-wheel"
+            if url.endswith("/SHA256SUMS"):
+                return sums.encode()
+            raise AssertionError(f"Unexpected URL: {url}")
 
         def command(argv, **_):
-            if argv[:3] == ["gh", "release", "download"]:
-                download = Path(argv[argv.index("--dir") + 1])
-                (download / release["wheel"]).write_bytes(b"test-wheel")
-                (download / "SHA256SUMS").write_text(
-                    hashlib.sha256(b"test-wheel").hexdigest() + "  " + release["wheel"] + "\n"
-                )
-                self.assertIn("github.com/" + updater.REPOSITORY, argv)
-            elif argv[:2] == ["uv", "venv"]:
+            if argv[:2] == ["uv", "venv"]:
                 generated["target"] = Path(argv[-1])
                 (generated["target"] / "bin").mkdir()
             elif argv[0] == str(generated["target"] / "bin/python"):
@@ -740,8 +772,19 @@ class CrashAndHealthTests(UpdateFixture):
                 return str(skill)
             return ""
 
-        with patch.object(updater, "_run", side_effect=command), patch.object(self.updater, "preflight"):
+        with (
+            patch.object(updater, "_download_bytes", side_effect=download),
+            patch.object(updater, "_run", side_effect=command),
+            patch.object(self.updater, "preflight"),
+        ):
             target = self.updater.stage(release)
+        self.assertEqual(
+            [
+                f"https://github.com/{updater.REPOSITORY}/releases/download/v0.2.0/{release['wheel']}",
+                f"https://github.com/{updater.REPOSITORY}/releases/download/v0.2.0/SHA256SUMS",
+            ],
+            seen_urls,
+        )
         self.assertEqual("packaged skill", (target / "skill/SKILL.md").read_text())
         self.assertTrue((target / "skill").is_symlink())
         self.assertTrue(self.old.exists())
@@ -761,13 +804,50 @@ class CrashAndHealthTests(UpdateFixture):
         self.assertNotIn("never-save-secret", json.dumps(result))
 
 
-class MirrorUrlReleaseTests(UpdateFixture):
-    def _start_server(self, routes: dict[str, tuple[int, bytes, dict[str, str]]]):
+class GitHubHttpsReleaseTests(UpdateFixture):
+    def _tls_contexts(self) -> tuple[ssl.SSLContext, ssl.SSLContext]:
+        cert = self.home / "test-cert.pem"
+        key = self.home / "test-key.pem"
+        openssl_cfg = self.home / "openssl.cnf"
+        openssl_cfg.write_text(
+            "[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n"
+            "[dn]\nCN=github.com\n"
+            "[v3]\nsubjectAltName=IP:127.0.0.1,DNS:localhost,DNS:github.com,DNS:release-assets.githubusercontent.com\n"
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+                "-days",
+                "1",
+                "-config",
+                str(openssl_cfg),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
+        client_ctx = ssl.create_default_context(cafile=str(cert))
+        return server_ctx, client_ctx
+
+    def _start_tls_server(self, routes: dict[str, tuple[int, bytes, dict[str, str]]]):
+        server_ctx, client_ctx = self._tls_contexts()
+
         class _Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 entry = routes.get(self.path)
                 if entry is None:
                     self.send_response(404)
+                    self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
                 code, body, extra_headers = entry
@@ -782,175 +862,16 @@ class MirrorUrlReleaseTests(UpdateFixture):
                 return
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        server.socket = server_ctx.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.shutdown)
         self.addCleanup(server.server_close)
         port = server.server_address[1]
-        return f"http://127.0.0.1:{port}/cli-agent-bridge"
-
-    def test_validate_release_url_accepts_tailscale_loopback_https_and_rejects_unsafe(self):
-        self.assertEqual(
-            "http://192.0.2.20:8088/cli-agent-bridge",
-            updater.validate_release_url("http://192.0.2.20:8088/cli-agent-bridge/"),
-        )
-        self.assertEqual(
-            "http://cn-peer-relay.taild20a97.ts.net:8088",
-            updater.validate_release_url("http://cn-peer-relay.taild20a97.ts.net:8088"),
-        )
-        self.assertEqual(
-            "http://[fd7a:115c:a1e0::b93a:f93b]:8088",
-            updater.validate_release_url("http://[fd7a:115c:a1e0::b93a:f93b]:8088/"),
-        )
-        self.assertEqual(
-            "https://releases.example.com/ota",
-            updater.validate_release_url("https://releases.example.com/ota/"),
-        )
-        for bad in (
-            "",
-            "   ",
-            "file:///tmp/ota",
-            "http://82.156.182.75:8088/cli-agent-bridge",
-            "http://192.0.2.10:8088/cli-agent-bridge",
-            "http://example.com/cli-agent-bridge",
-            "https://user:pass@releases.example.com/ota",
-            "https://releases.example.com/ota?token=1",
-            "https://releases.example.com/ota#frag",
-            "https://releases.example.com/../evil",
-            "http://192.0.2.20:8088/ota\nnewline",
-        ):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                updater.validate_release_url(bad)
-
-    def test_install_and_set_url_manage_release_url_without_overwriting_other_fields(self):
-        (self.state / "update.json").unlink()
-        with patch.object(updater.Path, "home", return_value=self.home), patch.object(updater, "_run"):
-            res = updater.install(
-                self.state,
-                service_kind="systemd",
-                root=self.root,
-                release_url="http://192.0.2.20:8088/cli-agent-bridge/",
-            )
-        saved = json.loads(Path(res["settings"]).read_text())
-        self.assertEqual("http://192.0.2.20:8088/cli-agent-bridge", saved["release_url"])
-
-        with patch("builtins.print"):
-            updater.main(["--state", str(self.state), "set-url", "--release-url", "https://mirror.example.com/ota/"])
-        self.assertEqual(
-            "https://mirror.example.com/ota",
-            json.loads((self.state / "update.json").read_text())["release_url"],
-        )
-        with patch("builtins.print"):
-            updater.main(["--state", str(self.state), "set-url", "--release-url", ""])
-        self.assertNotIn("release_url", json.loads((self.state / "update.json").read_text()))
-
-        with patch("builtins.print"), self.assertRaises(SystemExit) as missing:
-            updater.main(["--state", str(self.state), "set-url"])
-        self.assertEqual(1, missing.exception.code)
-        self.assertFalse((self.state / "update-status.json").exists())
-
-        for preserved in (
-            {"status": "activating", "target_version": "0.2.11"},
-            {"status": "uncertain", "target_version": "0.2.11"},
-        ):
-            updater._write(self.state / "update-status.json", preserved)
-            lock_fd = os.open(self.root / "update.lock", os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                with patch("builtins.print") as lock_out, self.assertRaises(SystemExit) as locked_err:
-                    updater.main(
-                        ["--state", str(self.state), "set-url", "--release-url", "https://mirror.example.com/ota"]
-                    )
-                self.assertEqual(1, locked_err.exception.code)
-                self.assertEqual("BlockingIOError", json.loads(lock_out.call_args.args[0])["error_type"])
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-            with patch("builtins.print"), self.assertRaises(SystemExit):
-                updater.main(["--state", str(self.state), "--release-url", "http://192.0.2.20:8088/ota", "check"])
-            with (
-                patch("builtins.print"),
-                patch.object(updater, "latest_release", side_effect=RuntimeError("boom")),
-                self.assertRaises(SystemExit),
-            ):
-                updater.main(["--state", str(self.state), "check"])
-            saved_status = json.loads((self.state / "update-status.json").read_text())
-            self.assertEqual(preserved["status"], saved_status["status"])
-            self.assertEqual("0.2.11", saved_status["target_version"])
-
-        # Simulate a concurrent run() acquiring update.lock and writing 'activating' during a failing check().
-        (self.state / "update-status.json").unlink()
-        hold_lock_fd = os.open(self.root / "update.lock", os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            def concurrent_writer_holds_lock(*_, **__):
-                fcntl.flock(hold_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                updater._write(self.state / "update-status.json", {"status": "activating", "target_version": "0.2.12"})
-                raise RuntimeError("check failed while activating acquired lock")
-
-            with (
-                patch("builtins.print"),
-                patch.object(updater, "latest_release", side_effect=concurrent_writer_holds_lock),
-                self.assertRaises(SystemExit),
-            ):
-                updater.main(["--state", str(self.state), "check"])
-            status_after_lock = json.loads((self.state / "update-status.json").read_text())
-            self.assertEqual("activating", status_after_lock["status"])
-            self.assertEqual("0.2.12", status_after_lock["target_version"])
-        finally:
-            fcntl.flock(hold_lock_fd, fcntl.LOCK_UN)
-            os.close(hold_lock_fd)
-
-        # Even if concurrent run() released the lock right before _record_cli_failure acquired it, 'activating' wins.
-        (self.state / "update-status.json").unlink()
-
-        def concurrent_writer_released_before_record(*_, **__):
-            with updater._acquire_update_lock(self.root):
-                updater._write(self.state / "update-status.json", {"status": "activating", "target_version": "0.2.13"})
-            raise RuntimeError("check failed after activating wrote and unlocked")
-
-        with (
-            patch("builtins.print"),
-            patch.object(updater, "latest_release", side_effect=concurrent_writer_released_before_record),
-            self.assertRaises(SystemExit),
-        ):
-            updater.main(["--state", str(self.state), "check"])
-        status_after_release = json.loads((self.state / "update-status.json").read_text())
-        self.assertEqual("activating", status_after_release["status"])
-        self.assertEqual("0.2.13", status_after_release["target_version"])
-
-        # When update.json cannot be parsed, lock location is unknown and existing status must not be overwritten.
-        (self.state / "update.json").write_text("{corrupt")
-        with patch("builtins.print"), self.assertRaises(SystemExit) as corrupt_err:
-            updater.main(["--state", str(self.state), "check"])
-        self.assertEqual(1, corrupt_err.exception.code)
-        status_after_corrupt = json.loads((self.state / "update-status.json").read_text())
-        self.assertEqual("activating", status_after_corrupt["status"])
-        self.assertEqual("0.2.13", status_after_corrupt["target_version"])
-
-    def _start_proxy_trap(self) -> tuple[str, list[str]]:
-        proxy_hits: list[str] = []
-
-        class _ProxyHandler(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
-                proxy_hits.append(self.path)
-                body = b"intercepted"
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, format, *args):  # noqa: A002
-                return
-
-        proxy = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
-        thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(proxy.shutdown)
-        self.addCleanup(proxy.server_close)
-        return f"http://127.0.0.1:{proxy.server_address[1]}", proxy_hits
+        return f"https://127.0.0.1:{port}", f"https://localhost:{port}", client_ctx
 
     @staticmethod
-    def _build_minimal_wheel(version: str = "0.2.0", skill_text: str = "mirror skill") -> bytes:
+    def _build_minimal_wheel(version: str = "0.2.0", skill_text: str = "github wheel skill") -> bytes:
         dist_info = f"cli_agent_bridge-{version}.dist-info"
         files = {
             "agent_bridge/__init__.py": f'__version__ = "{version}"\n'.encode(),
@@ -973,177 +894,123 @@ class MirrorUrlReleaseTests(UpdateFixture):
             zf.writestr(f"{dist_info}/RECORD", ("\n".join(rows) + "\n").encode())
         return buf.getvalue()
 
-    def test_http_mirror_check_and_stage_verify_checksum_and_bypass_proxy(self):
+    def test_validate_github_url_enforces_https_and_github_hosts(self):
+        self.assertEqual(
+            "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json",
+            updater._validate_github_url(
+                "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json"
+            ),
+        )
+        self.assertEqual(
+            "https://release-assets.githubusercontent.com/asset/foo.whl?sp=r&sig=abc",
+            updater._validate_github_url(
+                "https://release-assets.githubusercontent.com/asset/foo.whl?sp=r&sig=abc",
+                allow_query=True,
+            ),
+        )
+        for bad in (
+            "",
+            "http://github.com/qinjian623/cli-agent-bridge",
+            "http://198.51.100.10:8088/cli-agent-bridge",
+            "http://127.0.0.1:8088/latest.json",
+            "file:///tmp/latest.json",
+            "https://evil.example.com/latest.json",
+            "https://user:pass@github.com/a/b",
+            "https://github.com/a/b?token=1",
+            "https://github.com/a/b#frag",
+            "https://github.com/a/../evil",
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                updater._validate_github_url(bad)
+
+    @unittest.skipUnless(shutil.which("openssl") and shutil.which("uv"), "openssl and uv are required")
+    def test_github_https_release_cdn_redirect_and_real_wheel_stage(self):
         tag = "v0.2.0"
         wheel_name = "cli_agent_bridge-0.2.0-py3-none-any.whl"
-        wheel_bytes = b"mirror-wheel-payload"
+        wheel_bytes = self._build_minimal_wheel("0.2.0", "github https skill")
         digest = hashlib.sha256(wheel_bytes).hexdigest()
         sums_bytes = f"{digest}  {wheel_name}\n".encode()
-        manifest = updater.build_release_manifest(tag, len(wheel_bytes), len(sums_bytes), release_id=42)
-        base_url = self._start_server(
+        manifest = updater.build_release_manifest(tag, len(wheel_bytes), len(sums_bytes))
+        routes: dict[str, tuple[int, bytes, dict[str, str]]] = {}
+        base_web, base_cdn, client_ctx = self._start_tls_server(routes)
+        routes.update(
             {
-                "/cli-agent-bridge/latest.json": (200, json.dumps(manifest).encode(), {}),
-                f"/cli-agent-bridge/releases/{tag}/{wheel_name}": (200, wheel_bytes, {}),
-                f"/cli-agent-bridge/releases/{tag}/SHA256SUMS": (200, sums_bytes, {}),
+                f"/{updater.REPOSITORY}/releases/latest/download/latest.json": (
+                    302,
+                    b"",
+                    {"Location": f"/{updater.REPOSITORY}/releases/download/{tag}/latest.json"},
+                ),
+                f"/{updater.REPOSITORY}/releases/download/{tag}/latest.json": (
+                    200,
+                    json.dumps(manifest).encode(),
+                    {},
+                ),
+                f"/{updater.REPOSITORY}/releases/download/{tag}/{wheel_name}": (
+                    302,
+                    b"",
+                    {"Location": f"{base_cdn}/cdn/{wheel_name}?sp=r&sig=valid"},
+                ),
+                f"/cdn/{wheel_name}?sp=r&sig=valid": (200, wheel_bytes, {}),
+                f"/{updater.REPOSITORY}/releases/download/{tag}/SHA256SUMS": (200, sums_bytes, {}),
             }
         )
-        proxy_url, proxy_hits = self._start_proxy_trap()
-        updater.set_release_url(self.state, base_url)
         client = updater.Updater(self.state)
-
-        generated = {}
-
-        def fake_uv_command(argv, **_):
-            if argv[0] == "gh":
-                raise AssertionError("Mirror update must never invoke gh CLI")
-            if argv[:2] == ["uv", "venv"]:
-                generated["target"] = Path(argv[-1])
-                (generated["target"] / "bin").mkdir()
-            elif argv[0] == str(generated["target"] / "bin/python"):
-                skill = generated["target"] / "lib/python/site-packages/agent_bridge/skill"
-                skill.mkdir(parents=True)
-                (skill / "SKILL.md").write_text("mirror skill")
-                return str(skill)
-            return ""
-
         with (
-            patch.dict(
-                os.environ,
-                {"HTTP_PROXY": proxy_url, "http_proxy": proxy_url, "NO_PROXY": "", "no_proxy": ""},
-            ),
-            patch.object(updater, "_run", side_effect=fake_uv_command),
+            patch.object(updater, "GITHUB_WEB_ORIGIN", base_web),
+            patch.object(updater, "_GITHUB_RELEASE_HOSTS", frozenset({"127.0.0.1", "localhost"})),
+            patch.object(updater, "_GITHUB_CDN_HOSTS", frozenset({"localhost"})),
+            patch.object(updater, "_DEFAULT_SSL_CONTEXT", client_ctx),
             patch.object(client, "preflight", return_value={"requires_worker_drain": False}),
         ):
-            # Confirm an unpatched opener uses the proxy when NO_PROXY is cleared.
-            with urllib.request.build_opener().open(f"{base_url}/latest.json") as intercepted:
-                self.assertEqual(b"intercepted", intercepted.read())
-            self.assertEqual(1, len(proxy_hits))
-            proxy_hits.clear()
-
             chk = client.check()
             self.assertTrue(chk["update_available"])
-            self.assertEqual(tag, chk["available"]["tag"])
-            staged = client.stage(chk["available"])
-        self.assertEqual([], proxy_hits)
-        self.assertEqual("mirror skill", (staged / "skill/SKILL.md").read_text())
-        self.assertEqual(digest, json.loads((staged / "release.json").read_text())["sha256"])
-
-    @unittest.skipUnless(shutil.which("uv"), "uv CLI is required")
-    def test_http_mirror_stages_real_wheel_via_uv(self):
-        tag = "v0.2.0"
-        wheel_name = "cli_agent_bridge-0.2.0-py3-none-any.whl"
-        wheel_bytes = self._build_minimal_wheel("0.2.0", "real wheel skill")
-        digest = hashlib.sha256(wheel_bytes).hexdigest()
-        sums_bytes = f"{digest}  {wheel_name}\n".encode()
-        manifest = updater.build_release_manifest(tag, len(wheel_bytes), len(sums_bytes), release_id=7)
-        base_url = self._start_server(
-            {
-                "/cli-agent-bridge/latest.json": (200, json.dumps(manifest).encode(), {}),
-                f"/cli-agent-bridge/releases/{tag}/{wheel_name}": (200, wheel_bytes, {}),
-                f"/cli-agent-bridge/releases/{tag}/SHA256SUMS": (200, sums_bytes, {}),
-            }
-        )
-        updater.set_release_url(self.state, base_url)
-        client = updater.Updater(self.state)
-        with patch.object(client, "preflight", return_value={"requires_worker_drain": False}):
-            chk = client.check()
             staged = client.stage(chk["available"])
         version = subprocess.check_output(
             [str(staged / "bin/python"), "-c", "import agent_bridge; print(agent_bridge.__version__)"],
             text=True,
         ).strip()
         self.assertEqual("0.2.0", version)
-        self.assertEqual("real wheel skill", (staged / "skill/SKILL.md").read_text())
+        self.assertEqual("github https skill", (staged / "skill/SKILL.md").read_text())
         self.assertEqual(digest, json.loads((staged / "release.json").read_text())["sha256"])
 
-    def test_http_mirror_rejects_public_dns_trickle_timeout_and_unsupported_cli_flag(self):
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is required")
+    def test_github_https_rejects_unsafe_redirects_oversized_and_timeouts(self):
+        routes: dict[str, tuple[int, bytes, dict[str, str]]] = {}
+        base_web, base_cdn, client_ctx = self._start_tls_server(routes)
+        routes.update(
+            {
+                "/downgrade": (302, b"", {"Location": "http://github.com/a/b"}),
+                "/evil-host": (302, b"", {"Location": "https://evil.example.com/a/b"}),
+                "/query-on-github": (302, b"", {"Location": f"{base_web}/path?unexpected=1"}),
+                "/oversized": (200, b"x" * 300_000, {}),
+                "/broken": (500, b"boom", {}),
+            }
+        )
         with (
-            patch.object(
-                socket,
-                "getaddrinfo",
-                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 8088))],
-            ),
-            self.assertRaises(ValueError),
+            patch.object(updater, "_GITHUB_RELEASE_HOSTS", frozenset({"127.0.0.1", "localhost"})),
+            patch.object(updater, "_GITHUB_CDN_HOSTS", frozenset({"localhost"})),
+            patch.object(updater, "_DEFAULT_SSL_CONTEXT", client_ctx),
         ):
-            updater.latest_release(updater.REPOSITORY, release_url="http://spoofed.ts.net:8088")
+            for path in ("/downgrade", "/evil-host", "/query-on-github", "/oversized"):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    updater._download_bytes(f"{base_web}{path}", max_bytes=262_144, timeout=2.0)
 
-        class _SlowAndRedirectHandler(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
-                try:
-                    if self.path == "/slow-headers":
-                        self.connection.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
-                        for _ in range(15):
-                            time.sleep(0.06)
-                            self.connection.sendall(b"a")
-                        self.connection.sendall(b"\r\nContent-Length: 2\r\n\r\nok")
-                    elif self.path == "/slow-redirect":
-                        self.connection.sendall(
-                            b"HTTP/1.1 302 Found\r\n"
-                            b"Location: /ok\r\n"
-                            b"Content-Length: 5000000\r\n\r\n"
-                        )
-                        for _ in range(10):
-                            time.sleep(0.1)
-                            self.connection.sendall(b"z" * 1024)
-                    elif self.path == "/huge-cross-redirect":
-                        self.connection.sendall(
-                            b"HTTP/1.1 302 Found\r\n"
-                            b"Location: http://192.0.2.20:8088/cli-agent-bridge/latest.json\r\n"
-                            b"Content-Length: 5000000\r\n\r\n"
-                        )
-                    elif self.path == "/ok":
-                        self.connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal")
-                    else:
-                        self.send_response(200)
-                        self.send_header("Content-Length", "100")
-                        self.end_headers()
-                        for _ in range(10):
-                            self.wfile.write(b"x" * 10)
-                            self.wfile.flush()
-                            time.sleep(0.1)
-                except OSError:
-                    return
-
-            def log_message(self, format, *args):  # noqa: A002
-                return
-
-        slow = ThreadingHTTPServer(("127.0.0.1", 0), _SlowAndRedirectHandler)
-        thread = threading.Thread(target=slow.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(slow.shutdown)
-        self.addCleanup(slow.server_close)
-        slow_base = f"http://127.0.0.1:{slow.server_address[1]}"
-
-        for path in ("/slow-body", "/slow-headers"):
-            started = time.monotonic()
-            with self.subTest(path=path), self.assertRaises(TimeoutError):
-                updater._download_bytes(f"{slow_base}{path}", max_bytes=1024, timeout=0.2)
-            self.assertLess(time.monotonic() - started, 0.7)
-
-        # Same-origin redirect skips huge/slow 302 body and follows to target within timeout.
-        started = time.monotonic()
-        self.assertEqual(b"final", updater._download_bytes(f"{slow_base}/slow-redirect", max_bytes=1024, timeout=0.4))
-        self.assertLess(time.monotonic() - started, 0.4)
-
-        with self.assertRaises(ValueError):
-            updater._download_bytes(f"{slow_base}/huge-cross-redirect", max_bytes=1024, timeout=0.4)
-
-        # Hanging DNS lookup must also respect total download deadline without waiting for resolver completion.
+        # Hanging DNS lookup must obey total deadline.
         dns_release = threading.Event()
 
         def slow_dns(*_, **__):
             dns_release.wait(timeout=2.0)
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.20", 8088))]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
 
         try:
             started = time.monotonic()
             with patch.object(socket, "getaddrinfo", side_effect=slow_dns), self.assertRaises(TimeoutError):
-                updater._download_bytes("http://slow-dns.ts.net:8088/latest.json", max_bytes=1024, timeout=0.15)
+                updater._download_bytes("https://github.com/qinjian623/cli-agent-bridge", max_bytes=1024, timeout=0.15)
             self.assertLess(time.monotonic() - started, 0.5)
         finally:
             dns_release.set()
 
-        # Stalled TLS handshake (do_handshake_on_connect=False tracked socket) must abort at deadline.
+        # Stalled TLS handshake must abort at deadline.
         tls_stop = threading.Event()
         tls_srv = socket.create_server(("127.0.0.1", 0))
         self.addCleanup(tls_stop.set)
@@ -1161,7 +1028,10 @@ class MirrorUrlReleaseTests(UpdateFixture):
 
         threading.Thread(target=accept_and_stall_tls, daemon=True).start()
         started = time.monotonic()
-        with self.assertRaises(TimeoutError):
+        with (
+            patch.object(updater, "_GITHUB_RELEASE_HOSTS", frozenset({"127.0.0.1"})),
+            self.assertRaises(TimeoutError),
+        ):
             updater._download_bytes(
                 f"https://127.0.0.1:{tls_srv.getsockname()[1]}/latest.json",
                 max_bytes=1024,
@@ -1169,263 +1039,598 @@ class MirrorUrlReleaseTests(UpdateFixture):
             )
         self.assertLess(time.monotonic() - started, 0.6)
 
-        with patch("builtins.print"), patch.object(updater, "latest_release") as fetch, self.assertRaises(SystemExit) as err:
-            updater.main(["--state", str(self.state), "--release-url", "http://192.0.2.20:8088/ota", "check"])
-        self.assertEqual(1, err.exception.code)
-        fetch.assert_not_called()
-        self.assertFalse((self.state / "update-status.json").exists())
+        # Slow TLS headers, slow TLS body, and huge redirect body handling.
+        server_ctx, raw_client_ctx = self._tls_contexts()
 
-    def test_http_mirror_rejects_tampered_wheel_redirects_and_oversized_assets(self):
-        tag = "v0.2.0"
-        wheel_name = "cli_agent_bridge-0.2.0-py3-none-any.whl"
-        bad_wheel = b"tampered-bytes"
-        wrong_sums = f"{'0' * 64}  {wheel_name}\n".encode()
-        manifest = updater.build_release_manifest(tag, len(bad_wheel), len(wrong_sums))
-        base_url = self._start_server(
-            {
-                "/cli-agent-bridge/latest.json": (200, json.dumps(manifest).encode(), {}),
-                f"/cli-agent-bridge/releases/{tag}/{wheel_name}": (200, bad_wheel, {}),
-                f"/cli-agent-bridge/releases/{tag}/SHA256SUMS": (200, wrong_sums, {}),
-                "/redirect/latest.json": (
-                    302,
-                    b"",
-                    {"Location": "http://192.0.2.20:8088/cli-agent-bridge/latest.json"},
-                ),
-                "/oversized/latest.json": (200, b"x" * 300_000, {}),
-                "/broken/latest.json": (500, b"boom", {}),
-            }
-        )
-        root_origin = base_url.rsplit("/cli-agent-bridge", 1)[0]
-        updater.set_release_url(self.state, base_url)
-        client = updater.Updater(self.state)
-        chk = client.check()
-        with self.assertRaises(ValueError):
-            client.stage(chk["available"])
-        self.assertEqual({"old", "new"}, {p.name for p in (self.root / "releases").iterdir()})
-
-        with self.assertRaises(ValueError):
-            client.stage({"tag": tag, "wheel": "cli_agent_bridge-0.2.0-evil.whl"})
-        with self.assertRaises(ValueError):
-            updater.latest_release(updater.REPOSITORY, release_url=f"{root_origin}/redirect")
-        with self.assertRaises(ValueError):
-            updater.latest_release(updater.REPOSITORY, release_url=f"{root_origin}/oversized")
-
-        updater.set_release_url(self.state, f"{root_origin}/broken")
-        with patch("builtins.print"), self.assertRaises(SystemExit) as http_err:
-            updater.main(["--state", str(self.state), "check"])
-        self.assertEqual(1, http_err.exception.code)
-        self.assertEqual("failed", json.loads((self.state / "update-status.json").read_text())["status"])
-
-    @staticmethod
-    def _load_publish_module():
-        import importlib.util
-
-        script_path = Path(__file__).resolve().parent.parent / "scripts/publish_ota_relay.py"
-        spec = importlib.util.spec_from_file_location("publish_ota_relay", script_path)
-        mod = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(mod)
-        return mod
-
-    def _make_release_tar(self, mod, tag: str, wheel_bytes: bytes, *, release_id: int = 99) -> tuple[str, str, bytes]:
-        stage_src = self.home / f"src-{tag}-{len(wheel_bytes)}-{release_id}"
-        stage_src.mkdir(exist_ok=True)
-        wheel = f"cli_agent_bridge-{tag[1:]}-py3-none-any.whl"
-        digest = hashlib.sha256(wheel_bytes).hexdigest()
-        sums_bytes = f"{digest}  {wheel}\n".encode()
-        manifest = updater.build_release_manifest(tag, len(wheel_bytes), len(sums_bytes), release_id=release_id)
-        (stage_src / wheel).write_bytes(wheel_bytes)
-        (stage_src / "SHA256SUMS").write_bytes(sums_bytes)
-        (stage_src / "latest.json").write_text(json.dumps(manifest))
-        return wheel, digest, mod.build_tar_payload(stage_src, ("latest.json", wheel, "SHA256SUMS"))
-
-    def test_remote_relay_apply_script_verifies_immutable_monotonic_and_concurrent_publish(self):
-        mod = self._load_publish_module()
-
-        tag = "v0.2.11"
-        wheel_bytes = b"relay-atomic-wheel"
-        wheel, digest, tar_bytes = self._make_release_tar(mod, tag, wheel_bytes, release_id=99)
-
-        remote_root = self.home / "remote-ota"
-        proc = subprocess.run(
-            [sys.executable, "-c", mod._REMOTE_APPLY_SCRIPT, str(remote_root), tag, wheel],
-            input=tar_bytes,
-            capture_output=True,
-            check=True,
-        )
-        out = json.loads(proc.stdout.decode("utf-8"))
-        self.assertEqual(digest, out["sha256"])
-        self.assertFalse(out["immutable_preserved"])
-        inode_before = (remote_root / "releases" / tag).stat().st_ino
-        self.assertEqual(tag, json.loads((remote_root / "latest.json").read_text())["tag_name"])
-        self.assertEqual(wheel_bytes, (remote_root / "releases" / tag / wheel).read_bytes())
-
-        # Re-publishing the identical tag must preserve the immutable tag directory in-place (no 404 swap window).
-        repub = subprocess.run(
-            [sys.executable, "-c", mod._REMOTE_APPLY_SCRIPT, str(remote_root), tag, wheel],
-            input=tar_bytes,
-            capture_output=True,
-            check=True,
-        )
-        repub_out = json.loads(repub.stdout.decode("utf-8"))
-        self.assertTrue(repub_out["immutable_preserved"])
-        self.assertEqual(inode_before, (remote_root / "releases" / tag).stat().st_ino)
-
-        # Attempting to mutate an already-published tag with different contents must fail cleanly.
-        _, _, mutated_tar = self._make_release_tar(mod, tag, b"different-wheel-bytes", release_id=100)
-        conflict = subprocess.run(
-            [sys.executable, "-c", mod._REMOTE_APPLY_SCRIPT, str(remote_root), tag, wheel],
-            input=mutated_tar,
-            capture_output=True,
-        )
-        self.assertEqual(2, conflict.returncode)
-        self.assertEqual(wheel_bytes, (remote_root / "releases" / tag / wheel).read_bytes())
-        self.assertEqual([], [p for p in (remote_root / "releases").iterdir() if p.name.startswith(".stage-")])
-
-        # Publishing a newer release advances latest.json, and re-publishing an older tag never rolls back latest.json.
-        wheel12, _, tar12 = self._make_release_tar(mod, "v0.2.12", b"wheel-0.2.12", release_id=101)
-        subprocess.run(
-            [sys.executable, "-c", mod._REMOTE_APPLY_SCRIPT, str(remote_root), "v0.2.12", wheel12],
-            input=tar12,
-            capture_output=True,
-            check=True,
-        )
-        self.assertEqual("v0.2.12", json.loads((remote_root / "latest.json").read_text())["tag_name"])
-
-        rollback_try = subprocess.run(
-            [sys.executable, "-c", mod._REMOTE_APPLY_SCRIPT, str(remote_root), tag, wheel],
-            input=tar_bytes,
-            capture_output=True,
-        )
-        self.assertEqual(3, rollback_try.returncode)
-        self.assertEqual("v0.2.12", json.loads((remote_root / "latest.json").read_text())["tag_name"])
-
-        # Concurrent publishes of v0.2.13 and v0.2.14 serialize via .publish.lock and end at v0.2.14.
-        wheel13, _, tar13 = self._make_release_tar(mod, "v0.2.13", b"wheel-0.2.13", release_id=102)
-        wheel14, _, tar14 = self._make_release_tar(mod, "v0.2.14", b"wheel-0.2.14", release_id=103)
-        barrier = threading.Barrier(2)
-        outcomes: dict[str, int] = {}
-
-        def _worker(rel_tag: str, rel_wheel: str, payload: bytes) -> None:
-            barrier.wait(timeout=5)
-            res = subprocess.run(
-                [sys.executable, "-c", mod._REMOTE_APPLY_SCRIPT, str(remote_root), rel_tag, rel_wheel],
-                input=payload,
-                capture_output=True,
-            )
-            outcomes[rel_tag] = res.returncode
-
-        t1 = threading.Thread(target=_worker, args=("v0.2.13", wheel13, tar13))
-        t2 = threading.Thread(target=_worker, args=("v0.2.14", wheel14, tar14))
-        t1.start()
-        t2.start()
-        t1.join(timeout=10)
-        t2.join(timeout=10)
-        self.assertEqual(0, outcomes.get("v0.2.14"))
-        self.assertIn(outcomes.get("v0.2.13"), {0, 3})
-        self.assertEqual("v0.2.14", json.loads((remote_root / "latest.json").read_text())["tag_name"])
-        self.assertEqual(b"wheel-0.2.14", (remote_root / "releases" / "v0.2.14" / wheel14).read_bytes())
-
-    def test_publish_release_verify_url_downloads_assets_and_sanitizes_failures(self):
-        mod = self._load_publish_module()
-        tag = "v0.2.11"
-        wheel = "cli_agent_bridge-0.2.11-py3-none-any.whl"
-        wheel_bytes = b"verified-mirror-wheel"
-        digest = hashlib.sha256(wheel_bytes).hexdigest()
-        sums_bytes = f"{digest}  {wheel}\n".encode()
-
-        remote_root = self.home / "served-ota"
-        remote_root.mkdir()
-
-        class _DiskHandler(BaseHTTPRequestHandler):
+        class _SlowTlsHandler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
-                prefix = "/cli-agent-bridge/"
-                if not self.path.startswith(prefix):
-                    self.send_response(404)
-                    self.end_headers()
+                try:
+                    if self.path == "/slow-headers":
+                        self.connection.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+                        for _ in range(15):
+                            time.sleep(0.06)
+                            self.connection.sendall(b"a")
+                        self.connection.sendall(b"\r\nContent-Length: 2\r\n\r\nok")
+                    elif self.path == "/slow-redirect":
+                        self.connection.sendall(
+                            b"HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 5000000\r\n\r\n"
+                        )
+                        for _ in range(10):
+                            time.sleep(0.1)
+                            self.connection.sendall(b"z" * 1024)
+                    elif self.path == "/ok":
+                        self.connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal")
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Length", "100")
+                        self.end_headers()
+                        for _ in range(10):
+                            self.wfile.write(b"x" * 10)
+                            self.wfile.flush()
+                            time.sleep(0.1)
+                except OSError:
                     return
-                rel = self.path[len(prefix) :]
-                file_path = remote_root / rel
-                if not file_path.is_file() or (serve_missing_wheel and rel.endswith(".whl")):
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                data = file_path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
 
             def log_message(self, format, *args):  # noqa: A002
                 return
 
-        serve_missing_wheel = False
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), _DiskHandler)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        self.addCleanup(srv.shutdown)
-        self.addCleanup(srv.server_close)
-        mirror_url = f"http://127.0.0.1:{srv.server_address[1]}/cli-agent-bridge"
-
-        orig_run = subprocess.run
-
-        def fake_subprocess(cmd, **kwargs):
-            if cmd[:2] == ["gh", "api"]:
-                return subprocess.CompletedProcess(
-                    cmd,
-                    0,
-                    stdout=json.dumps({"id": 77, "tag_name": tag, "draft": False, "prerelease": False}),
-                    stderr="",
-                )
-            if cmd[:3] == ["gh", "release", "download"]:
-                dest = Path(cmd[cmd.index("--dir") + 1])
-                (dest / wheel).write_bytes(wheel_bytes)
-                (dest / "SHA256SUMS").write_bytes(sums_bytes)
-                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
-            if cmd[0] == "ssh":
-                return orig_run(
-                    [sys.executable, "-c", mod._REMOTE_APPLY_SCRIPT, str(remote_root), tag, wheel],
-                    input=kwargs["input"],
-                    capture_output=True,
-                    check=True,
-                )
-            raise AssertionError(f"Unexpected command: {cmd}")
-
-        with patch.object(mod.subprocess, "run", side_effect=fake_subprocess):
-            result = mod.publish_release(
-                host="relay",
-                remote_dir=str(remote_root),
-                tag=tag,
-                verify_url=mirror_url,
-            )
-            self.assertEqual(digest, result["sha256"])
-            self.assertEqual(mirror_url, result["verified_url"])
-
-            serve_missing_wheel = True
-            with self.assertRaises(RuntimeError) as verify_err:
-                mod.publish_release(
-                    host="relay",
-                    remote_dir=str(remote_root),
-                    tag=tag,
-                    verify_url=mirror_url,
-                )
-            self.assertIn("SSH upload", str(verify_err.exception))
-
-        # Top-level main() must sanitize gh stderr tokens/secrets.
-        def failing_gh(cmd, **_):
-            raise subprocess.CalledProcessError(4, cmd, output="", stderr="SECRET_GH_TOKEN_SHOULD_NOT_LEAK")
+        slow_srv = ThreadingHTTPServer(("127.0.0.1", 0), _SlowTlsHandler)
+        slow_srv.socket = server_ctx.wrap_socket(slow_srv.socket, server_side=True)
+        threading.Thread(target=slow_srv.serve_forever, daemon=True).start()
+        self.addCleanup(slow_srv.shutdown)
+        self.addCleanup(slow_srv.server_close)
+        slow_base = f"https://127.0.0.1:{slow_srv.server_address[1]}"
 
         with (
-            patch.object(mod.subprocess, "run", side_effect=failing_gh),
-            patch("builtins.print") as printed,
-            self.assertRaises(SystemExit) as cli_exit,
+            patch.object(updater, "_GITHUB_RELEASE_HOSTS", frozenset({"127.0.0.1"})),
+            patch.object(updater, "_DEFAULT_SSL_CONTEXT", raw_client_ctx),
         ):
-            mod.main(["--tag", tag, "--verify-url", ""])
-        self.assertEqual(1, cli_exit.exception.code)
-        printed_text = " ".join(str(c) for c in printed.call_args_list)
-        self.assertNotIn("SECRET_GH_TOKEN_SHOULD_NOT_LEAK", printed_text)
-        payload = json.loads(printed.call_args.args[0])
-        self.assertEqual("failed", payload["status"])
-        self.assertEqual("RuntimeError", payload["error_type"])
+            for path in ("/slow-body", "/slow-headers"):
+                started = time.monotonic()
+                with self.subTest(path=path), self.assertRaises(TimeoutError):
+                    updater._download_bytes(f"{slow_base}{path}", max_bytes=1024, timeout=0.2)
+                self.assertLess(time.monotonic() - started, 0.7)
+
+            started = time.monotonic()
+            self.assertEqual(b"final", updater._download_bytes(f"{slow_base}/slow-redirect", max_bytes=1024, timeout=0.5))
+            self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_cli_failure_preserves_protected_status_under_lock_races(self):
+        for preserved in (
+            {"status": "activating", "target_version": "0.2.11"},
+            {"status": "uncertain", "target_version": "0.2.11"},
+        ):
+            updater._write(self.state / "update-status.json", preserved)
+            with (
+                patch("builtins.print"),
+                patch.object(updater, "latest_release", side_effect=RuntimeError("boom")),
+                self.assertRaises(SystemExit),
+            ):
+                updater.main(["--state", str(self.state), "check"])
+            saved_status = json.loads((self.state / "update-status.json").read_text())
+            self.assertEqual(preserved["status"], saved_status["status"])
+            self.assertEqual("0.2.11", saved_status["target_version"])
+
+        (self.state / "update-status.json").unlink()
+        hold_lock_fd = os.open(self.root / "update.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            def concurrent_writer_holds_lock(*_, **__):
+                fcntl.flock(hold_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                updater._write(self.state / "update-status.json", {"status": "activating", "target_version": "0.2.12"})
+                raise RuntimeError("check failed while lock held")
+
+            with (
+                patch("builtins.print"),
+                patch.object(updater, "latest_release", side_effect=concurrent_writer_holds_lock),
+                self.assertRaises(SystemExit),
+            ):
+                updater.main(["--state", str(self.state), "check"])
+            status_after_lock = json.loads((self.state / "update-status.json").read_text())
+            self.assertEqual("activating", status_after_lock["status"])
+            self.assertEqual("0.2.12", status_after_lock["target_version"])
+        finally:
+            fcntl.flock(hold_lock_fd, fcntl.LOCK_UN)
+            os.close(hold_lock_fd)
+
+        (self.state / "update-status.json").unlink()
+
+        def concurrent_writer_released_before_record(*_, **__):
+            with updater._acquire_update_lock(self.root):
+                updater._write(self.state / "update-status.json", {"status": "activating", "target_version": "0.2.13"})
+            raise RuntimeError("check failed after activating unlocked")
+
+        with (
+            patch("builtins.print"),
+            patch.object(updater, "latest_release", side_effect=concurrent_writer_released_before_record),
+            self.assertRaises(SystemExit),
+        ):
+            updater.main(["--state", str(self.state), "check"])
+        status_after_release = json.loads((self.state / "update-status.json").read_text())
+        self.assertEqual("activating", status_after_release["status"])
+        self.assertEqual("0.2.13", status_after_release["target_version"])
+
+        # Corrupt update.json skips un-locked status overwrite.
+        (self.state / "update.json").write_text("{corrupt")
+        with patch("builtins.print"), self.assertRaises(SystemExit) as corrupt_err:
+            updater.main(["--state", str(self.state), "check"])
+        self.assertEqual(1, corrupt_err.exception.code)
+        status_after_corrupt = json.loads((self.state / "update-status.json").read_text())
+        self.assertEqual("activating", status_after_corrupt["status"])
+        self.assertEqual("0.2.13", status_after_corrupt["target_version"])
+
+    def test_install_broker_service_generates_managed_systemd_and_launchd_units(self):
+        with patch.object(updater.Path, "home", return_value=self.home), patch.object(updater, "_run") as run:
+            sys_res = updater.install_broker_service(
+                self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", enable=False
+            )
+            unit_text = Path(sys_res["service_path"]).read_text()
+            self.assertIn(str(self.root / "bin/agent-bridge"), unit_text)
+            self.assertIn("serve", unit_text)
+            Path(sys_res["service_path"]).write_text("custom unrelated unit")
+            with self.assertRaises(ValueError):
+                updater.install_broker_service(
+                    self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service"
+                )
+            updater.install_broker_service(
+                self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", force=True
+            )
+
+            mac_res = updater.install_broker_service(
+                self.state, root=self.root, service_kind="launchd", service_name="com.cli-agent-bridge.broker", enable=False
+            )
+            plist = plistlib.loads(Path(mac_res["service_path"]).read_bytes())
+            self.assertEqual("com.cli-agent-bridge.broker", plist["Label"])
+            self.assertEqual([str(self.root / "bin/agent-bridge"), "--state", str(self.state), "serve"], plist["ProgramArguments"])
+            self.assertTrue(plist["KeepAlive"])
+        run.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl is required")
+    def test_github_https_connect_proxy_with_auth_cdn_redirect_and_timeout(self):
+        routes: dict[str, tuple[int, bytes, dict[str, str]]] = {}
+        base_web, _, client_ctx = self._start_tls_server(routes)
+        tls_port = int(base_web.rsplit(":", 1)[1])
+        routes.update(
+            {
+                f"/{updater.REPOSITORY}/releases/download/v0.2.0/latest.json": (
+                    302,
+                    b"",
+                    {"Location": "https://release-assets.githubusercontent.com/assets/123?sp=r&sig=valid"},
+                ),
+                "/assets/123?sp=r&sig=valid": (200, b'{"proxied":true}', {}),
+            }
+        )
+
+        connect_targets: list[tuple[str, str]] = []
+        proxy_mode = {"stall": False, "auth_required": True}
+        expected_auth = "Basic " + base64.b64encode(b"user:secret").decode()
+
+        class _ConnectProxy(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_CONNECT(self):  # noqa: N802
+                auth_header = self.headers.get("Proxy-Authorization", "")
+                connect_targets.append((self.path, auth_header))
+                if proxy_mode["auth_required"] and auth_header != expected_auth:
+                    self.send_response(407, "Proxy Authentication Required")
+                    self.send_header("Proxy-Authenticate", 'Basic realm="test"')
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if proxy_mode["stall"]:
+                    # Hold CONNECT open past deadline without sending status line.
+                    time.sleep(0.5)
+                    return
+                upstream = socket.create_connection(("127.0.0.1", tls_port), timeout=5)
+                try:
+                    self.send_response(200, "Connection Established")
+                    self.end_headers()
+                    self.connection.setblocking(False)
+                    upstream.setblocking(False)
+                    sockets = [self.connection, upstream]
+                    while sockets:
+                        readable, _, errored = select.select(sockets, [], sockets, 1.0)
+                        if errored:
+                            break
+                        for sock in readable:
+                            peer = upstream if sock is self.connection else self.connection
+                            try:
+                                data = sock.recv(65_536)
+                            except OSError:
+                                data = b""
+                            if not data:
+                                return
+                            peer.sendall(data)
+                finally:
+                    upstream.close()
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        proxy = ThreadingHTTPServer(("127.0.0.1", 0), _ConnectProxy)
+        proxy.daemon_threads = True
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.shutdown)
+        self.addCleanup(proxy.server_close)
+        proxy_port = proxy.server_address[1]
+
+        # Test production hosts (`github.com` -> 302 CDN redirect to `release-assets.githubusercontent.com`)
+        # via real HTTP CONNECT proxy with Proxy-Authorization without overriding allowed host lists.
+        url = f"https://github.com/{updater.REPOSITORY}/releases/download/v0.2.0/latest.json"
+        proxy_env = {
+            "HTTPS_PROXY": f"http://user:secret@127.0.0.1:{proxy_port}",
+            "https_proxy": f"http://user:secret@127.0.0.1:{proxy_port}",
+            "NO_PROXY": "",
+            "no_proxy": "",
+        }
+        with (
+            patch.dict(os.environ, proxy_env),
+            patch.object(updater, "_DEFAULT_SSL_CONTEXT", client_ctx),
+        ):
+            payload = updater._download_bytes(url, max_bytes=4096, timeout=5.0)
+        self.assertEqual(b'{"proxied":true}', payload)
+        self.assertEqual(
+            [
+                ("github.com:443", expected_auth),
+                ("release-assets.githubusercontent.com:443", expected_auth),
+            ],
+            connect_targets,
+        )
+
+        # Wrong proxy credentials fail cleanly (407).
+        bad_auth_env = {**proxy_env, "HTTPS_PROXY": f"http://user:wrong@127.0.0.1:{proxy_port}", "https_proxy": f"http://user:wrong@127.0.0.1:{proxy_port}"}
+        with (
+            patch.dict(os.environ, bad_auth_env),
+            patch.object(updater, "_DEFAULT_SSL_CONTEXT", client_ctx),
+            self.assertRaises((OSError, urllib.error.HTTPError)),
+        ):
+            updater._download_bytes(url, max_bytes=4096, timeout=5.0)
+
+        # Slow stalling proxy CONNECT enforces deadline TimeoutError.
+        proxy_mode["stall"] = True
+        with (
+            patch.dict(os.environ, proxy_env),
+            patch.object(updater, "_DEFAULT_SSL_CONTEXT", client_ctx),
+            self.assertRaises(TimeoutError),
+        ):
+            updater._download_bytes(url, max_bytes=4096, timeout=0.15)
+
+    def test_install_broker_service_migrates_active_systemd_and_checks_busy_and_completion(self):
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        unit_path = unit_dir / "cli-agent-bridge.service"
+        old_unit = "[Unit]\n[Service]\nExecStart=/old/.venv/bin/agent-bridge serve\n"
+        unit_path.write_text(old_unit)
+        launcher = str(self.root / "bin/agent-bridge")
+
+        # Put one active task into bridge.sqlite: busy check must abort before mutating unit file.
+        store = Store(self.state)
+        with store.connection(write=True) as db:
+            db.execute(
+                "INSERT INTO sessions(id,profile,cwd,access,desired,created) VALUES('s-busy','codex-test',?,'read-only','open',0)",
+                (str(self.home),),
+            )
+            db.execute(
+                "INSERT INTO tasks(id,session_id,instruction,dependencies,reservation,status,created) "
+                "VALUES('t-busy','s-busy','run test','[]',0,'running',0)"
+            )
+
+        def _show_old(cmd, timeout=10):
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return "ActiveState=active\nMainPID=4242\nExecStart={ path=/old/.venv/bin/agent-bridge ; }\n"
+            return ""
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_show_old),
+        ):
+            with self.assertRaises(ValueError) as busy_err:
+                updater.install_broker_service(
+                    self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", enable=True, force=True
+                )
+            self.assertIn("busy", str(busy_err.exception).lower())
+        self.assertEqual(old_unit, unit_path.read_text())
+
+        # Remove busy database so state is idle: migration must acquire maintenance lease,
+        # restart active service, verify new PID + launcher, and release maintenance.
+        (self.state / "bridge.sqlite").unlink()
+        migrated = {"restarted": False}
+        commands: list[list[str]] = []
+        rpc_calls: list[tuple[str, dict]] = []
+
+        def _run_migration(cmd, timeout=10):
+            commands.append(cmd)
+            if cmd[:3] == ["systemctl", "--user", "restart"]:
+                migrated["restarted"] = True
+                return ""
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                if migrated["restarted"]:
+                    return f"ActiveState=active\nMainPID=9999\nExecStart={{ path={launcher} ; }}\n"
+                return "ActiveState=active\nMainPID=4242\nExecStart={ path=/old/.venv/bin/agent-bridge ; }\n"
+            return ""
+
+        async def _fake_request(_state, method, args):
+            rpc_calls.append((method, dict(args)))
+            if method == "agent_update_prepare":
+                return {"token": "lease-tok-1", "expires_at": time.time() + 180, "broker_pid": 4242}
+            if method == "agent_update_status":
+                return {"pid": 9999, "version": "0.2.12"}
+            if method == "agent_update_finish":
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_run_migration),
+            patch.object(updater, "_expected_managed_version", return_value="0.2.12"),
+            patch("agent_bridge.broker.request", side_effect=_fake_request),
+        ):
+            res = updater.install_broker_service(
+                self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", enable=True, force=True
+            )
+        self.assertTrue(res["restarted"])
+        self.assertEqual(9999, res["pid"])
+        self.assertEqual("0.2.12", res["version"])
+        self.assertIn(["systemctl", "--user", "restart", "cli-agent-bridge.service"], commands)
+        self.assertNotIn(["systemctl", "--user", "enable", "--now", "cli-agent-bridge.service"], commands)
+        self.assertEqual(
+            [m for m, _ in rpc_calls],
+            ["agent_update_prepare", "agent_update_status", "agent_update_finish"],
+        )
+
+        # If PID stayed on old 4242 after restart, fail explicitly as incomplete migration (while releasing lease).
+        unit_path.write_text(old_unit)
+        migrated["restarted"] = False
+        rpc_calls.clear()
+
+        async def _stale_pid_request(_state, method, args):
+            rpc_calls.append((method, dict(args)))
+            if method == "agent_update_prepare":
+                return {"token": "lease-tok-2", "expires_at": time.time() + 180, "broker_pid": 4242}
+            if method == "agent_update_status":
+                return {"pid": 4242, "version": "0.2.12"}
+            if method == "agent_update_finish":
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_run_migration),
+            patch.object(updater, "_expected_managed_version", return_value="0.2.12"),
+            patch.object(updater, "_BROKER_HEALTH_TIMEOUT", 0.05),
+            patch("agent_bridge.broker.request", side_effect=_stale_pid_request),
+            self.assertRaises(RuntimeError) as inc_err,
+        ):
+            updater.install_broker_service(
+                self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", enable=True, force=True
+            )
+        self.assertIn("incomplete", str(inc_err.exception).lower())
+        self.assertEqual(rpc_calls[-1], ("agent_update_finish", {"token": "lease-tok-2"}))
+
+    def test_install_broker_service_aborts_toctou_busy_and_missing_lease_without_touching_unit(self):
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        unit_path = unit_dir / "cli-agent-bridge.service"
+        old_unit = "[Unit]\n[Service]\nExecStart=/old/.venv/bin/agent-bridge serve\n"
+        unit_path.write_text(old_unit)
+        Store(self.state)
+
+        def _show_old(cmd, timeout=10):
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return "ActiveState=active\nMainPID=4242\nExecStart={ path=/old/.venv/bin/agent-bridge ; }\n"
+            raise AssertionError(f"Unexpected command {cmd}")
+
+        # 1. Unreachable broker / missing maintenance lease aborts before rewriting unit.
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_show_old),
+            patch("agent_bridge.broker.request", side_effect=OSError("no broker sock")),
+            self.assertRaisesRegex(RuntimeError, "maintenance lease"),
+        ):
+            updater.install_broker_service(
+                self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", enable=True, force=True
+            )
+        self.assertEqual(old_unit, unit_path.read_text())
+
+        # 2. Work arrives after validate_broker_service_install() but before lease re-check completes.
+        rpc_calls: list[str] = []
+
+        async def _arriving_work_request(_state, method, args):
+            rpc_calls.append(method)
+            if method == "agent_update_prepare":
+                store = Store(self.state)
+                with store.connection(write=True) as db:
+                    db.execute(
+                        "INSERT INTO sessions(id,profile,cwd,access,desired,created) VALUES('s-racy','codex-test',?,'read-only','open',0)",
+                        (str(self.home),),
+                    )
+                    db.execute(
+                        "INSERT INTO tasks(id,session_id,instruction,dependencies,reservation,status,created) "
+                        "VALUES('t-racy','s-racy','race','[]',0,'running',0)"
+                    )
+                return {"token": "tok-toctou", "expires_at": time.time() + 180, "broker_pid": 4242}
+            if method == "agent_update_finish":
+                self.assertEqual(args, {"token": "tok-toctou"})
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_show_old),
+            patch("agent_bridge.broker.request", side_effect=_arriving_work_request),
+            self.assertRaisesRegex(ValueError, "while busy"),
+        ):
+            updater.install_broker_service(
+                self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", enable=True, force=True
+            )
+        self.assertEqual(old_unit, unit_path.read_text())
+        self.assertEqual(rpc_calls, ["agent_update_prepare", "agent_update_finish"])
+
+    def test_install_broker_service_launchd_unifies_needs_restart(self):
+        with patch.object(updater.Path, "home", return_value=self.home), patch.object(updater, "_run"):
+            initial = updater.install_broker_service(
+                self.state, root=self.root, service_kind="launchd", service_name="com.cli-agent-bridge.broker", enable=False
+            )
+        launcher = str(self.root / "bin/agent-bridge")
+        plist_path = Path(initial["service_path"])
+        commands: list[list[str]] = []
+
+        def _launchctl_unchanged(cmd, timeout=10):
+            commands.append(cmd)
+            if cmd[:2] == ["launchctl", "print"]:
+                return f"\tstate = running\n\tpid = 7777\n\tprogram = {launcher}\n"
+            raise AssertionError(f"Unchanged active LaunchAgent must not run {cmd}")
+
+        rpc_calls: list[str] = []
+
+        async def _status_only(_state, method, args):
+            rpc_calls.append(method)
+            if method == "agent_update_status":
+                return {"pid": 7777, "version": "0.2.12"}
+            raise AssertionError(f"Unchanged LaunchAgent should not acquire lease ({method})")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_launchctl_unchanged),
+            patch.object(updater, "_expected_managed_version", return_value="0.2.12"),
+            patch("agent_bridge.broker.request", side_effect=_status_only),
+        ):
+            res = updater.install_broker_service(
+                self.state, root=self.root, service_kind="launchd", service_name="com.cli-agent-bridge.broker", enable=True
+            )
+        self.assertFalse(res["restarted"])
+        self.assertEqual(res["pid"], 7777)
+        self.assertEqual(rpc_calls, ["agent_update_status"])
+        self.assertTrue(all(cmd[:2] == ["launchctl", "print"] for cmd in commands))
+
+        # Now test unmanaged / modified launchd plist -> restarts cleanly under maintenance lease.
+        plist_path.write_text("<plist>old</plist>")
+        restarted_state = {"done": False}
+        commands.clear()
+        rpc_calls.clear()
+
+        def _launchctl_migrate(cmd, timeout=10):
+            commands.append(cmd)
+            if cmd[:2] == ["launchctl", "print"]:
+                if restarted_state["done"]:
+                    return f"\tstate = running\n\tpid = 8888\n\tprogram = {launcher}\n"
+                return "\tstate = running\n\tpid = 6666\n\tprogram = /old/agent-bridge\n"
+            if cmd[:2] == ["launchctl", "bootstrap"]:
+                restarted_state["done"] = True
+            return ""
+
+        async def _migrate_rpc(_state, method, args):
+            rpc_calls.append(method)
+            if method == "agent_update_prepare":
+                return {"token": "mac-tok", "expires_at": time.time() + 180, "broker_pid": 6666}
+            if method == "agent_update_status":
+                return {"pid": 8888, "version": "0.2.12"}
+            if method == "agent_update_finish":
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_launchctl_migrate),
+            patch.object(updater, "_expected_managed_version", return_value="0.2.12"),
+            patch("agent_bridge.broker.request", side_effect=_migrate_rpc),
+        ):
+            res = updater.install_broker_service(
+                self.state, root=self.root, service_kind="launchd", service_name="com.cli-agent-bridge.broker", enable=True, force=True
+            )
+        self.assertTrue(res["restarted"])
+        self.assertEqual(res["pid"], 8888)
+        self.assertEqual(rpc_calls, ["agent_update_prepare", "agent_update_status", "agent_update_finish"])
+        self.assertIn(["launchctl", "bootout", f"gui/{os.getuid()}/com.cli-agent-bridge.broker"], commands)
+        self.assertIn(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], commands)
+
+    def test_verify_migrated_broker_requires_expected_version_and_live_pid(self):
+        with (
+            patch.object(updater, "_expected_managed_version", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "expected managed broker version"),
+        ):
+            updater._verify_migrated_broker(
+                self.state, self.root, "systemd", "cli-agent-bridge.service", "/bin/agent-bridge",
+                previous_pid=None, restarted=False,
+            )
+
+        with (
+            patch.object(updater, "_expected_managed_version", return_value="0.2.12"),
+            patch("agent_bridge.broker.request", new=AsyncMock(return_value={"pid": 9999, "version": "0.2.12"})),
+            patch.object(updater, "_probe_broker_service_state", return_value=(True, None, True)),
+            self.assertRaisesRegex(RuntimeError, "live MainPID"),
+        ):
+            updater._verify_migrated_broker(
+                self.state, self.root, "systemd", "cli-agent-bridge.service", "/bin/agent-bridge",
+                previous_pid=None, restarted=False,
+            )
+
+    def test_validate_update_install_checks_timer_parent_symlinks_and_permissions(self):
+        timer_dir = self.home / ".config/systemd/user"
+        timer_dir.parent.mkdir(parents=True)
+        (self.home / "elsewhere").mkdir()
+        timer_dir.symlink_to(self.home / "elsewhere")
+        with patch.object(updater.Path, "home", return_value=self.home):
+            with self.assertRaisesRegex(ValueError, "symlinked"):
+                updater.validate_update_install(self.state, service_kind="systemd", root=self.root)
+
+        timer_dir.unlink()
+        timer_dir.mkdir()
+        timer_dir.chmod(0o500)
+        try:
+            with patch.object(updater.Path, "home", return_value=self.home):
+                with self.assertRaisesRegex(ValueError, "not writable"):
+                    updater.validate_update_install(self.state, service_kind="systemd", root=self.root)
+        finally:
+            timer_dir.chmod(0o700)
+
+    def test_install_broker_service_rejects_mismatched_maintenance_lease_pid(self):
+        unit_dir = self.home / ".config/systemd/user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        unit_path = unit_dir / "cli-agent-bridge.service"
+        old_unit = "[Unit]\n[Service]\nExecStart=/old/.venv/bin/agent-bridge serve\n"
+        unit_path.write_text(old_unit)
+
+        def _show_old(cmd, timeout=10):
+            if cmd[:3] == ["systemctl", "--user", "show"]:
+                return "ActiveState=active\nMainPID=111\nExecStart={ path=/old/.venv/bin/agent-bridge ; }\n"
+            raise AssertionError(f"Service manager command {cmd} must not run on lease PID mismatch")
+
+        rpc_calls: list[tuple[str, dict]] = []
+
+        async def _wrong_broker_rpc(_state, method, args):
+            rpc_calls.append((method, dict(args)))
+            if method == "agent_update_prepare":
+                return {"token": "wrong-tok", "expires_at": time.time() + 180, "broker_pid": 222}
+            if method == "agent_update_finish":
+                return {"maintenance": False}
+            raise AssertionError(f"Unexpected RPC {method}")
+
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run", side_effect=_show_old),
+            patch("agent_bridge.broker.request", side_effect=_wrong_broker_rpc),
+            self.assertRaisesRegex(RuntimeError, "broker PID 222"),
+        ):
+            updater.install_broker_service(
+                self.state, root=self.root, service_kind="systemd", service_name="cli-agent-bridge.service", enable=True, force=True
+            )
+        self.assertEqual(old_unit, unit_path.read_text())
+        self.assertEqual(
+            rpc_calls,
+            [
+                ("agent_update_prepare", {"hot": False}),
+                ("agent_update_finish", {"token": "wrong-tok"}),
+            ],
+        )
+
+    def test_validate_write_target_rejects_higher_ancestor_symlink_without_stop_at(self):
+        real_ancestor = self.home / "real_base"
+        (real_ancestor / "existing_parent").mkdir(parents=True)
+        link_ancestor = self.home / "link_base"
+        link_ancestor.symlink_to(real_ancestor)
+        linked_state = link_ancestor / "existing_parent" / "state"
+        with self.assertRaisesRegex(ValueError, "symlinked directory"):
+            updater._validate_write_target(linked_state, label="state directory", expect_dir=True)
 
 
 if __name__ == "__main__":
