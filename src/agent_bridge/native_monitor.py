@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
@@ -885,8 +886,16 @@ def _unified_sort_key(item: dict[str, Any]) -> tuple[int, int, float, int, str]:
         tier = 5
     source_rank = 0 if item.get("source") == "bridge" else 1
     created = item.get("created")
-    recency = -float(created) if isinstance(created, (int, float)) else 0.0
-    pid = int(item.get("pid") or 0)
+    recency = 0.0
+    if isinstance(created, (int, float)) and not isinstance(created, bool):
+        try:
+            f_created = float(created)
+            if math.isfinite(f_created):
+                recency = -f_created
+        except OverflowError:
+            recency = 0.0
+    raw_pid = item.get("pid")
+    pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else 0
     return (tier, source_rank, recency, pid, str(item.get("id") or ""))
 
 
