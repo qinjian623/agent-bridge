@@ -27,6 +27,8 @@ Follow-up fixes include:
 
 These descriptions summarize changes in code. The frozen source passed independent static acceptance of the reviewed cases. See [changes](../CHANGELOG.md) for the candidate's other user-visible changes.
 
+The tables below describe the original candidate snapshot. On 2026-11-17, the subsequent OTA source-compatibility fixes passed 1,091 offline tests on Python 3.13; that result does not replace the earlier multi-version checks or the unverified checks listed below.
+
 ## Checks performed locally
 
 | Check | Observed result and limit |
@@ -46,7 +48,7 @@ The installation checks used Linux, Python 3.13, a new HOME/state/project, detac
 
 The [workflow](../.github/workflows/ci.yml) is configured to run the complete offline suite on Linux with Python 3.11, 3.13, and 3.14, then build and check clean packaging on Linux and macOS. It creates a wheel, source archive, `SHA256SUMS`, and `latest.json`. A matching stable version tag triggers automatic GitHub Release publication only after the required jobs pass. See [CI and releases](ci-release.md).
 
-This preparation has not pushed a commit or tag or triggered a release. GitHub remains private. The 21 previously inspected release attachments contain private information; do not republish those files. Cleaning Git history or uploading new files does not clean old attachments. See [privacy preparation](privacy.md).
+The preparation branch was pushed and its initial CI passed. On 2026-11-17, the 21 inspected release attachments containing private information and the old CI records and package artifacts were removed; old build caches were invalidated. Git history rewriting and the new main CI are checked separately. GitHub remains private, and no 0.3.0 tag, release or production upgrade was created. Do not republish the private backups or merge old clone history. See [privacy preparation](privacy.md).
 
 ## Work still unverified
 

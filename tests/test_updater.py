@@ -271,6 +271,101 @@ class ChildProcessTests(unittest.TestCase):
 
 
 class ReleaseValidationTests(UpdateFixture):
+    def test_legacy_mirror_settings_load_and_reconfiguration_preserve_source(self):
+        for url in ("http://127.0.0.1:8088/bridge", "https://mirror.example.invalid/bridge/"):
+            with self.subTest(url=url):
+                updater._write(self.state / "update.json", {**self.settings, "release_url": url})
+                self.assertEqual(url, updater.load_settings(self.state)["release_url"])
+                for update_existing in (False, True):
+                    with patch.object(updater.Path, "home", return_value=self.home):
+                        *_, settings = updater.validate_update_install(
+                            self.state, root=self.root, update_existing=update_existing,
+                            interval=7200 if update_existing else 3600,
+                        )
+                    self.assertEqual(url, settings["release_url"])
+
+    def test_mirror_url_validation_and_errors_do_not_echo_input(self):
+        for url in (
+            "https://mirror.example.invalid/bridge", "http://127.0.0.1:8088/bridge",
+            "http://localhost/bridge", "http://100.64.0.8/bridge",
+            "http://node.example.ts.net/bridge", "http://[fd7a:115c:a1e0::1]/bridge",
+            "http://[::ffff:127.0.0.1]/bridge",
+        ):
+            self.assertEqual(url, updater.validate_release_url(url))
+        for url in (
+            "http://mirror.example.invalid/secret", "http://169.254.169.254/secret",
+            "http://192.168.1.1/secret", "http://node.ts.net.evil.invalid/secret",
+            "https://user:secret@mirror.example.invalid/bridge",
+            "https://mirror.example.invalid:secret/bridge", "https://mirror.example.invalid/bridge?secret=1",
+            "https://mirror.example.invalid/bridge#secret", "https://mirror.example.invalid/%2e%2e/secret",
+            "https://[broken/secret", "file:///secret", None,
+        ):
+            with self.subTest(url=url), self.assertRaises(ValueError) as caught:
+                updater.validate_release_url(url)
+            self.assertNotIn("secret", str(caught.exception))
+
+    def test_release_url_validators_reject_del_and_c1_before_url_normalization(self):
+        for validate, base in (
+            (updater.validate_release_url, "http://localhost/bridge"),
+            (updater._validate_github_url, "https://github.com/example/repo"),
+        ):
+            for value in range(0x7F, 0xA0):
+                char = chr(value)
+                for url in (char + base, base + char, base + "/" + char + "/asset"):
+                    with self.subTest(validator=validate.__name__, value=value, url=url), self.assertRaises(ValueError):
+                        validate(url)
+
+    def test_mirror_check_does_not_fall_back_to_github(self):
+        base = "http://127.0.0.1:8088/bridge"
+        payload = updater.build_release_manifest("v0.2.0", 123, 90)
+        with patch.object(updater, "_download_bytes", return_value=json.dumps(payload).encode()) as dl:
+            release = updater.latest_release(updater.REPOSITORY, release_url=base)
+        self.assertEqual("v0.2.0", release["tag"])
+        dl.assert_called_once_with(f"{base}/latest.json", max_bytes=262_144, timeout=30, mirror_base=base)
+        error = urllib.error.HTTPError(f"{base}/latest.json", 404, "Missing", {}, None)
+        with patch.object(updater, "_download_bytes", side_effect=error) as dl:
+            with self.assertRaises(urllib.error.HTTPError):
+                updater.latest_release(updater.REPOSITORY, release_url=base)
+        self.assertEqual(1, dl.call_count)
+        self.updater.settings["release_url"] = base
+        with patch.object(updater, "latest_release", return_value=release) as latest:
+            self.updater.check()
+        latest.assert_called_once_with(updater.REPOSITORY, release_url=base)
+
+        updater._write(self.state / "update.json", self.settings)
+        client = updater.Updater(self.state)
+        with patch.object(updater, "latest_release", return_value=release) as latest:
+            client.check()
+        latest.assert_called_once_with(updater.REPOSITORY)
+
+    def test_mirror_redirect_stays_on_configured_origin(self):
+        base = "http://127.0.0.1:8088/bridge"
+        with updater._DownloadDeadline(2) as guard:
+            handler = updater._GitHubRedirectHandler(guard, mirror_base=base)
+            request = urllib.request.Request(f"{base}/latest.json")
+            result = handler.redirect_request(request, None, 302, "Moved", {}, f"{base}/releases/latest.json")
+            self.assertEqual(f"{base}/releases/latest.json", result.full_url)
+            for target in (
+                "http://127.0.0.2:8088/bridge/latest.json", "http://127.0.0.1:8089/bridge/latest.json",
+                "https://127.0.0.1:8088/bridge/latest.json", "http://mirror.example.invalid/latest.json",
+            ):
+                with self.subTest(target=target), self.assertRaises(ValueError):
+                    handler.redirect_request(request, None, 302, "Moved", {}, target)
+
+    def test_http_mirror_dns_answers_are_checked_before_any_connect(self):
+        answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("100.64.0.8", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", 80)),
+        ]
+        with (
+            updater._DownloadDeadline(2) as guard,
+            patch.object(updater, "_resolve_addrs_with_deadline", return_value=answers),
+            patch.object(updater.socket, "socket") as create,
+            self.assertRaises(ValueError),
+        ):
+            updater._open_guarded_socket("node.example.ts.net", 80, guard, tailscale_only=True)
+        create.assert_not_called()
+
     def release(self):
         return {
             "id": 1,
@@ -928,6 +1023,58 @@ class CrashAndHealthTests(UpdateFixture):
         self.assertTrue(self.old.exists())
         self.assertEqual(self.old, self.updater.current.resolve())
 
+    def test_stage_mirror_downloads_wheel_and_checksum_only_from_configured_source(self):
+        release = {"tag": "v0.2.0", "wheel": "cli_agent_bridge-0.2.0-py3-none-any.whl"}
+        sums = (hashlib.sha256(b"test-wheel").hexdigest() + "  " + release["wheel"] + "\n").encode()
+        for base in ("http://127.0.0.1:8088/bridge", "https://mirror.example.invalid/bridge"):
+            with self.subTest(base=base):
+                self.updater.settings["release_url"] = base
+                generated = {}
+
+                def download(url, base=base, **options):
+                    self.assertEqual(base, options["mirror_base"])
+                    self.assertTrue(url.startswith(f"{base}/releases/v0.2.0/"))
+                    return sums if url.endswith("/SHA256SUMS") else b"test-wheel"
+
+                def command(argv, generated=generated, **_):
+                    if argv[:2] == ["uv", "venv"]:
+                        generated["target"] = Path(argv[-1])
+                        (generated["target"] / "bin").mkdir()
+                    elif argv[0] == str(generated["target"] / "bin/python"):
+                        skill = generated["target"] / "lib/python/site-packages/agent_bridge/skill"
+                        skill.mkdir(parents=True)
+                        return str(skill)
+                    return ""
+
+                with (
+                    patch.object(updater, "_download_bytes", side_effect=download) as dl,
+                    patch.object(updater, "_run", side_effect=command),
+                    patch.object(self.updater, "preflight"),
+                ):
+                    target = self.updater.stage(release)
+                self.assertEqual([
+                    f"{base}/releases/v0.2.0/{release['wheel']}", f"{base}/releases/v0.2.0/SHA256SUMS",
+                ], [c.args[0] for c in dl.call_args_list])
+                self.assertTrue((target / "skill").is_symlink())
+
+    def test_mirror_checksum_failure_does_not_install_or_keep_candidate(self):
+        self.updater.settings["release_url"] = "http://127.0.0.1:8088/bridge"
+        release = {"tag": "v0.2.0", "wheel": "cli_agent_bridge-0.2.0-py3-none-any.whl"}
+
+        def download(url, **_):
+            return ("0" * 64 + "  " + release["wheel"]).encode() if url.endswith("/SHA256SUMS") else b"wheel"
+
+        before = set((self.root / "releases").iterdir())
+        with (
+            patch.object(updater, "_download_bytes", side_effect=download),
+            patch.object(updater, "_run") as run,
+            self.assertRaises(ValueError),
+        ):
+            self.updater.stage(release)
+        run.assert_not_called()
+        self.assertEqual(before, set((self.root / "releases").iterdir()))
+        self.assertEqual(self.old, self.updater.current.resolve())
+
     def test_cli_failure_has_nonzero_exit_and_only_sanitized_status(self):
         with (
             patch.object(updater, "Updater", side_effect=RuntimeError("never-save-secret")),
@@ -943,6 +1090,45 @@ class CrashAndHealthTests(UpdateFixture):
 
 
 class GitHubHttpsReleaseTests(UpdateFixture):
+    def test_configured_loopback_http_mirror_bypasses_proxy_and_rejects_origin_change(self):
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                seen.append(self.path)
+                if self.path == "/bridge/latest.json":
+                    self.send_response(302)
+                    self.send_header("Location", "/bridge/manifest.json")
+                    body = b""
+                elif self.path == "/bridge/escape":
+                    self.send_response(302)
+                    self.send_header("Location", "http://127.0.0.2/elsewhere")
+                    body = b""
+                else:
+                    self.send_response(200)
+                    body = b"fixture manifest"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}/bridge"
+        with patch.dict(os.environ, {
+            "HTTP_PROXY": "http://proxy.invalid:9", "http_proxy": "http://proxy.invalid:9",
+            "HTTPS_PROXY": "http://proxy.invalid:9", "NO_PROXY": "", "no_proxy": "",
+        }):
+            self.assertEqual(b"fixture manifest", updater._download_bytes(f"{base}/latest.json", max_bytes=1024, timeout=2, mirror_base=base))
+            with self.assertRaises(ValueError):
+                updater._download_bytes(f"{base}/escape", max_bytes=1024, timeout=2, mirror_base=base)
+        self.assertEqual(["/bridge/latest.json", "/bridge/manifest.json", "/bridge/escape"], seen)
+
     def _tls_contexts(self) -> tuple[ssl.SSLContext, ssl.SSLContext]:
         cert = self.home / "test-cert.pem"
         key = self.home / "test-key.pem"

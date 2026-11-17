@@ -1,4 +1,4 @@
-"""Install checked public GitHub Release wheels; drain and hot-swap the broker while compatible workers run."""
+"""Install checked release wheels; drain and hot-swap the broker while compatible workers run."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import contextlib
 import fcntl
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -50,6 +51,8 @@ VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)\Z")
 NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
 DEFAULT_DRAIN_TIMEOUT = 15.0
 LEGACY_WORKER_VERSION = (0, 2, 0)
+_TAILSCALE_IPV4_NET = ipaddress.ip_network("100.64.0.0/10")
+_TAILSCALE_IPV6_NET = ipaddress.ip_network("fd7a:115c:a1e0::/48")
 
 
 class UpdateUncertain(RuntimeError):
@@ -259,6 +262,66 @@ def busy_snapshot(
     return {"busy": bool(reasons), "reasons": reasons, "counts": counts, "hot": hot}
 
 
+def _is_tailscale_or_loopback_ip(raw_ip: str) -> bool:
+    try:
+        address = ipaddress.ip_address(raw_ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    network = _TAILSCALE_IPV4_NET if isinstance(address, ipaddress.IPv4Address) else _TAILSCALE_IPV6_NET
+    return address.is_loopback or address in network
+
+
+def _is_tailscale_or_loopback_host(host: str) -> bool:
+    host = host.lower().rstrip(".")
+    return host == "localhost" or host.endswith(".ts.net") or _is_tailscale_or_loopback_ip(host)
+
+
+def validate_release_url(url: str) -> str:
+    """Retain configured mirrors; plain HTTP is limited to loopback or Tailscale."""
+    try:
+        if (
+            not isinstance(url, str) or not url.strip()
+            or any(0x7F <= ord(ch) <= 0x9F for ch in url)
+            or any(ch.isspace() or ord(ch) < 32 for ch in url.strip())
+        ):
+            raise ValueError
+        clean = url.strip()
+        parsed = urllib.parse.urlsplit(clean)
+        host = parsed.hostname or ""
+        if (
+            parsed.scheme not in {"http", "https"} or not host
+            or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
+            or ".." in urllib.parse.unquote(parsed.path).split("/")
+            or parsed.port == 0
+            or parsed.scheme == "http" and not _is_tailscale_or_loopback_host(host)
+        ):
+            raise ValueError
+    except ValueError:
+        raise ValueError(
+            "Invalid release_url: use HTTPS, or HTTP only on loopback/Tailscale, without credentials, "
+            "query, fragment or parent traversal; remove this setting explicitly to use GitHub"
+        ) from None
+    return clean.rstrip("/")
+
+
+def _validate_mirror_url(url: str, base: str) -> str:
+    target = validate_release_url(url)
+    parsed, expected = urllib.parse.urlsplit(target), urllib.parse.urlsplit(validate_release_url(base))
+    if (
+        parsed.scheme,
+        (parsed.hostname or "").lower().rstrip("."),
+        parsed.port or (443 if parsed.scheme == "https" else 80),
+    ) != (
+        expected.scheme,
+        (expected.hostname or "").lower().rstrip("."),
+        expected.port or (443 if expected.scheme == "https" else 80),
+    ):
+        raise ValueError("Refusing cross-origin release mirror redirect")
+    return target
+
+
 def _validate_github_url(
     url: str,
     *,
@@ -269,7 +332,10 @@ def _validate_github_url(
     if not isinstance(url, str):
         raise ValueError("Invalid release URL")
     cleaned = url.strip()
-    if not cleaned or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+    if (
+        not cleaned or any(0x7F <= ord(ch) <= 0x9F for ch in url)
+        or any(ch.isspace() or ord(ch) < 32 for ch in cleaned)
+    ):
         raise ValueError("Invalid release URL")
     parsed = urllib.parse.urlsplit(cleaned)
     if parsed.scheme.lower() != "https":
@@ -350,12 +416,16 @@ class _RejectHTTPHandler(urllib.request.HTTPHandler):
 class _GitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
     max_redirections = 5
 
-    def __init__(self, guard: _DownloadDeadline) -> None:
+    def __init__(self, guard: _DownloadDeadline, *, mirror_base: str | None = None) -> None:
         self._guard = guard
+        self._mirror_base = mirror_base
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        host = (urllib.parse.urlsplit(newurl).hostname or "").lower().rstrip(".")
-        target = _validate_github_url(newurl, allow_query=(host in _GITHUB_CDN_HOSTS))
+        if self._mirror_base is not None:
+            target = _validate_mirror_url(newurl, self._mirror_base)
+        else:
+            host = (urllib.parse.urlsplit(newurl).hostname or "").lower().rstrip(".")
+            target = _validate_github_url(newurl, allow_query=(host in _GITHUB_CDN_HOSTS))
         return super().redirect_request(req, fp, code, msg, headers, target)
 
     def http_error_302(self, req, fp, code, msg, headers):
@@ -404,11 +474,15 @@ def _resolve_addrs_with_deadline(host: str, port: int, guard: _DownloadDeadline)
     return payload
 
 
-def _open_guarded_socket(host: str, port: int, guard: _DownloadDeadline) -> socket.socket:
+def _open_guarded_socket(
+    host: str, port: int, guard: _DownloadDeadline, *, tailscale_only: bool = False,
+) -> socket.socket:
     guard.check()
     addrs = _resolve_addrs_with_deadline(host, port, guard)
     if not addrs:
         raise OSError("Could not resolve release host")
+    if tailscale_only and any(not _is_tailscale_or_loopback_ip(str(address[4][0])) for address in addrs):
+        raise ValueError("Plain HTTP release host resolved outside Tailscale or loopback ranges")
     last_err: OSError | None = None
     for family, socktype, proto, _, sockaddr in addrs:
         sock = None
@@ -429,6 +503,25 @@ def _open_guarded_socket(host: str, port: int, guard: _DownloadDeadline) -> sock
     if last_err is not None:
         raise last_err
     raise OSError("Failed to connect to release host")
+
+
+class _VerifiedTailscaleHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, *, guard: _DownloadDeadline, **kwargs) -> None:
+        super().__init__(host, **kwargs)
+        self._guard = guard
+
+    def connect(self):
+        self.sock = _open_guarded_socket(self.host, self.port, self._guard, tailscale_only=True)
+
+
+class _BoundedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, guard: _DownloadDeadline) -> None:
+        super().__init__()
+        self._guard = guard
+
+    def http_open(self, req):
+        req.timeout = self._guard.check()
+        return self.do_open(lambda host, **kw: _VerifiedTailscaleHTTPConnection(host, guard=self._guard, **kw), req)
 
 
 class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
@@ -486,16 +579,18 @@ class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
         )
 
 
-def _download_bytes(url: str, *, max_bytes: int, timeout: float = 30.0) -> bytes:
-    """Download a bounded HTTPS release payload within a total wall-clock deadline."""
-    clean = _validate_github_url(url)
+def _download_bytes(url: str, *, max_bytes: int, timeout: float = 30.0, mirror_base: str | None = None) -> bytes:
+    """Download a bounded GitHub or configured same-origin mirror payload."""
+    clean = _validate_github_url(url) if mirror_base is None else _validate_mirror_url(url, mirror_base)
     context = _DEFAULT_SSL_CONTEXT if _DEFAULT_SSL_CONTEXT is not None else ssl.create_default_context()
     with _DownloadDeadline(timeout) as guard:
         handlers: list[urllib.request.BaseHandler] = [
-            _GitHubRedirectHandler(guard),
-            _RejectHTTPHandler(),
+            _GitHubRedirectHandler(guard, mirror_base=mirror_base),
+            _BoundedHTTPHandler(guard) if urllib.parse.urlsplit(clean).scheme == "http" else _RejectHTTPHandler(),
             _BoundedHTTPSHandler(guard, context=context),
         ]
+        if mirror_base is not None and _is_tailscale_or_loopback_host(urllib.parse.urlsplit(clean).hostname or ""):
+            handlers.append(urllib.request.ProxyHandler({}))
         opener = urllib.request.build_opener(*handlers)
         request = urllib.request.Request(
             clean,
@@ -541,13 +636,15 @@ def load_settings(state: Path):
         "service_name",
         "bootstrap_python",
     }
-    optional = {"interval"}
+    optional = {"interval", "release_url"}
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(required | optional):
         raise ValueError("Invalid update settings")
     if any(not isinstance(value[key], str) for key in required):
         raise ValueError("Update settings must be strings")
     if "interval" in value and (type(value["interval"]) is not int or value["interval"] < 300):
         raise ValueError("Update interval must be an integer >= 300")
+    if "release_url" in value:
+        validate_release_url(value["release_url"])
     repo = value["repository"]
     if not isinstance(repo, str) or len(repo.split("/")) != 2 or not all(NAME.fullmatch(x) for x in repo.split("/")):
         raise ValueError("Invalid GitHub repository")
@@ -613,9 +710,13 @@ def _parse_release_payload(data, *, require_positive_id: bool = True):
     return {"tag": tag, "wheel": wheel, "release_id": release_id}
 
 
-def latest_release(repository: str):
+def latest_release(repository: str, *, release_url: str | None = None):
     if not isinstance(repository, str) or len(repository.split("/")) != 2 or not all(NAME.fullmatch(x) for x in repository.split("/")):
         raise ValueError("Invalid GitHub repository")
+    if release_url is not None:
+        base = validate_release_url(release_url)
+        raw = _download_bytes(f"{base}/latest.json", max_bytes=262_144, timeout=30, mirror_base=base)
+        return _parse_release_payload(json.loads(raw.decode("utf-8")), require_positive_id=False)
     try:
         raw = _download_bytes(
             f"{GITHUB_WEB_ORIGIN}/{repository}/releases/latest/download/latest.json",
@@ -697,7 +798,10 @@ class Updater:
         return data
 
     def check(self):
-        release = latest_release(self.settings["repository"])
+        if "release_url" in self.settings:
+            release = latest_release(self.settings["repository"], release_url=self.settings["release_url"])
+        else:
+            release = latest_release(self.settings["repository"])
         installed = self.installed()
         return {
             "available": release,
@@ -764,18 +868,25 @@ class Updater:
                 download = Path(name)
                 repo = self.settings["repository"]
                 tag = release["tag"]
+                base = f"{GITHUB_WEB_ORIGIN}/{repo}/releases/download/{tag}"
+                options = {}
+                if "release_url" in self.settings:
+                    mirror = validate_release_url(self.settings["release_url"])
+                    base, options = f"{mirror}/releases/{tag}", {"mirror_base": mirror}
                 (download / expected_wheel).write_bytes(
                     _download_bytes(
-                        f"{GITHUB_WEB_ORIGIN}/{repo}/releases/download/{tag}/{expected_wheel}",
+                        f"{base}/{expected_wheel}",
                         max_bytes=100_000_000,
                         timeout=120,
+                        **options,
                     )
                 )
                 (download / "SHA256SUMS").write_bytes(
                     _download_bytes(
-                        f"{GITHUB_WEB_ORIGIN}/{repo}/releases/download/{tag}/SHA256SUMS",
+                        f"{base}/SHA256SUMS",
                         max_bytes=65_536,
                         timeout=30,
+                        **options,
                     )
                 )
                 digest = verify_wheel(download, expected_wheel)
@@ -1242,6 +1353,9 @@ def validate_update_install(
         "bootstrap_python": str(bootstrap),
         "interval": interval,
     }
+    if isinstance(existing, dict) and "release_url" in existing:
+        validate_release_url(existing["release_url"])
+        settings["release_url"] = existing["release_url"]
     _validate_write_target(path, label="update.json", stop_at=state)
     if kind == "systemd":
         directory = Path.home() / ".config/systemd/user"

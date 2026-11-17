@@ -694,9 +694,24 @@ class InitConfigTests(unittest.TestCase):
         finally:
             timer_dir.chmod(0o700)
 
-    def test_interactive_commit_interrupt_not_reported_as_aborted_and_legacy_update_migrated(self):
-        # Legacy update.json containing release_url should be stripped cleanly on init --non-interactive.
-        self.root.mkdir(parents=True, exist_ok=True)
+    def test_invalid_existing_mirror_is_not_silently_changed(self):
+        self.root.mkdir(parents=True, mode=0o700)
+        path = self.state / "update.json"
+        original = json.dumps({
+            "repository": updater.REPOSITORY, "root": str(self.root), "service_kind": "systemd",
+            "service_name": "cli-agent-bridge.service", "bootstrap_python": sys.executable,
+            "release_url": "http://public.example.invalid/private-marker",
+        })
+        path.write_text(original)
+        path.chmod(0o600)
+        with self.assertRaises(BridgeError) as caught:
+            init_config._load_existing_update(self.state)
+        self.assertEqual("invalid_config", caught.exception.code)
+        self.assertNotIn("private-marker", str(caught.exception))
+        self.assertEqual(original, path.read_text())
+
+    def test_interactive_commit_interrupt_and_existing_mirror_source_preserved(self):
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         (self.state / "config.json").write_text(
             json.dumps({"profiles": {"p1": {"runtime": "codex", "model": "gpt-5"}}})
         )
@@ -712,14 +727,24 @@ class InitConfigTests(unittest.TestCase):
                 }
             )
         )
+        (self.state / "update.json").chmod(0o600)
+        before = (self.state / "update.json").read_bytes()
         with (
             patch.object(Path, "home", return_value=self.home),
             patch.object(updater.Path, "home", return_value=self.home),
         ):
             code, out = self._run_cli(["init", "--non-interactive"])
         self.assertEqual(0, code, out)
-        migrated_update = json.loads((self.state / "update.json").read_text())
-        self.assertNotIn("release_url", migrated_update)
+        self.assertEqual(before, (self.state / "update.json").read_bytes())
+        with (
+            patch.object(Path, "home", return_value=self.home),
+            patch.object(updater.Path, "home", return_value=self.home),
+        ):
+            code, out = self._run_cli(["init", "--non-interactive", "--ota-interval", "7200"])
+        self.assertEqual(0, code, out)
+        changed = json.loads((self.state / "update.json").read_text())
+        self.assertEqual("http://127.0.0.1:8088/cli-agent-bridge", changed["release_url"])
+        self.assertEqual(7200, changed["interval"])
 
         # KeyboardInterrupt during _commit_changes after config.json was saved must NOT claim "Aborted without saving".
         (self.state / "config.json").unlink()

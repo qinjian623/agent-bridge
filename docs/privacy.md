@@ -30,6 +30,14 @@ After rewriting, check every retained ref and its historical objects, confirm th
 
 If historical removal cannot be verified with reasonable confidence, prepare a fresh public history from reviewed current files instead. Retain original history privately. Creating a local candidate does not publish it, change an existing remote, or authorize a force push.
 
+## Working after a history rewrite
+
+Rewriting Git history does not change runtime configuration, state backups or running services; maintain those separately.
+
+Clone the cleaned repository into a new directory. Keep uncommitted work in the old checkout private, and transfer reviewed file changes without its `.git` directory. Do not merge an old branch or push old backup refs: that can restore the removed history. A shared checkout with active worktrees should remain available until its work finishes; disable its push destination while using the new clone for future changes.
+
+Release attachments, workflow-run author metadata, build artifacts, and caches need separate checks and cleanup. Keep recovery copies private. Check the cleaned remote again from a fresh clone and verify source archives downloaded by tag. Server-side cached commit views and other people's clones require separate handling; a rewritten branch alone does not erase them.
+
 ## Limits
 
 Removing data from this candidate cannot erase other clones, remote caches, forks, release assets, backups, or already published messages. Exposed credentials need separate revocation. Do not publish runtime databases, authentication state, environment files containing secrets, raw conversations, or screen recordings, even when their filenames look harmless.

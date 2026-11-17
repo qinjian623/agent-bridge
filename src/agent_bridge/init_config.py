@@ -221,14 +221,14 @@ def _load_existing_update(state: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     loaded: dict[str, Any] | None
-    had_legacy_release_url = False
     try:
         loaded = dict(load_settings(state))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as error:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             return None
-        had_legacy_release_url = "release_url" in raw
+        if "release_url" in raw:
+            raise BridgeError("invalid_config", "Existing updater settings are invalid; the configured release source was not changed") from error
         allowed_str = {"repository", "root", "service_kind", "service_name", "bootstrap_python"}
         loaded = {k: v for k, v in raw.items() if k in allowed_str and isinstance(v, str)}
         if type(raw.get("interval")) is int and raw["interval"] >= 300:
@@ -237,8 +237,6 @@ def _load_existing_update(state: Path) -> dict[str, Any] | None:
         detected = _detect_existing_update_interval(loaded.get("service_kind"))
         if detected is not None:
             loaded["interval"] = detected
-    if had_legacy_release_url:
-        loaded["_had_legacy_release_url"] = True
     return loaded
 
 
@@ -1185,7 +1183,6 @@ def run_init(
     }
     removed_hosts: set[str] = set()
     existing_update = _load_existing_update(state)
-    had_legacy_release_url = bool((existing_update or {}).pop("_had_legacy_release_url", False))
     default_kind = (existing_update or {}).get("service_kind") or ("launchd" if sys.platform == "darwin" else "systemd")
     default_name = (existing_update or {}).get("service_name") or (
         "com.cli-agent-bridge.broker" if default_kind == "launchd" else "cli-agent-bridge.service"
@@ -1201,7 +1198,7 @@ def run_init(
         "force_broker_service": False,
         "install_updater": existing_update is not None,
         "enable_updater": False,
-        "apply_updater": had_legacy_release_url and existing_update is not None,
+        "apply_updater": False,
     }
     config_edited, ota_edited = _apply_cli_flags(config, ota_plan, args, removed_hosts=removed_hosts)
     if ota_edited and ota_plan.get("install_updater"):
