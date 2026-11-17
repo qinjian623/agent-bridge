@@ -1,6 +1,6 @@
-> Language: English | [中文](zh/dynamic-hosts-20261109.md)
+> Language: English | [中文](zh/dynamic-hosts.md)
 
-# Dynamic Host Registry and Secondary Linux Node Verification (2026-11-09)
+# Dynamic host configuration
 
 ## Live Runtime Configuration Reloads
 
@@ -15,7 +15,7 @@ agent-bridge call agent_hosts --json '{}'
 
 `agent_hosts_reload` returns `{added, updated, removed}` (empty lists when unchanged). It takes no parameters, requires local same-UID coordinator admin token auth, and is excluded from restricted member and `peer.*` paths. Existing MCP clients do not need re-discovery unless listing newly registered tools.
 
-Example `hosts` entry (note SSH host aliases in this check are redacted to `linux-node-b`):
+Example `hosts` entry using a synthetic SSH alias:
 
 ```json
 {
@@ -41,16 +41,3 @@ Inspect `peer.hello` and `peer.inspect(kind=node)` over an explicit SSH target b
 - Changing only SSH connection fields for the same identity does not bypass an `EventMirror` fingerprint-conflict pause; explicit re-pinning or removal clears transient pause flags while keeping historical fingerprints and durable cursors intact.
 
 Known limitation: historical parent routes from a retired `state_generation` lack explicit retirement proofs and may block later removal if reusing the exact same `host_id` for a different `node_id`—assign a fresh `host_id` when provisioning replacement nodes rather than force-deleting safety checks.
-
-## Live Node Bring-Up & Verification Summary (`linux-node-b`)
-
-- Synced repository and Git metadata cleanly via sync script to `~/gits/cli-agent-bridge` without copying credentials, SQLite state, or local virtualenvs.
-- Verified `cli-agent-bridge.service` user unit enabled/active, `broker.sock` present, and direct `agent_inspect` succeeded remotely (not relying solely on SSH relay).
-- Confirmed `peer.hello`, node `inspect`, and remote catalog (`protocol_version=1`, `ready`); adding the node surfaced it online across MCP and the running Web monitor without restart.
-- Two pre-existing Codex app-server daemons on `linux-node-b` stayed undisturbed (`verified=false` intentionally kept with zero inference triggered).
-- Verified dynamic add -> remove -> re-add of `linux-node-b` over real SSH under an isolated broker/Web PID without restarts, plus rejection + automatic recovery when intentionally writing corrupt test config.
-- Full test suite at check time: 687 tests passed in 24.342s, Ruff and `git diff --check` clean; isolated deployment verification details remain saved privately under `<private-validation-state>/report`.
-
-## Initial Coordinator Cutover Record
-
-Because the legacy running broker (`PID <process-01-pid>`) pre-dated live config-watch support, a single authorized hot-idle broker restart upgraded PID `<process-01-pid> -> <process-07-pid>` once all in-flight sends, API calls, socket connections, and non-SSH helpers reached zero (`Web PID <process-08-pid>`, shared Codex daemon `PID <process-09-pid>`, and exited historical workers stayed undisturbed). Merging `linux-node-b` afterward left coordinator PIDs untouched and registered remote daemon `PID <process-10-pid>` cleanly. Meanwhile `macos-node` remained unreachable over private VPN (`<vpn-ip>:22` timed out, `Online=false` in mesh view) with its config preserved untouched.

@@ -2,7 +2,7 @@
 
 # 隔离安装与首个任务检查
 
-2026-11-17（UTC 2026-11-16 18:07–18:08），在 Linux x86-64、Python 3.13.15、uv 0.13.8 上，将最后一轮候选 `0.3.0` wheel 安装到全新的 HOME、XDG、uv 工具、状态和项目目录，再按新用户步骤使用。模型执行部分采用 `tests/fixtures/fake_codex.py` 的未修改副本，没有使用真实模型、CLI 账号、共享 Codex daemon、已有 Bridge 状态或已安装的用户服务。
+2026-11-17（UTC 2026-11-16 18:07–18:08），在 Linux x86-64、Python 3.13.15、uv 0.13.8 上，将当时的候选 `0.3.0` wheel 安装到全新的 HOME、XDG、uv 工具、状态和项目目录，再按新用户步骤使用。模型执行部分采用 `tests/fixtures/fake_codex.py` 的未修改副本，没有使用真实模型、CLI 账号、共享 Codex daemon、已有 Bridge 状态或已安装的用户服务。
 
 17 项检查全部通过，其中包含 12 项无效输入。此前候选包曾因未知 profile 字段输出 Python traceback；本次重新安装后，确认返回清楚且不回显输入名称的错误，原配置保持不变。
 

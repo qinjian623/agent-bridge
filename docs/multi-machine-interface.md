@@ -22,7 +22,7 @@ All components above are wired into live code. Each host owns an independent SQL
 
 The broker watches `config.json.hosts` and `host_pins.json` periodically and supports immediate zero-arg refresh via `agent_hosts_reload`, returning `{added, updated, removed}` (while `agent_hosts` preserves `hosts` and exposes `config_error`). Reload adds no `peer.*` methods and never weakens member restrictions.
 
-`HostRegistry.read_configured_hosts()` validates candidate host configs without side effects; `replace_hosts()` applies in place. `PeerClientFactory.retire(host_ids)` blocks new traffic on stale handles while waiting for in-flight RPCs/pollers/ACKs; `release_retired(host_ids)` closes retired connections cleanly once replaced. Invalid batches or referenced active hosts reject changes atomically without affecting unchanged hosts. See [Dynamic Hosts Check](dynamic-hosts-20261109.md).
+`HostRegistry.read_configured_hosts()` validates candidate host configs without side effects; `replace_hosts()` applies in place. `PeerClientFactory.retire(host_ids)` blocks new traffic on stale handles while waiting for in-flight RPCs/pollers/ACKs; `release_retired(host_ids)` closes retired connections cleanly once replaced. Invalid batches or referenced active hosts reject changes atomically without affecting unchanged hosts. See [Dynamic host configuration](dynamic-hosts.md).
 
 - Transport: `ssh <target> <remote_executable> relay`, one UTF-8 JSON line per frame, max `MAX_FRAME_BYTES` (1 MiB).
 - Request: `{"v":1,"id":"<frame id>","method":"peer.x","params":{...}}`; response: `{"v":1,"id":...,"ok":true,"result":{...}}` or `"ok":false,"error":{code,message}`.
@@ -96,7 +96,7 @@ Budgets stay scoped per host (`budget_scope=host`); metered broadcasts containin
 
 Phase C error codes: `workspace_conflict`, `workspace_already_attached`, `workspace_limit_exceeded`, `workspace_project_changed`, `group_prune_blocked`, `native_stop_unverifiable`, `parent_route_conflict`. Extended `PeerDeliveryStatus`: `sending`, `tombstone_pending`, `released`, `resolving`, `failed`.
 
-`peer_protocol.CAPABILITIES`: `groups_v1`, `ordered_delivery_v1`, `member_outbox_v1`, `event_mirror_v1`, `workspace_v1`, `session_name_v1`, `prune_guard_v1`. Of the 16 allowlisted RPCs, 13 have active server handlers (`peer.workspace` and `peer.resolve_delivery` included; `peer.control`, `peer.review`, `peer.inbox` marked unimplemented above).
+`peer_protocol.CAPABILITIES`: `groups_v1`, `ordered_delivery_v1`, `member_outbox_v1`, `event_mirror_v1`, `workspace_v1`, `session_name_v1`, `prune_guard_v1`, `task_timeout_v1`. Of the 16 allowlisted RPCs, 13 have active server handlers (`peer.workspace` and `peer.resolve_delivery` included; `peer.control`, `peer.review`, `peer.inbox` marked unimplemented above).
 
 ## 7. Work Package Mapping
 

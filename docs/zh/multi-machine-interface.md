@@ -22,7 +22,7 @@
 
 管理员主机清单支持运行中更新：Broker 定期读取 `config.json.hosts` 与 `host_pins.json`，或通过无参数管理工具 `agent_hosts_reload` 立即更新。返回 `{added,updated,removed}`；`agent_hosts` 保留 `hosts`，新增 `config_error`。不会为刷新调用新增 `peer.*` 方法或放宽成员权限。
 
-`HostRegistry.read_configured_hosts()` 只验证候选配置；`replace_hosts()` 原地应用。`PeerClientFactory.retire(host_ids)` 禁止旧句柄新发请求并等待已发请求完成；替换清单后调用 `release_retired(host_ids)`。完整 API 与轮询 ACK 先结束，未变化连接不关闭。无效输入或尚有未完成引用时整批不应用；历史路由须实际核实。详见 [动态节点检查](dynamic-hosts-20261109.md)。
+`HostRegistry.read_configured_hosts()` 只验证候选配置；`replace_hosts()` 原地应用。`PeerClientFactory.retire(host_ids)` 禁止旧句柄新发请求并等待已发请求完成；替换清单后调用 `release_retired(host_ids)`。完整 API 与轮询 ACK 先结束，未变化连接不关闭。无效输入或尚有未完成引用时整批不应用；历史路由须实际核实。详见 [动态节点检查](dynamic-hosts.md)。
 
 - 传输：`ssh <target> <remote_executable> relay`，每行一个 UTF-8 JSON，单帧不超过 `MAX_FRAME_BYTES`（1 MiB）。
 - 请求 `{"v":1,"id":"<frame id>","method":"peer.x","params":{…}}`；响应 `{"v":1,"id":…,"ok":true,"result":{…}}` 或 `"ok":false,"error":{code,message}`。
@@ -98,7 +98,7 @@
 
 Phase C 新增错误码：`workspace_conflict`、`workspace_already_attached`、`workspace_limit_exceeded`、`workspace_project_changed`、`group_prune_blocked`、`native_stop_unverifiable`、`parent_route_conflict`。`PeerDeliveryStatus` 新增 `sending`、`tombstone_pending`、`released`、`resolving`、`failed`。
 
-`peer_protocol.CAPABILITIES`：`groups_v1`、`ordered_delivery_v1`、`member_outbox_v1`、`event_mirror_v1`、`workspace_v1`、`session_name_v1`、`prune_guard_v1`。
+`peer_protocol.CAPABILITIES`：`groups_v1`、`ordered_delivery_v1`、`member_outbox_v1`、`event_mirror_v1`、`workspace_v1`、`session_name_v1`、`prune_guard_v1`、`task_timeout_v1`。
 
 Phase C 接口：`RemoteMember` 使用 `target_kind`（`bridge` 带 `session_id`；`native` 带 `runtime` + `native_id`）；`peer.deliver` 支持 `ordering_mode`、`stream_id`、`authority_ref`、`parent_ref`；`peer.pull_requests` 返回 `scan_upper_seq`；`OutboxItem` 带 `seq`、`sender_ref`、`authority_ref`、`authorization_revision`、`fingerprint`。`peer.workspace` 与 `peer.resolve_delivery` 已实现；16 个白名单方法中，13 个有运行处理代码，未实现项已在上表标出。
 

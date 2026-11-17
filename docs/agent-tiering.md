@@ -8,9 +8,9 @@ The primary agent dispatches a task, the execution agent edits files inside an i
 
 v1 connects to a single bridge instance executing one round per task. The primary agent explicitly picks an existing profile without automatic retries, automatic model switching, or metrics-driven auto-selection.
 
-[cli-agent-bridge](../README.md) already implements sessions, tasks, isolated worktrees, `agent_wait`, `agent_result`, and `agent_review`. The validation helpers, JSONL logger, and metrics reporting described here remain external/planned tooling rather than claiming existing built-in bridge features.
+[cli-agent-bridge](../README.md) already implements sessions, tasks, isolated worktrees, `agent_wait`, `agent_result`, and `agent_review`. The external helper [scripts/tiering.py](../scripts/tiering.py) provides independent checks, task/review JSONL recording, and counts, pass-rate, and duration reports; dispatch and Bridge review remain the primary agent's responsibility.
 
-Simplified per [Basic Scope & Terminology Review](agent-tiering-basic-review.md) to persist only `task` and `review` event records in v1.
+The v1 ledger persists only `task` and `review` event records.
 
 ## 2. Responsibilities
 

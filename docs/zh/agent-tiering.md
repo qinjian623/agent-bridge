@@ -8,9 +8,9 @@
 
 第一版只连接一个 bridge，每次任务只执行一轮。主 agent 直接选择一个已有配置，不自动重试、不自动换模型，也不按统计结果自动选模型。
 
-[cli-agent-bridge](README.md) 已提供会话、任务、worktree、等待、结果查询和 `agent_review`。本文的检查脚本、JSONL 记录和报表仍待实现，不表示 bridge 已经支持。
+[cli-agent-bridge](README.md) 已提供会话、任务、worktree、等待、结果查询和 `agent_review`。仓库中的独立脚本 [scripts/tiering.py](../../scripts/tiering.py) 已提供检查、task/review JSONL 记录，以及数量、通过率和耗时报表；任务派发和 Bridge 审核仍由主 agent 执行。
 
-本文按 [基础功能与用词审查](agent-tiering-basic-review.md) 精简；记录按本版要求只保留 `task`、`review` 两种。
+本版记录只保留 `task`、`review` 两种。
 
 ## 2. 谁负责什么
 

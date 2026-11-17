@@ -178,13 +178,13 @@ launchctl print "gui/$(id -u)/com.cli-agent-bridge.broker"
 
 ## 远端主机
 
-多机器接入方案见 [多机器架构规范](multi-machine-design.md)（已整合 [AGY / DeepSeek 审查结论](multi-machine-review.md)）。代码已提供 `agent-bridge relay`、SSH JSONL 传输、节点握手、主机查询、远端任务与分组接口。远端机器需要独立运行 Broker；连接按主机复用，每次请求前核对节点身份，断线不自动重发原请求。macOS 节点的首次服务启动与只读通信检查见 [部署记录](macos-node-service-verification-20261108.md)，该检查未执行远端模型任务或广播。
+多机器接入见[架构决策](multi-machine-design.md)和[当前节点接口](multi-machine-interface.md)。Bridge 已提供 `agent-bridge relay`、SSH JSONL 传输、节点握手、主机查询、远端任务和分组接口。每个远端主机独立运行 Broker；连接按主机重复使用，请求前核对节点身份，断线后不盲目重发结果未确认的工作。
 
 当前运行结构、协议格式、远端原生广播接收检查、relay 配置刷新和升级时的连接处理见 [接口说明](multi-machine-interface.md)。`peer.control`、`peer.review`、`peer.inbox` 尚未实现，不能仅凭协议方法已声明就当作可用。
 
 本版 Broker 会自动检查 `config.json` 中的 `hosts` 和 `host_pins.json`，运行中增删节点无需重启服务。也可调用 `agent-bridge call agent_hosts_reload --json '{}'` 立即应用配置；`agent_hosts.config_error` 显示配置错误或拒绝变更的原因。未变化节点保留原 SSH，正在处理的请求和 ACK 先完成，再替换相关连接。配置无效时保留上一份有效清单，不重发任务。
 
-仍在分组中、存在待处理消息或结果不明的节点拒绝删除/改址；历史父通知路由需只读核实会话关闭、任务结束且完成审查后才允许。节点移除不停止远端程序，也不清除历史。使用方式、限制及首次部署说明见 [动态节点检查记录](dynamic-hosts-20261109.md)。
+仍在分组中、存在待处理消息或结果不明的节点拒绝删除/改址；历史父通知路由需只读核实会话关闭、任务结束且完成审查后才允许。节点移除不停止远端程序，也不清除历史。配置示例和限制见[动态节点配置](dynamic-hosts.md)。
 
 参与的节点都应由同一用户信任。SSH 凭据和主机密钥保存在仓库之外。远端主机需要自行安装 Bridge、配置 profiles/projects 并运行 broker；添加本地主机条目不会自动部署远端。派发远端任务前阅读所链接的多机说明。`codex-async` 和 Telegram 都是可选集成。
 
@@ -411,14 +411,14 @@ TUI（`agent-bridge monitor`）、Web（`agent-bridge monitor --web`）和 MCP `
 
 ## 检查
 
-跨程序执行、中断、重开及父会话退出后的恢复记录见[检查记录](verification.md)；包含父会话开销的小型比较见[报告](benchmark.md)。Antigravity 有离线协议测试，以及模型目录、零推理初始化的历史检查；真实推理、工具执行及实时中断需要在各环境中确认。历史检查不证明你的账号或本次安装已经可用。
+CI 覆盖范围及需要真实账号、主机的检查见[检查及使用限制](production-readiness.md)。模型发现、模拟 CLI 任务和历史安装检查，不证明当前账号已经可以执行推理、使用工具或中断并恢复原生会话。
 
 ```bash
 uv run ruff check src tests scripts
 uv run python -m unittest discover -s tests -v
 ```
 
-自动检查使用真实 MCP/Unix socket/进程及模拟 CLI，不产生推理费用。`scripts/*_smoke.py` 和 `benchmark.py` 会真实调用模型；`cold_resume_smoke.py` 检查父进程退出后继续工作，`restart_smoke.py` 在独立服务中检查重启与后台命令关闭。命令和报告见 [检查记录](verification.md)。
+自动检查使用真实 MCP/Unix socket/进程及模拟 CLI，不产生推理费用。`scripts/*_smoke.py` 和 `benchmark.py` 会真实调用模型；`cold_resume_smoke.py` 检查父进程退出后继续工作，`restart_smoke.py` 在独立服务中检查重启与后台命令关闭。运行这些脚本前指定隔离目标；普通 CI 不执行真实模型任务。
 
 凭据只引用已有登录或权限 600 的私有 JSON 环境文件。数据目录、socket 和 token 文件仅当前用户可访问。子进程默认不注册其他 agent 的管理工具；Claude/Pi 只读模式仅提供读取工具，Codex 使用原生只读沙箱并禁用继承的 MCP/插件。它们共享本机用户身份，本项目不承诺防御恶意同 UID 程序。
 
@@ -475,13 +475,8 @@ agent-bridge update --drain-workers run
 
 已有私有 `release_url` 设置会继续生效：从 `<base>/latest.json` 获取发布信息，从 `<base>/releases/<tag>/` 获取附件。再次运行 `init` 或修改检查间隔会保留原来源。镜像支持 HTTPS，HTTP 仅限 loopback/Tailscale，并检查 DNS 地址；重定向必须保持原来源的协议、主机和端口。镜像请求失败不会改用 GitHub。需要切换到默认 GitHub 来源时，明确从 `update.json` 删除 `release_url`。
 
-更新下载经过 SHA256 检查的 wheel，在新版本专用虚拟环境中安装，先运行配置与隔离服务检查。默认启用 OTA 热更新：不中断运行中的任务和兼容 worker，进入维护前仅排空短在途请求、通知与非 SSH helper；兼容 Worker 与 SSH relay 在当前轮次结束或空闲后自行退场由新版拉起（仅当目标版声明不兼容、或指定 `--drain-workers` 时才等待全部任务与 Worker 清空）；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录禁止新派单和发送，其他节点也不能在此时投递新工作；CLI 在维护和重启短暂窗口内对只读与带 `request_id` 的幂等请求自动重试。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。详情参见 [OTA 热更新设计](ota-hot-update-20261116.md)。
+更新下载经过 SHA256 检查的 wheel，在新版本专用虚拟环境中安装，先运行配置与隔离服务检查。默认启用 OTA 热更新：不中断运行中的任务和兼容 worker，进入维护前仅排空短在途请求、通知与非 SSH helper；兼容 Worker 与 SSH relay 在当前轮次结束或空闲后自行退场由新版拉起（仅当目标版声明不兼容、或指定 `--drain-workers` 时才等待全部任务与 Worker 清空）；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录禁止新派单和发送，其他节点也不能在此时投递新工作；CLI 在维护和重启短暂窗口内对只读与带 `request_id` 的幂等请求自动重试。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。详情参见 [OTA 热更新设计](ota-updates.md)。
 
 `~/.local/share/cli-agent-bridge/bin/agent-bridge` 是固定入口，Broker、CLI、MCP、远端 relay 和 skill 应使用该入口或 `current/skill`，不能只改 Broker 而让其它入口仍指向旧 checkout。版本目录保留，源仓库及其未提交修改不被更新程序覆盖。正在运行的原生终端不被重启，MCP 配置修改在下次加载时生效。定时器只更新 Bridge，不更新 Codex、Claude、Pi 或 AGY 本身。
 
-最近结果保存在状态目录的 `update-status.json`；下载或校验失败会记录失败类型。首版迁移及各节点验证记录另列，不能将定时器已安装当作升级已成功。
-
-
-## detached worker 导致的更新延期
-
-detached worker 仍是 broker 的子进程，即使没有正在执行的任务，更新程序也可能报告 `broker_helpers` 并延期。重试前关闭不再使用的 Bridge 会话；程序会保留工作，不会直接重启仍拥有活动子进程的 broker。这不要求关闭无关的原生终端。
+最近结果保存在状态目录的 `update-status.json`；下载或校验失败会记录失败类型。核对实际运行版本和健康检查结果，不能将定时器已安装当作升级成功。

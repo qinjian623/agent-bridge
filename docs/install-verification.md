@@ -2,7 +2,7 @@
 
 # Isolated installation and first-task check
 
-On 2026-11-17 (18:07–18:08 UTC on 2026-11-16), the final candidate `0.3.0` wheel was installed and used from a new HOME and new XDG, uv-tool, state, and project directories on Linux x86-64, with Python 3.13.15 and uv 0.13.8. Model execution used an unchanged copy of `tests/fixtures/fake_codex.py`. No real model, CLI account, shared Codex daemon, existing Bridge state, or installed user service was used.
+On 2026-11-17 (18:07–18:08 UTC on 2026-11-16), the then-current candidate `0.3.0` wheel was installed and used from a new HOME and new XDG, uv-tool, state, and project directories on Linux x86-64, with Python 3.13.15 and uv 0.13.8. Model execution used an unchanged copy of `tests/fixtures/fake_codex.py`. No real model, CLI account, shared Codex daemon, existing Bridge state, or installed user service was used.
 
 All 17 checks passed, including 12 invalid-input cases. An earlier candidate failed when an unknown profile field produced a Python traceback; this new run confirmed a clear, redacted command error and unchanged saved settings.
 
