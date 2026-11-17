@@ -1,13 +1,16 @@
+import hashlib
 import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_bridge import workspace as workspace_module
 from agent_bridge.errors import BridgeError
 from agent_bridge.store import encode
 from agent_bridge.workspace import capture_patch, directory_copy, git, worktree
@@ -251,11 +254,148 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(set(raw_names), set(names))
         self.assertEqual(len(names), len(set(result["changed_files"])))
         for name, content in files.items():
-            self.assertEqual(raw_root + b"/" + name, os.fsencode(raw_names[name]["path"]))
-            with open(raw_root + b"/" + name, "rb") as stream:
+            self.assertEqual(raw_root + b"/" + name, os.fsencode(raw_names[name]["source_path"]))
+            with open(os.fsencode(raw_names[name]["path"]), "rb") as stream:
                 self.assertEqual(content, stream.read())
         self.assertEqual(link_target, os.readlink(raw_root + b"/" + link_name))
         self.assertEqual("base\n", (self.source / "tracked.txt").read_text())
+
+    def test_copy_capture_retains_changed_and_new_files_after_workspace_changes(self):
+        plain = self.root / "retained-source"
+        plain.mkdir()
+        (plain / "file.txt").write_text("input\n")
+        (plain / "unchanged.txt").write_text("same\n")
+        directory, metadata = directory_copy(
+            self.state, plain, "retained-copy", ["file.txt", "unchanged.txt"],
+        )
+        target = Path(directory)
+        (target / "file.txt").write_text("task output\n")
+        (target / "file.txt").chmod(0o640)
+        (target / "new.txt").write_text("new output\n")
+        (target / "new.txt").chmod(0o644)
+        result = capture_patch(directory, self.state / "retained.patch", metadata)
+        changes = json.loads(Path(result["changes"]).read_text())
+        self.assertNotIn("unchanged.txt", changes)
+        for name, content, mode in (
+            ("file.txt", b"task output\n", 0o640),
+            ("new.txt", b"new output\n", 0o644),
+        ):
+            record = changes[name]
+            retained = Path(record["path"])
+            self.assertNotEqual(str(retained), str(target / name))
+            self.assertEqual(str(target / name), record["source_path"])
+            self.assertEqual(mode, record["mode"])
+            self.assertEqual(content, retained.read_bytes())
+            self.assertEqual(record["sha256"], hashlib.sha256(content).hexdigest())
+        (target / "file.txt").write_text("later task\n")
+        (target / "new.txt").unlink()
+        self.assertEqual(b"task output\n", Path(changes["file.txt"]["path"]).read_bytes())
+        self.assertEqual(b"new output\n", Path(changes["new.txt"]["path"]).read_bytes())
+
+    def test_copy_capture_rejects_symlink_in_capture_root_ancestors(self):
+        ancestor = self.root / "root-link"
+        ancestor.symlink_to(self.root, target_is_directory=True)
+        directory, metadata = directory_copy(self.state, self.source, "ancestor-link", ["tracked.txt"])
+        relative = Path(directory).relative_to(self.root)
+        with self.assertRaises(BridgeError) as caught:
+            capture_patch(str(ancestor / relative), self.state / "ancestor.patch", metadata)
+        self.assertEqual("invalid_snapshot", caught.exception.code)
+        self.assertFalse((self.state / "ancestor.files.json").exists())
+
+    def test_copy_capture_rejects_fifo_replacement_without_waiting_for_a_writer(self):
+        code = '''
+import os, sys, tempfile
+from pathlib import Path
+from agent_bridge.errors import BridgeError
+from agent_bridge.workspace import _capture_root, _open_source_regular
+with tempfile.TemporaryDirectory() as directory:
+    path = Path(directory) / "file"
+    path.write_text("original")
+    root = _capture_root(Path(directory))
+    try:
+        path.unlink()
+        os.mkfifo(path)
+        try:
+            _open_source_regular(root, "file")
+        except BridgeError as error:
+            assert error.code == "snapshot_changed"
+        else:
+            raise AssertionError("FIFO accepted as a regular file")
+    finally:
+        os.close(root)
+'''
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=5)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_copy_capture_rejects_parent_symlink_swap_before_hashing(self):
+        plain = self.root / "swap-before-source"
+        (plain / "parent").mkdir(parents=True)
+        (plain / "parent" / "file.txt").write_text("input\n")
+        outside = self.root / "swap-before-outside"
+        outside.mkdir()
+        (outside / "file.txt").write_text("outside secret\n")
+        directory, metadata = directory_copy(
+            self.state, plain, "swap-before", ["parent/file.txt"],
+        )
+        target = Path(directory)
+        (target / "parent" / "file.txt").write_text("workspace output\n")
+        original = workspace_module._regular_digest
+        swapped = False
+
+        def digest(root_fd, name):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                (target / "parent").rename(target / "parent-original")
+                (target / "parent").symlink_to(outside, target_is_directory=True)
+            return original(root_fd, name)
+
+        destination = self.state / "swap-before.patch"
+        with patch("agent_bridge.workspace._regular_digest", side_effect=digest):
+            with self.assertRaises(BridgeError) as caught:
+                capture_patch(directory, destination, metadata)
+        self.assertTrue(swapped)
+        self.assertEqual("snapshot_changed", caught.exception.code)
+        self.assertFalse(destination.with_suffix(".files.json").exists())
+        self.assertFalse(list(self.state.glob("swap-before.patch.files-*")))
+        for path in self.state.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                self.assertNotIn(b"outside secret", path.read_bytes())
+
+    def test_copy_capture_rejects_parent_symlink_swap_between_hash_and_retention(self):
+        plain = self.root / "swap-after-source"
+        (plain / "parent").mkdir(parents=True)
+        (plain / "parent" / "file.txt").write_text("input\n")
+        outside = self.root / "swap-after-outside"
+        outside.mkdir()
+        (outside / "file.txt").write_text("outside secret\n")
+        directory, metadata = directory_copy(
+            self.state, plain, "swap-after", ["parent/file.txt"],
+        )
+        target = Path(directory)
+        (target / "parent" / "file.txt").write_text("workspace output\n")
+        original = workspace_module._retain_regular
+        swapped = False
+
+        def retain(root_fd, name, retained, digest, mode):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                (target / "parent").rename(target / "parent-original")
+                (target / "parent").symlink_to(outside, target_is_directory=True)
+            return original(root_fd, name, retained, digest, mode)
+
+        destination = self.state / "swap-after.patch"
+        with patch("agent_bridge.workspace._retain_regular", side_effect=retain):
+            with self.assertRaises(BridgeError) as caught:
+                capture_patch(directory, destination, metadata)
+        self.assertTrue(swapped)
+        self.assertEqual("snapshot_changed", caught.exception.code)
+        self.assertFalse(destination.with_suffix(".files.json").exists())
+        self.assertFalse(list(self.state.glob("swap-after.patch.files-*")))
+        for path in self.state.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                self.assertNotIn(b"outside secret", path.read_bytes())
 
     def test_non_utf8_selected_snapshot_input_is_rejected_explicitly(self):
         with self.assertRaises(BridgeError) as caught:

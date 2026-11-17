@@ -31,6 +31,7 @@ from .native_monitor import (
     normalize_status_filter,
     parse_runtime_filter,
     should_widen_events,
+    snapshot_cost_metrics,
     summarize_runtimes,
 )
 from .node_identity import FileNodeIdentityStore
@@ -433,6 +434,9 @@ class MonitorCollector:
         def _is_int(val: Any) -> bool:
             return isinstance(val, int) and not isinstance(val, bool) and -(1 << 63) <= val <= (1 << 63) - 1
 
+        def _is_count(val: Any) -> bool:
+            return _is_int(val) and val >= 0
+
         def _is_num(val: Any) -> bool:
             if isinstance(val, bool) or not isinstance(val, (int, float)):
                 return False
@@ -562,10 +566,14 @@ class MonitorCollector:
             "native_workers",
             "native_daemons",
             "total_all_active",
-            "known_cost_sessions",
         ):
             return False
-        if not _opt(metrics, _is_cost, "total_cost_usd") or not _if_present(metrics, _is_bool, "cost_complete", "has_cost_gaps"):
+        if not _if_present(
+            metrics, _is_count,
+            "known_cost_sessions", "known_cost_attempt_sessions", "unknown_cost_sessions",
+        ):
+            return False
+        if not _opt(metrics, _is_cost, "total_cost_usd") or not _if_present(metrics, _is_bool, "cost_complete", "has_cost_gaps", "has_attempts"):
             return False
 
         if "native_sessions" in data:
@@ -607,10 +615,11 @@ class MonitorCollector:
                     "native_interactive",
                     "native_daemons",
                     "total_live",
-                    "known_cost_sessions",
                 ):
                     return False
-                if not _if_present(info, _is_cost, "total_cost_usd") or not _if_present(info, _is_bool, "cost_complete"):
+                if not _if_present(info, _is_count, "known_cost_sessions", "known_cost_attempt_sessions", "unknown_cost_sessions"):
+                    return False
+                if not _if_present(info, _is_cost, "total_cost_usd") or not _if_present(info, _is_bool, "cost_complete", "has_attempts", "has_cost_gaps"):
                     return False
 
         if "pending_questions" in data:
@@ -630,8 +639,13 @@ class MonitorCollector:
             for g in groups:
                 if not isinstance(g, dict):
                     return False
+                group_identity = g.get("id")
+                if group_identity is None:
+                    group_identity = g.get("group_id")
+                if not _is_str(group_identity):
+                    return False
                 if (
-                    not _opt(g, _is_str, "group_id", "created_rel")
+                    not _opt(g, _is_str, "id", "group_id", "created_rel")
                     or not _opt(g, _is_timestamp, "created")
                     or not _if_present(g, _is_int, "bridge_members", "native_members", "remote_members", "total_members")
                 ):
@@ -661,6 +675,55 @@ class MonitorCollector:
                 return False
 
         return True
+
+    @staticmethod
+    def _attach_provenance(
+        snapshot: dict[str, Any],
+        *,
+        source: str,
+        broker_connected: bool | None,
+        detail: str,
+        legacy: bool = False,
+        transport: str | None = None,
+        served_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach what is positively known about how this snapshot was produced."""
+        if broker_connected is True:
+            connection_state = "connected"
+        elif source == "local_db_fallback":
+            connection_state = "fallback"
+        elif broker_connected is False:
+            connection_state = "unavailable"
+        else:
+            connection_state = "unknown"
+        out = dict(snapshot)
+        raw_provenance = out.get("provenance")
+        provenance = dict(raw_provenance) if isinstance(raw_provenance, dict) else {}
+        provenance.update(
+            {
+                "source": source,
+                "snapshot_source": source,
+                "broker_connected": broker_connected,
+                "broker_state": connection_state,
+                "connection_state": connection_state,
+                "legacy": bool(provenance.get("legacy")) or bool(legacy),
+                "detail": detail,
+                "transport": transport,
+                "served_by": served_by,
+            }
+        )
+        out["provenance"] = provenance
+        raw_coordinator = out.get("coordinator")
+        coordinator = dict(raw_coordinator) if isinstance(raw_coordinator, dict) else {}
+        coordinator.update(
+            {
+                "snapshot_source": source,
+                "broker_connected": broker_connected,
+                "connection_state": connection_state,
+            }
+        )
+        out["coordinator"] = coordinator
+        return out
 
     def _finalize_broker_reply(
         self,
@@ -730,20 +793,19 @@ class MonitorCollector:
             out["metrics"] = rep_metrics
         if is_legacy:
             out["legacy_broker"] = True
-        if any(
+        apply_filters = any(
             x is not None
             for x in (rt_filter, src_filter, st_filter, session_limit, after_seq)
-        ):
-            out = filter_snapshot_dict(
-                out,
-                runtime=rt_filter,
-                source=src_filter,
-                status=st_filter,
-                session_limit=session_limit,
-                after_seq=after_seq,
-                event_limit=limit,
-            )
-        return out
+        )
+        return filter_snapshot_dict(
+            out,
+            runtime=rt_filter,
+            source=src_filter,
+            status=st_filter,
+            session_limit=session_limit,
+            after_seq=after_seq,
+            event_limit=limit if apply_filters else None,
+        )
 
     def collect(
         self,
@@ -763,13 +825,17 @@ class MonitorCollector:
         if src_filter is not None and src_filter not in {"bridge", "native"}:
             raise ValueError(f"Unsupported source {source!r}")
         st_filter = normalize_status_filter(status)
+        broker_socket_present = (self.state / "broker.sock").exists()
+        broker_attempted = False
+        broker_failure: str | None = None
 
-        if self.host_registry is None and (self.state / "broker.sock").exists():
+        if self.host_registry is None and broker_socket_present:
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
                 from .broker import request
 
+                broker_attempted = True
                 withhold_session_limit = st_filter is not None and session_limit is not None
                 eff_session_limit = None if withhold_session_limit else session_limit
                 rpc_args: dict[str, Any] = {"limit": limit, "include_events": include_events}
@@ -887,11 +953,27 @@ class MonitorCollector:
                         if truncated or raw_ver < 3:
                             filtered = dict(filtered)
                             filtered["events_truncated"] = bool(truncated)
+                        legacy_reply = bool(filtered.get("legacy_broker")) or raw_ver < 3
+                        filtered = self._attach_provenance(
+                            filtered,
+                            source="broker_rpc",
+                            broker_connected=True,
+                            detail=(
+                                "Legacy broker reply received over the Unix socket; broker connectivity is confirmed, "
+                                "but snapshot metadata is incomplete."
+                                if legacy_reply
+                                else "Snapshot received from the local broker over its Unix socket."
+                            ),
+                            legacy=legacy_reply,
+                            transport="unix_socket",
+                            served_by="broker",
+                        )
                         return filtered
                     if isinstance(reply, dict) and "sessions" not in reply:
                         return reply
+                    broker_failure = "invalid_snapshot"
                 except broker_reply_errors:
-                    pass
+                    broker_failure = "rpc_failed"
         now = time.time()
         hostname = socket.gethostname()
 
@@ -1839,6 +1921,8 @@ class MonitorCollector:
 
                         sessions.sort(key=_session_priority)
 
+                    metrics.update(snapshot_cost_metrics(sessions))
+
                     for q in pending_questions:
                         q["session_name"] = session_names_map.get(q["session_id"], q["session_id"][:8])
 
@@ -2078,6 +2162,41 @@ class MonitorCollector:
                 status=st_filter,
                 session_limit=session_limit,
             )
+        if self.host_registry is not None:
+            provenance_source = "local_db"
+            provenance_connected: bool | None = None
+            provenance_detail = (
+                "Snapshot collected directly from the local database; broker serving status is not reported."
+            )
+        elif broker_attempted:
+            provenance_source = "local_db_fallback"
+            provenance_connected = False
+            provenance_detail = (
+                "Broker RPC failed (" + str(broker_failure or "unavailable") +
+                "); data was read directly from the local database. Broker connectivity is not verified."
+            )
+        elif broker_socket_present:
+            provenance_source = "local_db_fallback"
+            provenance_connected = None
+            provenance_detail = (
+                "A broker socket exists but could not be queried from this context; data was read directly "
+                "from the local database. Broker connectivity is unknown."
+            )
+        else:
+            provenance_source = "local_db_fallback"
+            provenance_connected = False
+            provenance_detail = (
+                "No broker socket is available; data was read directly from the local database. "
+                "Broker connectivity is unavailable."
+            )
+        snapshot = self._attach_provenance(
+            snapshot,
+            source=provenance_source,
+            broker_connected=provenance_connected,
+            detail=provenance_detail,
+            transport=None,
+            served_by=None,
+        )
         return snapshot
 
 
@@ -2136,7 +2255,32 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
 
     cost_complete = metrics.get("cost_complete", True)
     total_cost_val = metrics.get("total_cost_usd")
-    if total_cost_val is None or (metrics.get("total_sessions", 0) > 0 and not cost_complete and float(total_cost_val or 0.0) == 0.0 and any(s.get("has_attempts") for s in snapshot.get("sessions", []))):
+    cost_has_attempts = metrics.get("has_attempts")
+    if not isinstance(cost_has_attempts, bool):
+        cost_has_attempts = any(
+            isinstance(s, dict) and (s.get("has_attempts") or isinstance(s.get("attempt"), dict))
+            for s in snapshot.get("sessions", [])
+        )
+        if not cost_has_attempts and metrics.get("total_sessions", 0) > len(snapshot.get("sessions", [])):
+            cost_has_attempts = None
+    known_cost_attempts = metrics.get("known_cost_attempt_sessions")
+    known_coverage = isinstance(known_cost_attempts, int) and not isinstance(known_cost_attempts, bool) and known_cost_attempts >= 0
+    has_cost_gaps = metrics.get("has_cost_gaps")
+    if not isinstance(has_cost_gaps, bool):
+        unknown_cost_sessions = metrics.get("unknown_cost_sessions")
+        if isinstance(unknown_cost_sessions, int) and not isinstance(unknown_cost_sessions, bool):
+            has_cost_gaps = unknown_cost_sessions > 0
+        else:
+            has_cost_gaps = cost_complete is False or (
+                metrics.get("cost_complete") is not True
+                and metrics.get("total_sessions", 0) > len(snapshot.get("sessions", []))
+            )
+    cost_complete = cost_complete is not False and not has_cost_gaps
+    if total_cost_val is None or (
+        not cost_complete
+        and float(total_cost_val or 0.0) == 0.0
+        and (not known_coverage or (cost_has_attempts is not False and known_cost_attempts == 0))
+    ):
         cost_label = "unknown"
     elif not cost_complete:
         cost_label = f"${float(total_cost_val or 0.0):.4f}*"
@@ -2254,9 +2398,12 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
         running_cnt = str(info.get("bridge_running", 0) + info.get("native_workers", 0))
         waiting_cnt = str(info.get("bridge_waiting", 0) + info.get("bridge_recovery", 0))
         rt_cost_val = float(info.get("total_cost_usd", 0.0) or 0.0)
-        if info.get("bridge_total", 0) > 0 and not info.get("cost_complete", True) and rt_cost_val == 0.0 and info.get("known_cost_sessions", 0) == 0:
+        rt_complete = info.get("cost_complete", True) is not False and not info.get("has_cost_gaps", False)
+        rt_known = info.get("known_cost_attempt_sessions")
+        rt_coverage = isinstance(rt_known, int) and not isinstance(rt_known, bool) and rt_known >= 0
+        if not rt_complete and rt_cost_val == 0.0 and (not rt_coverage or (info.get("has_attempts") is not False and rt_known == 0)):
             rt_cost = "unknown"
-        elif not info.get("cost_complete", True):
+        elif not rt_complete:
             rt_cost = f"${rt_cost_val:.3f}*"
         else:
             rt_cost = f"${rt_cost_val:.3f}"

@@ -10,6 +10,7 @@ import uuid
 
 from .config import Config, state_directory
 from .errors import BridgeError
+from .init_config import add_init_arguments, detect_environment, run_init
 
 
 class _AsyncStdinReader:
@@ -45,15 +46,22 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Persistent local Codex / Claude Code / Pi / Antigravity sessions")
     parser.add_argument("--state")
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("init", help="Write a private example config; never overwrite existing config")
+    init_parser = commands.add_parser(
+        "init",
+        help="Interactively configure or idempotently update config.json, services, and GitHub OTA",
+    )
+    add_init_arguments(init_parser)
     commands.add_parser("serve", help="Run the persistent Unix socket broker")
     commands.add_parser("mcp", help="Run the MCP tools over stdio")
     commands.add_parser("doctor", help="Check local configuration and installed CLI paths")
-    update = commands.add_parser("update", help="Check or install verified GitHub releases")
-    update.add_argument("update_args", nargs=argparse.REMAINDER)
+    commands.add_parser(
+        "update",
+        add_help=False,
+        help="Check or install verified GitHub releases",
+    )
     relay = commands.add_parser("relay", help="Bridge stdin/stdout peer JSONL to the local node service")
     relay.add_argument("--state", default=argparse.SUPPRESS)
-    worker = commands.add_parser("worker", help=argparse.SUPPRESS)
+    worker = commands.add_parser("worker", help="Internal worker command (managed automatically)")
     worker.add_argument("session_id")
     monitor = commands.add_parser("monitor", help="Monitor active agents, tasks, and communications")
     monitor.add_argument("--web", action="store_true", help="Launch local web-based monitor dashboard")
@@ -136,7 +144,9 @@ def build_parser():
 def main(argv: list[str] | None = None):
     os.umask(0o077)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, update_args = parser.parse_known_args(argv)
+    if args.command != "update" and update_args:
+        parser.parse_args(argv)
     try:
         state = state_directory(args.state)
         if args.command == "mirrors":
@@ -152,37 +162,7 @@ def main(argv: list[str] | None = None):
                 )
                 print(json.dumps(result, indent=2, ensure_ascii=False))
         elif args.command == "init":
-            template = {
-                "profiles": {
-                    "codex-sol": {
-                        "runtime": "codex",
-                        "provider": "openai-codex",
-                        "model": "gpt-6.1-sol",
-                        "effort": "low",
-                        "quota_group": "codex-account",
-                    },
-                    "pi-deepseek": {
-                        "runtime": "pi",
-                        "provider": "deepseek",
-                        "model": "deepseek-flash",
-                        "quota_group": "deepseek-account",
-                    },
-                },
-                "worker_launcher": "detached" if sys.platform == "darwin" else "systemd",
-                "parallel_limit": 3,
-                "quota_limit": 2,
-                "default_strategy": "balanced",
-            }
-            with (state / "config.json").open("x") as file:
-                json.dump(template, file, indent=2)
-            print(
-                json.dumps(
-                    {
-                        "config": str(state / "config.json"),
-                        "note": "Profiles remain unverified until a real task passes; add Claude with the actual provider/model.",
-                    }
-                )
-            )
+            print(json.dumps(run_init(state, args), ensure_ascii=False, indent=2))
         elif args.command == "serve":
             from .broker import Broker
 
@@ -190,7 +170,7 @@ def main(argv: list[str] | None = None):
         elif args.command == "update":
             from .updater import main as update_main
 
-            update_main(["--state", str(state), *args.update_args])
+            update_main(["--state", str(state), *update_args])
         elif args.command == "worker":
             from .worker import Worker
 
@@ -227,6 +207,7 @@ def main(argv: list[str] | None = None):
             server(state).run(transport="stdio")
         elif args.command == "doctor":
             config = Config.load(state / "config.json")
+            env = detect_environment()
             profiles = []
             for profile in config.profiles.values():
                 try:
@@ -235,12 +216,37 @@ def main(argv: list[str] | None = None):
                     )
                 except BridgeError as error:
                     profiles.append({"name": profile.name, "error": error.as_dict()})
+            managed = False
+            update_configured = (state / "update.json").exists()
+            if update_configured:
+                from .updater import Updater
+
+                try:
+                    managed = Updater(state).service_managed()
+                except (OSError, ValueError, RuntimeError):
+                    managed = None
+            warnings: list[str] = []
+            if managed is None:
+                warnings.append("Could not determine whether the broker service uses the managed launcher")
+            if config.worker_launcher == "systemd" and not env["systemd_user"]:
+                warnings.append("worker_launcher is 'systemd' but systemd --user is unavailable; consider 'detached'")
+            if not env["tools"]["uv"]:
+                warnings.append("'uv' executable not found on PATH; OTA self-update requires uv")
+            if config.hosts and not env["tools"]["ssh"]:
+                warnings.append("remote hosts are configured but 'ssh' executable was not found on PATH")
             print(
                 json.dumps(
                     {
                         "profiles": profiles,
                         "launcher": config.worker_launcher,
                         "broker_socket": (state / "broker.sock").exists(),
+                        "platform": env["platform"],
+                        "uv": env["tools"]["uv"],
+                        "ssh": env["tools"]["ssh"],
+                        "systemd_user": env["systemd_user"],
+                        "update_configured": update_configured,
+                        "broker_service_managed": managed,
+                        "warnings": warnings,
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -301,7 +307,7 @@ def main(argv: list[str] | None = None):
 
             params = json.loads(args.json if args.json is not None else sys.stdin.read() or "{}")
             print(json.dumps(asyncio.run(request(state, args.method, params)), ensure_ascii=False, indent=2))
-    except (BridgeError, OSError, ValueError) as error:
+    except (BridgeError, OSError, ValueError, RuntimeError) as error:
         print(
             json.dumps(
                 {"error": error.as_dict() if isinstance(error, BridgeError) else str(error)}, ensure_ascii=False

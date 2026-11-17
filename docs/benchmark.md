@@ -1,25 +1,27 @@
-# 固定任务比较：2026-10-22
+> Language: English | [中文](zh/benchmark.md)
 
-三个配置先分别修改同一份字符串规范化函数，三次都通过固定断言。之后使用未参与收集样本的“合并区间”和“迭代器分块”两个任务，对比三种执行方式。每次从同一个 Git commit 创建独立 worktree；主会话为 `gpt-6-astra / low`。指定分工分别使用 Codex Sol 和 Pi DeepSeek，均衡选择在两个验证任务中都使用 Pi DeepSeek。
+# Fixed-Task Benchmark: 2026-10-22
 
-| 执行方式 | 固定断言和主会话检查通过 | 两任务合计 token | 耗时中位数 | 较慢任务耗时 |
+Three configurations each first modified the same string-normalization function; all three passed the fixed assertions. Two held-out tasks ("merge intervals" and "chunked iterator")—excluded from sample calibration—were then compared across three execution modes. Every run created an isolated Git worktree from the same commit; the primary session ran `gpt-6-astra / low`. Explicit delegation assigned tasks to Codex Sol and Pi DeepSeek; balanced auto-selection chose Pi DeepSeek on both held-out validation tasks.
+
+| Execution Mode | Fixed Assertions & Main-Session Review Passed | Total Tokens (2 Tasks) | Median Duration | Slower Task Duration |
 | --- | --- | ---: | ---: | ---: |
-| Astra 直接修改 | 2/2 | 186,296 | 29.2 秒 | 31.1 秒 |
-| 指定程序分工 | 2/2 | 180,853 | 29.4 秒 | 38.7 秒 |
-| 自动均衡分配 | 2/2 | 125,213 | 19.7 秒 | 21.1 秒 |
+| Astra direct edit | 2/2 | 186,296 | 29.2s | 31.1s |
+| Explicit runtime delegation | 2/2 | 180,853 | 29.4s | 38.7s |
+| Balanced auto-selection | 2/2 | 125,213 | 19.7s | 21.1s |
 
-token 包含该案例中的主会话和所有子任务 attempt；主会话生成分工说明、检查补丁的调用均计入。每个父记录的累计差值与原生各轮 usage 之和相等。时间从创建工作目录前开始，到检查、关闭会话、固定计数后结束。本次没有失败或重试；保留失败/重试开销的行为另有自动检查。
+Token counts include both the parent session and all child task attempts in each case; parent-session turns for writing delegation instructions and inspecting patches are included. Each parent record's cumulative token delta matched the sum of its native turn usages. Timing starts before workspace creation and stops after patch inspection, session closure, and usage metering stop. No failures or retries occurred in this run; retaining failure/retry overhead is tested separately in automated tests.
 
-校准样本是独立的三次执行，不计入上表的验证任务结果；其开销如下，首次使用的样本收集成本仍需承担。
+Calibration samples were three independent runs excluded from the held-out comparison table above; initial calibration incurs its own one-time token cost:
 
-| 子程序 | 含 Astra 主会话的 token | 总耗时 | 结果 |
+| Child Configuration | Total Tokens (with Astra Parent) | Total Duration | Outcome |
 | --- | ---: | ---: | --- |
-| Codex Sol | 143,280 | 37.9 秒 | 通过 |
-| Pi DeepSeek | 59,834 | 23.8 秒 | 通过 |
-| Claude Code / DeepSeek | 78,300 | 19.9 秒 | 通过 |
+| Codex Sol | 143,280 | 37.9s | Pass |
+| Pi DeepSeek | 59,834 | 23.8s | Pass |
+| Claude Code / DeepSeek | 78,300 | 19.9s | Pass |
 
-测试脚本为 `scripts/benchmark.py`。验证任务使用 `learn_from_result=false`，没有影响本次选择规则；改变任务执行顺序以减少固定先后顺序的影响。每次采用新原生会话，但供应商缓存没有清空或受控；原始报告保存缓存 token。只跑了两个小型代码任务，各一次，不能推断一般任务的收益。token 不是金额，没有实际账单或全部可比价格，因此不报告费用节省比例。
+The benchmark script is `scripts/benchmark.py`. Held-out tasks set `learn_from_result=false` so they did not influence selection weights; execution order was varied to reduce order bias. Each case used a fresh native session, though provider-side prompt caches were neither cleared nor controlled (cached tokens are recorded in the raw report). Because only two small coding tasks ran once each, general savings cannot be extrapolated from this sample. Tokens are not currency, and without complete comparable billing rates across all configurations, no dollar cost-savings percentage is claimed.
 
-私有完整报告：`<private-validation-state>/report.json`。其中保存原始回答、patch、测试错误、原生用量和会话 ID，不纳入仓库。三个校准案例加六个验证案例合计 16 个主会话轮次和 7 个子任务 attempt，均正常结束。
+Private full report: `<private-report-01>/validation.json` (contains raw responses, patches, test outputs, native usages, and session IDs; excluded from version control). The three calibration runs plus six validation runs totaled 16 parent-session turns and 7 child attempts, all completing normally.
 
-9 个父记录均为 `notify=false`，完成通知表为空。Codex 和 Claude 的全部 12 条原生会话均登记为外部子会话，等待旧 bot 扫描完毕后检查，outbox 记录均为 0。Pi 使用本项目私有 RPC 会话文件。测试 worker 和临时任务服务已退出。
+All 9 parent records used `notify=false` and left the delivery table empty. All 12 Codex and Claude native sessions were registered as external child sessions and verified to produce 0 bot outbox entries after a scan cycle. Pi used private RPC session files. Test workers and the temporary service exited cleanly.

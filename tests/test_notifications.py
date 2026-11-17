@@ -3,6 +3,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -419,6 +420,42 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("resolve" if status == "recovery_needed" else "retry", messages[seq])
         completed = self.store.get_parent("parent")["deliveries"][0]["event_seq"]
         self.assertIn("agent_review", messages[completed])
+
+    async def test_input_required_notice_identifies_question_and_is_not_completion(self):
+        task_id = self.store.dispatch(self.sid, "need input", "input-task")["task_id"]
+        attempt_id = self.store.claim(self.config)["attempt_id"]
+        self.store.begin_attempt(self.sid, "g")
+        question_id = self.store.question(
+            self.sid, task_id, attempt_id, {"method": "permission"}, expires=time.time() + 60,
+        )
+        event_seq = next(
+            event["seq"] for event in self.store.events(task_id=task_id)
+            if event["kind"] == "input_required"
+        )
+        messages = {}
+
+        async def sender(config, parent, message, seq, receipt=None):
+            messages[seq] = message
+            return {"ready": True, "receipt": "sent", "native_status": "received", "native_turn_id": "turn-1"}
+
+        await deliver(self.store, self.config, sender)
+        message = messages[event_seq]
+        self.assertIn(f"Child task {task_id}", message)
+        self.assertIn(f"question_id={question_id}", message)
+        self.assertIn("waiting for input", message)
+        self.assertIn("agent_control", message)
+        self.assertIn("respond", message)
+        self.assertNotIn("ended with status None", message)
+        self.assertNotIn("has completed", message)
+        self.assertNotIn("agent_review", message)
+
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE questions SET expires=0 WHERE id=?", (question_id,))
+        self.assertEqual("expired", self.store.get_question(question_id)["status"])
+        with self.store.connection() as db:
+            self.assertEqual(1, db.execute(
+                "SELECT COUNT(*) FROM deliveries WHERE event_seq=?", (event_seq,)
+            ).fetchone()[0])
 
     async def test_startup_failure_notification_requests_inspection_and_resume(self):
         tid = self.store.dispatch(self.sid, "queued task", "queued")["task_id"]

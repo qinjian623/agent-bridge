@@ -2196,6 +2196,30 @@ class Broker:
         request_id = args.get("request_id")
         if request_id is not None and (not isinstance(request_id, str) or len(request_id) > 200):
             raise BridgeError("invalid_request_id", "request_id must be at most 200 characters")
+
+        # A group broadcast owns its delivery_id in peer_outbox before any remote operation exists. Cancel that
+        # local ordered slot before considering host routing; otherwise a still-pending message is sent remotely
+        # and the cancel is reported as unknown. Terminal released/failed rows keep the older lookup behaviour.
+        if target == "delivery_id":
+            with self.store.connection() as db:
+                outbox = db.execute(
+                    "SELECT status FROM peer_outbox WHERE delivery_id=?", (value,)
+                ).fetchone()
+            if outbox is not None and outbox["status"] in {
+                str(PeerDeliveryStatus.PENDING), str(PeerDeliveryStatus.TOMBSTONE_PENDING),
+                str(PeerDeliveryStatus.SENDING), str(PeerDeliveryStatus.UNCERTAIN),
+                str(PeerDeliveryStatus.RESOLVING), str(PeerDeliveryStatus.WAITING_FOR_HOST),
+                str(PeerDeliveryStatus.CANCELLED),
+            }:
+                row = self.delivery_scheduler.cancel(value)
+                return {
+                    "target": value,
+                    "delivery_id": value,
+                    "status": row["status"],
+                    "tombstone_seq": row["target_seq"],
+                    "operation_id": row["operation_id"],
+                }
+
         host_id = self._remote_host(args)
 
         if host_id is not None:
@@ -2438,10 +2462,41 @@ class Broker:
                     inflight.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
                     self._monitor_inflight = inflight
                     try:
-                        return await asyncio.shield(inflight)
+                        snapshot = await asyncio.shield(inflight)
                     finally:
                         if inflight.done() and self._monitor_inflight is inflight:
                             self._monitor_inflight = None
+                    if isinstance(snapshot, dict) and "sessions" in snapshot:
+                        raw_provenance = snapshot.get("provenance")
+                        provenance = dict(raw_provenance) if isinstance(raw_provenance, dict) else {}
+                        provenance.update(
+                            {
+                                "source": "broker",
+                                "snapshot_source": "broker",
+                                "broker_connected": True,
+                                "broker_state": "connected",
+                                "connection_state": "connected",
+                                "legacy": bool(provenance.get("legacy"))
+                                or bool(snapshot.get("legacy_broker"))
+                                or not snapshot.get("collector_version"),
+                                "detail": "Snapshot served by the local broker.",
+                                "transport": "unix_socket",
+                                "served_by": "broker",
+                            }
+                        )
+                        snapshot = {**snapshot, "provenance": provenance}
+                        raw_coordinator = snapshot.get("coordinator")
+                        if isinstance(raw_coordinator, dict):
+                            snapshot = {
+                                **snapshot,
+                                "coordinator": {
+                                    **raw_coordinator,
+                                    "snapshot_source": "broker",
+                                    "broker_connected": True,
+                                    "connection_state": "connected",
+                                },
+                            }
+                    return snapshot
             except ValueError as exc:
                 raise BridgeError("invalid_request", str(exc)) from None
         if method == "agent_hosts":

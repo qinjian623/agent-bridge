@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import os
 import sqlite3
 from pathlib import Path
@@ -11,12 +12,19 @@ from typing import TYPE_CHECKING, Any
 
 from .errors import BridgeError
 from .node_identity import IDENTITY_FILENAME, FileNodeIdentityStore
-from .peer_protocol import DeliverySource, PeerErrorCode, peer_error
+from .peer_protocol import DeliverySource, PeerErrorCode, peer_error, unwrap_peer_event
+from .store import encode
 
 if TYPE_CHECKING:
     from .store import Store
 
 _SQL_VAR_CHUNK = 400
+_PROTECTED_SQL = (
+    "EXISTS (SELECT 1 FROM deliveries d WHERE d.event_seq=m.local_seq) "
+    "OR EXISTS (SELECT 1 FROM mirrored_parent_notifications n WHERE n.local_seq=m.local_seq) "
+    "OR EXISTS (SELECT 1 FROM native_send_queue q "
+    "WHERE q.delivery_source=? AND q.delivery_id=CAST(m.local_seq AS TEXT))"
+)
 
 
 def _validate_batch_size(batch_size: int) -> int:
@@ -25,12 +33,18 @@ def _validate_batch_size(batch_size: int) -> int:
     return batch_size
 
 
-def _resolve_local_node_id(store: Store, local_node_id: str | None) -> str | None:
+def _resolve_local_identity(store: Store, local_node_id: str | None) -> tuple[str | None, str | None]:
     if local_node_id is not None:
-        return store._non_empty_text(local_node_id, "local_node_id")
+        resolved = store._non_empty_text(local_node_id, "local_node_id")
+        if (store.state / IDENTITY_FILENAME).exists():
+            identity = FileNodeIdentityStore(store.state).load_or_create()
+            if identity.node_id == resolved:
+                return resolved, identity.state_generation
+        return resolved, None
     if (store.state / IDENTITY_FILENAME).exists():
-        return FileNodeIdentityStore(store.state).load_or_create().node_id
-    return None
+        identity = FileNodeIdentityStore(store.state).load_or_create()
+        return identity.node_id, identity.state_generation
+    return None, None
 
 
 def _db_file_sizes(store: Store) -> tuple[int, int]:
@@ -117,13 +131,14 @@ def _create_plan_db() -> sqlite3.Connection:
             protected INTEGER NOT NULL,
             is_direct INTEGER NOT NULL,
             is_self INTEGER NOT NULL,
+            self_proven INTEGER NOT NULL,
             needs_repair INTEGER NOT NULL,
             has_event INTEGER NOT NULL,
             data_bytes INTEGER NOT NULL,
             action TEXT NOT NULL DEFAULT 'keep'
         );
         CREATE INDEX idx_mirrors_origin
-            ON mirrors(origin_node_id, origin_state_generation, origin_seq);
+            ON mirrors(origin_node_id, origin_state_generation, origin_seq, origin_fingerprint);
         CREATE INDEX idx_mirrors_action_seq
             ON mirrors(action, local_seq);
         """
@@ -148,6 +163,92 @@ def _origin_for_row(store: Store, row: sqlite3.Row, *, repair_origins: bool) -> 
     return store._origin_mirror_values(row, force=repair_origins)
 
 
+def _origin_event_from_row(store: Store, row: sqlite3.Row) -> dict[str, Any] | None:
+    data = store._decode_json(row["data"])
+    if not isinstance(data, dict):
+        return None
+    synthetic = {
+        "seq": row["remote_seq"],
+        "type": row["kind"] or "event",
+        "ref": {
+            "host_id": row["host_id"],
+            "node_id": row["node_id"],
+            "state_generation": row["state_generation"],
+            "local_id": str(row["remote_seq"]),
+        },
+        "payload": data,
+        "created": float(row["created"] or 0.0),
+    }
+    origin_event, wrapped = unwrap_peer_event(synthetic)
+    return origin_event if wrapped else None
+
+
+def _mirror_content_fingerprint(store: Store, row: sqlite3.Row) -> str | None:
+    data = store._decode_json(row["data"])
+    if data is None:
+        return None
+    origin_event = _origin_event_from_row(store, row)
+    if origin_event is not None:
+        return hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        encode({"kind": row["kind"], "data": data, "created": row["created"]}).encode("utf-8")
+    ).hexdigest()
+
+
+def _self_origin_proven(
+    store: Store,
+    db: sqlite3.Connection,
+    *,
+    local_seq: int,
+    expected_origin: tuple[str, str, int, str],
+    local_node_id: str | None,
+    local_state_generation: str | None,
+) -> bool:
+    origin_node, origin_generation, origin_seq, origin_fingerprint = expected_origin
+    if (
+        local_node_id is None
+        or local_state_generation is None
+        or origin_node != local_node_id
+        or origin_generation != local_state_generation
+    ):
+        return False
+    mirror = db.execute(
+        "SELECT m.host_id,m.node_id,m.state_generation,m.remote_seq,"
+        "m.origin_node_id,m.origin_state_generation,m.origin_seq,m.origin_fingerprint,"
+        "e.kind,e.data,e.created "
+        "FROM peer_event_mirrors m LEFT JOIN events e ON e.seq=m.local_seq "
+        "WHERE m.local_seq=?",
+        (local_seq,),
+    ).fetchone()
+    if mirror is None:
+        return False
+    origin_event = _origin_event_from_row(store, mirror)
+    if origin_event is None:
+        return False
+    if (
+        int(origin_event["seq"]) != origin_seq
+        or origin_event["ref"]["node_id"] != local_node_id
+        or origin_event["ref"]["state_generation"] != local_state_generation
+        or hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest() != origin_fingerprint
+    ):
+        return False
+    original = db.execute(
+        "SELECT e.seq,e.kind,e.data,e.created,e.session_id,e.task_id,e.attempt_id "
+        "FROM events e WHERE e.seq=? AND NOT EXISTS ("
+        "SELECT 1 FROM peer_event_mirrors m WHERE m.local_seq=e.seq)",
+        (origin_seq,),
+    ).fetchone()
+    if original is None:
+        return False
+    local_id = original["task_id"] or original["session_id"] or original["attempt_id"] or str(original["seq"])
+    return (
+        origin_event["ref"]["local_id"] == local_id
+        and origin_event["type"] == original["kind"]
+        and origin_event["payload"] == store._decode_json(original["data"])
+        and float(origin_event["created"]) == float(original["created"])
+    )
+
+
 def _scan_mirrors_into_plan(
     store: Store,
     plan_db: sqlite3.Connection,
@@ -155,6 +256,7 @@ def _scan_mirrors_into_plan(
     batch_size: int,
     repair_origins: bool,
     local_node_id: str | None,
+    local_state_generation: str | None,
 ) -> None:
     with store.connection() as db:
         upper_row = db.execute("SELECT COALESCE(MAX(local_seq), 0) FROM peer_event_mirrors").fetchone()
@@ -172,60 +274,69 @@ def _scan_mirrors_into_plan(
                 "e.kind,e.data,e.created,"
                 "CASE WHEN e.seq IS NULL THEN 0 ELSE 1 END AS has_event,"
                 "LENGTH(CAST(COALESCE(e.data,'') AS BLOB)) AS data_bytes,"
-                "CASE WHEN ("
-                "  EXISTS (SELECT 1 FROM deliveries d WHERE d.event_seq=m.local_seq)"
-                "  OR EXISTS (SELECT 1 FROM mirrored_parent_notifications n WHERE n.local_seq=m.local_seq)"
-                "  OR EXISTS (SELECT 1 FROM native_send_queue q WHERE q.delivery_source=? AND q.delivery_id=CAST(m.local_seq AS TEXT))"
-                ") THEN 1 ELSE 0 END AS protected "
+                "CASE WHEN (" + _PROTECTED_SQL + ") THEN 1 ELSE 0 END AS protected "
                 "FROM peer_event_mirrors m "
                 "LEFT JOIN events e ON e.seq=m.local_seq "
                 "WHERE m.local_seq>? AND m.local_seq<=? "
                 "ORDER BY m.local_seq LIMIT ?",
                 (parent_source, last_seq, upper_seq, batch_size),
             ).fetchall()
-        if not rows:
-            break
+            if not rows:
+                break
 
-        batch = []
-        for row in rows:
-            orig_node, orig_gen, orig_seq, orig_fp = _origin_for_row(
-                store, row, repair_origins=repair_origins
-            )
-            needs_repair = int(
-                (row["origin_node_id"], row["origin_state_generation"], row["origin_seq"], row["origin_fingerprint"])
-                != (orig_node, orig_gen, orig_seq, orig_fp)
-            )
-            is_direct = int(
-                orig_node == row["node_id"]
-                and orig_gen == row["state_generation"]
-                and orig_seq == row["remote_seq"]
-            )
-            is_self = int(local_node_id is not None and orig_node == local_node_id)
-            batch.append(
-                (
-                    row["local_seq"],
-                    orig_node,
-                    orig_gen,
-                    orig_seq,
-                    orig_fp,
-                    row["protected"],
-                    is_direct,
-                    is_self,
-                    needs_repair,
-                    row["has_event"],
-                    row["data_bytes"],
+            batch = []
+            for row in rows:
+                orig_node, orig_gen, orig_seq, orig_fp = _origin_for_row(
+                    store, row, repair_origins=repair_origins
                 )
-            )
-            last_seq = row["local_seq"]
+                needs_repair = int(
+                    (row["origin_node_id"], row["origin_state_generation"], row["origin_seq"], row["origin_fingerprint"])
+                    != (orig_node, orig_gen, orig_seq, orig_fp)
+                )
+                is_direct = int(
+                    orig_node == row["node_id"]
+                    and orig_gen == row["state_generation"]
+                    and orig_seq == row["remote_seq"]
+                )
+                is_self = int(local_node_id is not None and orig_node == local_node_id)
+                self_proven = 0
+                if is_self and local_state_generation is not None and orig_gen == local_state_generation:
+                    self_proven = int(
+                        _self_origin_proven(
+                            store,
+                            db,
+                            local_seq=row["local_seq"],
+                            expected_origin=(orig_node, orig_gen, orig_seq, orig_fp),
+                            local_node_id=local_node_id,
+                            local_state_generation=local_state_generation,
+                        )
+                    )
+                batch.append(
+                    (
+                        row["local_seq"],
+                        orig_node,
+                        orig_gen,
+                        orig_seq,
+                        orig_fp,
+                        row["protected"],
+                        is_direct,
+                        is_self,
+                        self_proven,
+                        needs_repair,
+                        row["has_event"],
+                        row["data_bytes"],
+                    )
+                )
+                last_seq = row["local_seq"]
 
-        plan_db.executemany(
-            "INSERT INTO mirrors("
-            "local_seq,origin_node_id,origin_state_generation,origin_seq,origin_fingerprint,"
-            "protected,is_direct,is_self,needs_repair,has_event,data_bytes"
-            ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            batch,
-        )
-    plan_db.commit()
+            plan_db.executemany(
+                "INSERT INTO mirrors("
+                "local_seq,origin_node_id,origin_state_generation,origin_seq,origin_fingerprint,"
+                "protected,is_direct,is_self,self_proven,needs_repair,has_event,data_bytes"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                batch,
+            )
+        plan_db.commit()
 
 
 def _classify_plan(plan_db: sqlite3.Connection, *, prune_self_origins: bool) -> dict[str, int]:
@@ -239,9 +350,10 @@ def _classify_plan(plan_db: sqlite3.Connection, *, prune_self_origins: bool) -> 
                 SELECT local_seq,
                        CASE
                            WHEN protected = 1 THEN 'keep'
+                           WHEN ? = 1 AND is_self = 1 AND self_proven = 0 THEN 'keep'
                            WHEN ? = 1 AND is_self = 1 THEN 'prune'
                            WHEN ROW_NUMBER() OVER (
-                               PARTITION BY origin_node_id, origin_state_generation, origin_seq
+                               PARTITION BY origin_node_id, origin_state_generation, origin_seq, origin_fingerprint
                                ORDER BY protected DESC, is_direct DESC, local_seq ASC
                            ) = 1 THEN 'keep'
                            ELSE 'prune'
@@ -251,7 +363,7 @@ def _classify_plan(plan_db: sqlite3.Connection, *, prune_self_origins: bool) -> 
             WHERE planned_action = 'prune'
         )
         """,
-        (prune_self_flag,),
+        (prune_self_flag, prune_self_flag),
     )
     plan_db.commit()
     summary = plan_db.execute(
@@ -340,6 +452,8 @@ def _apply_mirror_prunes(
     *,
     batch_size: int,
     prune_self_origins: bool,
+    repair_origins: bool,
+    local_node_id: str | None,
 ) -> tuple[int, int, int, int]:
     with store.connection() as db:
         max_seq = _max_event_seq(db)
@@ -353,39 +467,99 @@ def _apply_mirror_prunes(
 
     while True:
         rows = plan_db.execute(
-            "SELECT local_seq,is_self FROM mirrors WHERE action='prune' AND local_seq>? "
+            "SELECT local_seq,origin_node_id,origin_state_generation,origin_seq,origin_fingerprint,"
+            "is_self,self_proven FROM mirrors WHERE action='prune' AND local_seq>? "
             "ORDER BY local_seq LIMIT ?",
             (last_seq, batch_size),
         ).fetchall()
         if not rows:
             break
         last_seq = rows[-1]["local_seq"]
-        kind_by_seq = {int(row["local_seq"]): int(row["is_self"]) for row in rows}
-        all_seqs = list(kind_by_seq.keys())
+        plan_by_seq = {int(row["local_seq"]): row for row in rows}
+        all_seqs = list(plan_by_seq)
+        current_node_id, current_generation = (
+            _resolve_local_identity(store, local_node_id) if prune_self_origins else (None, None)
+        )
 
         with store.connection(write=True, timeout=30) as db:
             for start in range(0, len(all_seqs), _SQL_VAR_CHUNK):
                 chunk = all_seqs[start : start + _SQL_VAR_CHUNK]
                 placeholders = ",".join("?" for _ in chunk)
-                eligible = [
-                    int(row[0])
-                    for row in db.execute(
-                        f"SELECT m.local_seq FROM peer_event_mirrors m "
-                        f"WHERE m.local_seq IN ({placeholders}) "
-                        f"AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.event_seq=m.local_seq) "
-                        f"AND NOT EXISTS (SELECT 1 FROM mirrored_parent_notifications n WHERE n.local_seq=m.local_seq) "
-                        f"AND NOT EXISTS (SELECT 1 FROM native_send_queue q "
-                        f"  WHERE q.delivery_source=? AND q.delivery_id=CAST(m.local_seq AS TEXT))",
-                        (*chunk, parent_source),
+                current_rows = db.execute(
+                    "SELECT m.local_seq,m.host_id,m.node_id,m.state_generation,m.remote_seq,"
+                    "m.fingerprint,m.origin_node_id,m.origin_state_generation,m.origin_seq,"
+                    "m.origin_fingerprint,e.kind,e.data,e.created,"
+                    "CASE WHEN (" + _PROTECTED_SQL + ") THEN 1 ELSE 0 END AS protected "
+                    "FROM peer_event_mirrors m LEFT JOIN events e ON e.seq=m.local_seq "
+                    f"WHERE m.local_seq IN ({placeholders})",
+                    (parent_source, *chunk),
+                ).fetchall()
+                current_by_seq = {int(row["local_seq"]): row for row in current_rows}
+                eligible = []
+                for seq in chunk:
+                    plan_row = plan_by_seq[seq]
+                    current = current_by_seq.get(seq)
+                    if current is None:
+                        continue
+                    plan_origin = (
+                        plan_row["origin_node_id"],
+                        plan_row["origin_state_generation"],
+                        int(plan_row["origin_seq"]),
+                        plan_row["origin_fingerprint"],
+                    )
+                    if _origin_for_row(store, current, repair_origins=repair_origins) != plan_origin:
+                        continue
+                    if int(current["protected"]):
+                        continue
+                    if prune_self_origins and int(plan_row["is_self"]) and int(plan_row["self_proven"]):
+                        if not _self_origin_proven(
+                            store,
+                            db,
+                            local_seq=seq,
+                            expected_origin=plan_origin,
+                            local_node_id=current_node_id,
+                            local_state_generation=current_generation,
+                        ):
+                            continue
+                        eligible.append(seq)
+                        continue
+                    candidate_fingerprint = _mirror_content_fingerprint(store, current)
+                    if candidate_fingerprint is None:
+                        continue
+                    keep_seqs = [
+                        int(keep[0])
+                        for keep in plan_db.execute(
+                            "SELECT local_seq FROM mirrors WHERE origin_node_id=? "
+                            "AND origin_state_generation=? AND origin_seq=? AND origin_fingerprint=? "
+                            "AND action='keep'",
+                            plan_origin,
+                        ).fetchall()
+                    ]
+                    if not keep_seqs:
+                        continue
+                    keep_placeholders = ",".join("?" for _ in keep_seqs)
+                    keep_rows = db.execute(
+                        "SELECT m.local_seq,m.host_id,m.node_id,m.state_generation,m.remote_seq,"
+                        "m.fingerprint,m.origin_node_id,m.origin_state_generation,m.origin_seq,"
+                        "m.origin_fingerprint,e.kind,e.data,e.created "
+                        "FROM peer_event_mirrors m LEFT JOIN events e ON e.seq=m.local_seq "
+                        f"WHERE m.local_seq IN ({keep_placeholders})",
+                        keep_seqs,
                     ).fetchall()
-                ]
+                    if not any(
+                        _mirror_content_fingerprint(store, keep) == candidate_fingerprint
+                        for keep in keep_rows
+                    ):
+                        continue
+                    eligible.append(seq)
                 if not eligible:
                     continue
                 ep = ",".join("?" for _ in eligible)
                 db.execute(f"DELETE FROM peer_event_mirrors WHERE local_seq IN ({ep})", eligible)
                 deleted_mirrors += len(eligible)
                 for seq in eligible:
-                    if prune_self_origins and kind_by_seq.get(seq):
+                    plan_row = plan_by_seq[seq]
+                    if prune_self_origins and int(plan_row["is_self"]) and int(plan_row["self_proven"]):
                         deleted_self_origins += 1
                     else:
                         deleted_duplicates += 1
@@ -427,7 +601,7 @@ def prune_duplicate_mirrors(
 ) -> dict[str, Any]:
     """Deduplicate historical peer event mirrors while preserving deliveries, notifications, and cursors."""
     batch_size = _validate_batch_size(batch_size)
-    resolved_local_node_id = _resolve_local_node_id(store, local_node_id)
+    resolved_local_node_id, resolved_local_state_generation = _resolve_local_identity(store, local_node_id)
     db_bytes_before, wal_bytes_before = _db_file_sizes(store)
     broker_running = _is_broker_running(store.state)
 
@@ -442,6 +616,7 @@ def prune_duplicate_mirrors(
                 batch_size=batch_size,
                 repair_origins=repair_origins,
                 local_node_id=resolved_local_node_id,
+                local_state_generation=resolved_local_state_generation,
             )
             stats = _classify_plan(plan_db, prune_self_origins=prune_self_origins)
 
@@ -458,6 +633,8 @@ def prune_duplicate_mirrors(
                     plan_db,
                     batch_size=batch_size,
                     prune_self_origins=prune_self_origins,
+                    repair_origins=repair_origins,
+                    local_node_id=local_node_id,
                 )
                 stats["kept_mirrors"] = stats["total_mirrors"] - stats["pruned_mirrors"]
                 if vacuum:

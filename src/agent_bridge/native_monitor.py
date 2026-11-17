@@ -779,6 +779,47 @@ def collect_native_sessions(
     return results
 
 
+def snapshot_cost_metrics(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate attempt and cost coverage across all sessions before pagination."""
+    has_attempts = False
+    known_cost_sessions = 0
+    known_cost_attempt_sessions = 0
+    unknown_cost_sessions = 0
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        attempt = session.get("attempt")
+        session_has_attempts = bool(session.get("has_attempts")) or bool(
+            isinstance(attempt, dict) and attempt
+        )
+        cost = session.get("cost_usd")
+        if cost is None and isinstance(attempt, dict):
+            cost = attempt.get("cost_usd")
+        try:
+            cost_known = (
+                isinstance(cost, (int, float))
+                and not isinstance(cost, bool)
+                and math.isfinite(float(cost))
+            )
+        except (OverflowError, TypeError, ValueError):
+            cost_known = False
+        if cost_known:
+            known_cost_sessions += 1
+        if session_has_attempts:
+            has_attempts = True
+            if cost_known:
+                known_cost_attempt_sessions += 1
+            else:
+                unknown_cost_sessions += 1
+    return {
+        "has_attempts": has_attempts,
+        "known_cost_sessions": known_cost_sessions,
+        "known_cost_attempt_sessions": known_cost_attempt_sessions,
+        "unknown_cost_sessions": unknown_cost_sessions,
+        "has_cost_gaps": unknown_cost_sessions > 0,
+    }
+
+
 def _empty_runtime_bucket(rt: str) -> dict[str, Any]:
     return {
         "runtime": rt,
@@ -794,7 +835,7 @@ def _empty_runtime_bucket(rt: str) -> dict[str, Any]:
         "native_daemons": 0,
         "total_live": 0,
         "total_cost_usd": 0.0,
-        "known_cost_sessions": 0,
+        **snapshot_cost_metrics([]),
         "cost_complete": True,
     }
 
@@ -829,26 +870,22 @@ def summarize_runtimes(
             bucket["bridge_waiting"] += 1
         if obs == "recovery_needed":
             bucket["bridge_recovery"] += 1
-        if "cost_usd" in s:
-            if isinstance(s.get("cost_usd"), (int, float)):
-                bucket["total_cost_usd"] += float(s["cost_usd"])
-                bucket["known_cost_sessions"] += 1
-                if s.get("cost_complete") is False:
-                    bucket["cost_complete"] = False
-            elif s.get("has_attempts") or s.get("cost_complete") is False:
-                bucket["cost_complete"] = False
-        else:
-            attempt = s.get("attempt")
-            if isinstance(attempt, dict):
-                if isinstance(attempt.get("cost_usd"), (int, float)):
-                    bucket["total_cost_usd"] += float(attempt["cost_usd"])
-                    bucket["known_cost_sessions"] += 1
-                    if attempt.get("cost_complete") is False:
-                        bucket["cost_complete"] = False
-                else:
-                    bucket["cost_complete"] = False
-            elif s.get("has_attempts"):
-                bucket["cost_complete"] = False
+        coverage = snapshot_cost_metrics([s])
+        for key in ("known_cost_sessions", "known_cost_attempt_sessions", "unknown_cost_sessions"):
+            bucket[key] += coverage[key]
+        bucket["has_attempts"] |= coverage["has_attempts"]
+        bucket["has_cost_gaps"] |= coverage["has_cost_gaps"]
+        attempt = s.get("attempt")
+        cost = s.get("cost_usd")
+        if cost is None and isinstance(attempt, dict):
+            cost = attempt.get("cost_usd")
+        if coverage["known_cost_sessions"]:
+            bucket["total_cost_usd"] += float(cost)
+        complete = s.get("cost_complete")
+        if complete is None and isinstance(attempt, dict):
+            complete = attempt.get("cost_complete")
+        if complete is False or coverage["has_cost_gaps"]:
+            bucket["cost_complete"] = False
 
     for n in native_sessions:
         rt = normalize_runtime(n.get("runtime")) or "unknown"
@@ -874,14 +911,15 @@ def _unified_sort_key(item: dict[str, Any]) -> tuple[int, int, float, int, str]:
     status = str(item.get("status") or "stopped").lower()
     if item.get("waiting_question") or status == "waiting_input":
         tier = 0
+    elif item.get("kind") == "daemon":
+        # Keep background daemons visible, but never let them displace interactive work.
+        tier = 4
     elif status == "running":
         tier = 1
     elif status in ("active", "idle", "starting") or item.get("alive"):
-        tier = 2 if item.get("kind") != "daemon" else 4
+        tier = 2
     elif status == "recovery_needed":
         tier = 3
-    elif item.get("kind") == "daemon":
-        tier = 4
     else:
         tier = 5
     source_rank = 0 if item.get("source") == "bridge" else 1
@@ -1016,6 +1054,16 @@ def filter_snapshot_dict(
     native_sessions = list(snapshot.get("native_sessions") or [])
     events = list(snapshot.get("events") or [])
     metrics = dict(snapshot.get("metrics") or {})
+    if metrics.get("total_sessions", len(sessions)) > len(sessions):
+        # A legacy broker page cannot establish cost coverage for hidden sessions.
+        if metrics.get("cost_complete") is not True and "known_cost_attempt_sessions" not in metrics:
+            metrics["cost_complete"] = False
+            metrics.setdefault("has_cost_gaps", True)
+            if metrics.get("total_cost_usd") == 0:
+                metrics["total_cost_usd"] = None
+    else:
+        for key, value in snapshot_cost_metrics(sessions).items():
+            metrics.setdefault(key, value)
 
     if rt_filter:
         sessions = [s for s in sessions if normalize_runtime(s.get("runtime")) == rt_filter]
@@ -1043,7 +1091,7 @@ def filter_snapshot_dict(
 
     if session_limit is not None and session_limit >= 0:
         sessions = sessions[:session_limit]
-        native_sessions = native_sessions[:session_limit]
+        native_sessions = sorted(native_sessions, key=lambda item: _unified_sort_key(item)[0])[:session_limit]
 
     result = dict(snapshot)
     result["sessions"] = sessions

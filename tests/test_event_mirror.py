@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_bridge.broker import Broker, EventMirror
-from agent_bridge.config import Config
+from agent_bridge.config import Config, Profile
 from agent_bridge.hosts import HostConfig
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.notifications import deliver
@@ -189,6 +189,82 @@ class EventMirrorTests(MirrorTestCase):
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM mirrored_parent_notifications").fetchone()[0])
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+
+    async def test_mirrored_notices_name_the_remote_host_task_and_outcome(self):
+        parent_ref = self.local_parent()
+        cases = [
+            (18, "remote-failed", "task_finished", {"status": "failed", "validation": "pending"},
+             ["Remote child task gpu-a/remote-failed", "failed", "agent_result"], ["agent_review"]),
+            (19, "remote-completed", "task_finished", {"status": "completed"},
+             ["Remote child task gpu-a/remote-completed", "completed", "agent_result", "agent_review"], []),
+            (20, "remote-recovery", "task_recovery_needed",
+             {"status": "recovery_needed", "error": "connection lost"},
+             ["Remote child task gpu-a/remote-recovery", "recovery_needed", "resolve"], ["agent_review"]),
+            (21, "remote-start", "task_start_failed", {"status": "queued", "error": "CLI unavailable"},
+             ["Remote child task gpu-a/remote-start", "has not started", "agent_inspect", "resume"],
+             ["agent_review"]),
+        ]
+        items = []
+        for seq, child, kind, payload, _, _ in cases:
+            self.store.register_parent_route(HOST_A, NODE_A, GEN_A, child, parent_ref)
+            items.append(event(seq=seq, local_id=child, event_type=kind, payload=payload))
+        client = FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [
+            {"items": items, "cursor": 21, "has_more": False},
+        ])
+        await self.mirror({HOST_A: client}).run_once(HOST_A)
+
+        messages = {}
+
+        async def sender(config, parent, message, event_seq, receipt=None):
+            messages[event_seq] = message
+            return {"ready": True, "receipt": "sent", "native_status": "received", "native_turn_id": "turn-1"}
+
+        await deliver(self.store, Config({}, codex_async_python="fixture"), sender)
+        for seq, _, _, _, includes, excludes in cases:
+            mirrored = self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, seq)
+            message = messages[mirrored["local_seq"]]
+            for text in includes:
+                self.assertIn(text, message)
+            for text in excludes:
+                self.assertNotIn(text, message)
+            self.assertNotIn("None", message)
+
+    async def test_local_and_mirrored_notices_keep_their_formats_and_deliver_once(self):
+        parent_ref = self.local_parent()
+        profile = Profile("local", "codex", "fixed")
+        session_id = self.store.open(
+            profile, str(self.root), "read-only", "local-open", parent="parent-1",
+        )["session_id"]
+        self.store.worker_ready(session_id, "g", 123, "start", "native-local")
+        task_id = self.store.dispatch(session_id, "local work", "local-dispatch")["task_id"]
+        config = Config({"local": profile}, codex_async_python="fixture")
+        self.store.claim(config)
+        attempt_id = self.store.begin_attempt(session_id, "g")["active_attempt"]
+        self.store.finish(session_id, "g", task_id, attempt_id, "completed", {"answer": "done"})
+
+        self.store.register_parent_route(HOST_A, NODE_A, GEN_A, "remote-task", parent_ref)
+        item = event(seq=18, local_id="remote-task", event_type="task_finished",
+                     payload={"status": "failed", "validation": "pending"})
+        client = FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [
+            {"items": [item], "cursor": 18, "has_more": False},
+        ])
+        await self.mirror({HOST_A: client}).run_once(HOST_A)
+
+        calls = []
+
+        async def sender(config, parent, message, event_seq, receipt=None):
+            calls.append((event_seq, message))
+            return {"ready": True, "receipt": "sent", "native_status": "received", "native_turn_id": "turn-1"}
+
+        await deliver(self.store, config, sender)
+        await deliver(self.store, config, sender)
+        self.assertEqual(2, len(calls))
+        messages = dict(calls)
+        local_seq = self.store.events(task_id=task_id)[-1]["seq"]
+        mirrored = self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, 18)
+        self.assertIn(f"Child task {task_id} has completed", messages[local_seq])
+        self.assertIn("Remote child task gpu-a/remote-task", messages[mirrored["local_seq"]])
+        self.assertIn("failed", messages[mirrored["local_seq"]])
 
     async def test_remote_parent_route_calls_notify_parent_on_that_host(self):
         parent_ref = self.remote_parent()

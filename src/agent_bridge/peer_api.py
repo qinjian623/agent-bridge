@@ -12,6 +12,7 @@ import socket
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -798,10 +799,12 @@ class DirectPeerService:
     def _workspace_path(self, workspace_id: str) -> Path:
         return Path(self._store.state) / "workspaces" / self._safe_workspace_id(workspace_id)
 
-    def _workspace_chunk_path(self, workspace_id: str, blob_sha256: str, offset: int) -> Path:
+    def _workspace_chunk_path(
+        self, workspace_id: str, blob_sha256: str, offset: int, chunk_sha256: str,
+    ) -> Path:
         return (
             Path(self._store.state) / "workspace_chunks" / self._safe_workspace_id(workspace_id)
-            / blob_sha256 / f"{offset}.chunk"
+            / blob_sha256 / f"{offset}-{chunk_sha256}.chunk"
         )
 
     def _workspace_blob_path(self, sha256: str) -> Path:
@@ -833,13 +836,17 @@ class DirectPeerService:
     @staticmethod
     def _write_bytes_atomic(path: Path, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = path.with_name(path.name + ".tmp")
-        with temporary.open("wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.chmod(0o600)
-        os.replace(temporary, path)
+        descriptor, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.chmod(0o600)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _read_bytes(path: str | Path) -> bytes:
@@ -1039,13 +1046,15 @@ class DirectPeerService:
             if offset < chunk["offset"] + chunk["size"] and chunk["offset"] < offset + size:
                 raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "chunk overlaps a stored chunk")
 
-        stored_path = self._workspace_chunk_path(workspace_id, blob_sha256, offset)
+        stored_path = self._workspace_chunk_path(
+            workspace_id, blob_sha256, offset, params["chunk_sha256"],
+        )
         self._write_bytes_atomic(stored_path, decoded)
         store.record_workspace_chunk(
             workspace_id, blob_sha256, offset, size, params["chunk_sha256"], str(stored_path),
         )
 
-        assembled = self._assemble_blob(store, workspace_id, blob_sha256)
+        assembled = self._assemble_blob(store, workspace_id, blob_sha256, expected_size)
         verified_manifest = False
         if assembled is not None:
             verified_manifest = self._record_complete_blob(store, transfer, blob_sha256, assembled)
@@ -1065,7 +1074,9 @@ class DirectPeerService:
             result["status"] = "verified"
         return result
 
-    def _assemble_blob(self, store: Any, workspace_id: str, blob_sha256: str) -> bytes | None:
+    def _assemble_blob(
+        self, store: Any, workspace_id: str, blob_sha256: str, expected_size: int | None,
+    ) -> bytes | None:
         chunks = store.get_workspace_chunks(workspace_id, blob_sha256)
         if not chunks:
             return None
@@ -1079,6 +1090,15 @@ class DirectPeerService:
                 raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "stored chunk does not match its digest")
             payload.extend(content)
             position += len(content)
+            if expected_size is not None and position > expected_size:
+                raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "blob exceeds its declared size")
+        if expected_size is not None:
+            if position != expected_size:
+                return None
+        elif hashlib.sha256(payload).hexdigest() != blob_sha256:
+            # Legacy uploads can omit the total size. Only a complete content match proves completion; otherwise
+            # acknowledge the valid prefix and wait for the remaining chunks.
+            return None
         return bytes(payload)
 
     def _record_blob(self, store: Any, digest: str, data: bytes) -> None:
@@ -1291,7 +1311,9 @@ class DirectPeerService:
                 shutil.rmtree(path, ignore_errors=True)
 
     @staticmethod
-    def _safe_workspace_file(root: Path, name: str, *, create_parents: bool) -> Path:
+    def _safe_workspace_file(
+        root: Path, name: str, *, create_parents: bool, allow_missing_parents: bool = False,
+    ) -> Path:
         validate_manifest_path(name)
         current = Path(root)
         parts = name.split("/")
@@ -1299,9 +1321,12 @@ class DirectPeerService:
             current = current / part
             if current.is_symlink():
                 raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace path traverses a symlink")
-            if create_parents:
+            if current.exists():
+                if not current.is_dir():
+                    raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace path parent is not a directory")
+            elif create_parents:
                 current.mkdir(parents=True, exist_ok=True, mode=0o700)
-            elif not current.is_dir():
+            elif not allow_missing_parents:
                 raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace path has a missing parent")
         target = current / parts[-1]
         if target.is_symlink():
@@ -1330,12 +1355,15 @@ class DirectPeerService:
         target.chmod(mode)
 
     def _verify_workspace_before(self, root: Path, entry: dict[str, Any]) -> None:
-        target = self._safe_workspace_file(root, entry["path"], create_parents=False)
         before = entry.get("before_sha256")
         if entry["op"] == "put" and before is None:
+            target = self._safe_workspace_file(
+                root, entry["path"], create_parents=False, allow_missing_parents=True,
+            )
             if target.exists():
                 raise peer_error(PeerErrorCode.WORKSPACE_CONFLICT, "workspace base unexpectedly contains a new file")
             return
+        target = self._safe_workspace_file(root, entry["path"], create_parents=False)
         if before is None:
             return
         if not target.is_file() or target.is_symlink():
@@ -1920,20 +1948,12 @@ class DirectPeerService:
             result = self._operation_outcome(existing)
             self._identity.advance(store.record_commit(f"peer.cancel:{operation['operation_id']}", "peer.cancel"))
             return result
-        store.record_operation(
-            operation["operation_id"],
-            identity.node_id,
-            identity.state_generation,
-            fingerprint,
-            "peer.cancel",
-            params,
-            status="running",
-        )
 
         target, value = next(iter(targets.items()))
         task_id: str | None = None
         target_operation_id: str | None = None
         tombstone_seq: int | None = None
+        inbox = None
         if target == "task_id":
             task_id = value
             try:
@@ -1956,6 +1976,143 @@ class DirectPeerService:
                 raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown operation: {value}")
             if isinstance(delivered.get("result"), dict):
                 task_id = delivered["result"].get("task_id")
+                delivery_id = delivered["result"].get("delivery_id")
+            else:
+                delivery_id = None
+            delivered_params = delivered.get("params") if isinstance(delivered.get("params"), dict) else {}
+            if not isinstance(delivery_id, str) or not delivery_id:
+                delivery_id = delivered_params.get("delivery_id")
+            if isinstance(delivery_id, str) and delivery_id:
+                inbox = store.get_inbox_delivery(delivery_id)
+            if inbox is None:
+                with store.connection() as db:
+                    row = db.execute(
+                        "SELECT delivery_id FROM peer_inbox WHERE operation_id=? ORDER BY created DESC LIMIT 1",
+                        (value,),
+                    ).fetchone()
+                if row is not None:
+                    inbox = store.get_inbox_delivery(row["delivery_id"])
+
+        # Native deliveries have no task_id. Their only durable cancellation point is the ordered send-queue
+        # row, so resolve it from the saved inbox target/delivery and CAS it in the same transaction that saves
+        # the cancellation result. A claimed or uncertain write is never reported as cancelled.
+        if inbox is not None:
+            payload = inbox.get("payload") if isinstance(inbox.get("payload"), dict) else {}
+            target_ref = payload.get("target") if isinstance(payload.get("target"), dict) else {}
+            target_kind = inbox.get("target_kind") or target_ref.get("kind")
+            delivery_id = inbox["delivery_id"]
+            queue = store.get_native_send_by_delivery(DeliverySource.PEER_DELIVER, delivery_id)
+            if queue is not None and target_kind not in {None, "native"}:
+                raise peer_error(
+                    PeerErrorCode.OPERATION_CONFLICT,
+                    "Saved delivery target conflicts with its native send-queue record",
+                )
+            if queue is not None:
+                expected_runtime = inbox.get("runtime") or target_ref.get("runtime")
+                expected_target = inbox.get("target_id") or target_ref.get("id")
+                if ((expected_runtime and queue["runtime"] != expected_runtime)
+                        or (expected_target and queue["native_id"] != expected_target)):
+                    raise peer_error(
+                        PeerErrorCode.DELIVERY_BLOCKED,
+                        "Native send-queue target does not match the saved delivery target",
+                    )
+            if queue is not None or target_kind == "native":
+                now = time.time()
+                with store.connection(write=True) as db:
+                    inbox_row = db.execute(
+                        "SELECT * FROM peer_inbox WHERE delivery_id=?", (delivery_id,)
+                    ).fetchone()
+                    if inbox_row is None:
+                        raise peer_error(PeerErrorCode.OPERATION_NOT_FOUND, f"Unknown delivery: {delivery_id}")
+                    queue_row = db.execute(
+                        "SELECT * FROM native_send_queue WHERE delivery_source=? AND delivery_id=?",
+                        (DeliverySource.PEER_DELIVER, delivery_id),
+                    ).fetchone()
+                    if queue_row is not None:
+                        if queue_row["status"] == "pending":
+                            queue_row = store.update_native_send(
+                                queue_row["id"], "cancelled",
+                                receipt=encode({"cancelled_at": now, "resolution": "not_received"}),
+                                expected_status="pending", db=db,
+                            )
+                            if queue_row["status"] != "cancelled":
+                                raise peer_error(
+                                    PeerErrorCode.DELIVERY_BLOCKED,
+                                    f"Native delivery is {queue_row['status']}; prove its outcome with lookup/resolve before cancelling",
+                                )
+                        elif queue_row["status"] != "cancelled":
+                            raise peer_error(
+                                PeerErrorCode.DELIVERY_BLOCKED,
+                                f"Native delivery is {queue_row['status']}; prove its outcome with lookup/resolve before cancelling",
+                            )
+                    elif inbox_row["status"] != "cancelled":
+                        raise peer_error(
+                            PeerErrorCode.OPERATION_NOT_FOUND,
+                            f"Native send-queue record is missing for delivery: {delivery_id}",
+                        )
+                    created = store.record_operation(
+                        operation["operation_id"],
+                        identity.node_id,
+                        identity.state_generation,
+                        fingerprint,
+                        "peer.cancel",
+                        params,
+                        status="running",
+                        db=db,
+                    )
+                    stored_result = created.get("result")
+                    if isinstance(stored_result, dict):
+                        result = stored_result
+                    else:
+                        receipt = encode({"cancelled_at": now, "resolution": "not_received"})
+                        if inbox_row["status"] != "cancelled":
+                            db.execute(
+                                "UPDATE peer_inbox SET status='cancelled',receipt=?,revision=revision+1 "
+                                "WHERE delivery_id=?",
+                                (receipt, delivery_id),
+                            )
+                        if target_operation_id and target_operation_id != operation["operation_id"]:
+                            target_row = db.execute(
+                                "SELECT result FROM peer_operations WHERE operation_id=?",
+                                (target_operation_id,),
+                            ).fetchone()
+                            target_result = Store._decode_json(target_row["result"]) if target_row else None
+                            if not isinstance(target_result, dict):
+                                target_result = {}
+                            target_result = {
+                                **target_result,
+                                "status": "cancelled",
+                                "send_status": "cancelled",
+                                "receipt": {"cancelled_at": now, "resolution": "not_received"},
+                            }
+                            db.execute(
+                                "UPDATE peer_operations SET status='cancelled',result=?,updated=? "
+                                "WHERE operation_id=?",
+                                (encode(target_result), now, target_operation_id),
+                            )
+                        result = {"target": value, "status": "cancelled"}
+                        if tombstone_seq is not None:
+                            result["tombstone_seq"] = tombstone_seq
+                        db.execute(
+                            "UPDATE peer_operations SET status='completed',result=?,error=NULL,updated=? "
+                            "WHERE operation_id=?",
+                            (encode(result), time.time(), operation["operation_id"]),
+                        )
+                    ack_seq = store.record_commit(
+                        f"peer.cancel:{operation['operation_id']}", "peer.cancel", db=db
+                    )
+                self._identity.advance(ack_seq)
+                return result
+
+        store.record_operation(
+            operation["operation_id"],
+            identity.node_id,
+            identity.state_generation,
+            fingerprint,
+            "peer.cancel",
+            params,
+            status="running",
+        )
 
         status = "cancelled"
         if task_id:

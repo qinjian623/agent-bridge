@@ -118,7 +118,7 @@ class WebTopologyTests(unittest.TestCase):
             session("closed", desired="closed"), session("stopped", observed="stopped"),
             session("dead", alive=False), session("unverified", alive="true"),
             session("question-without-worker", alive=False, waiting_question=True),
-            session("remote", host_id="linux-node-b"), session("recovery", alive=False, observed="recovery_needed"),
+            session("remote", host_id="worker-b"), session("recovery", alive=False, observed="recovery_needed"),
         ]}
         value = self.execute(data)
         self.assertEqual({"live", "idle"}, {node["session"]["id"] for node in value["hostNodes"][0]["sessions"]})
@@ -145,8 +145,8 @@ class WebTopologyTests(unittest.TestCase):
     def test_absent_host_means_local_but_remote_and_native_data_are_not_invented(self):
         local = session("legacy")
         local.pop("host_id")
-        value = self.execute({"hosts": [{"host_id": "linux-node-b", "state": "online"}],
-                              "sessions": [local, session("remote", host_id="linux-node-b")],
+        value = self.execute({"hosts": [{"host_id": "worker-b", "state": "online"}],
+                              "sessions": [local, session("remote", host_id="worker-b")],
                               "native_group_members": [{"native_id": "native", "runtime": "codex"}]})
         self.assertEqual(1, value["liveCount"])
         self.assertEqual(["legacy"], [node["session"]["id"] for node in value["hostNodes"][0]["sessions"]])
@@ -166,7 +166,7 @@ class WebTopologyTests(unittest.TestCase):
                 self.assertLessEqual(hosts[-1]["x"] + 28, value["width"])
 
     def test_empty_view_explains_missing_local_and_remote_session_data(self):
-        frame = self.execute({"hosts": [{"host_id": "linux-node-b", "state": "online"}]}, render=True)[0]
+        frame = self.execute({"hosts": [{"host_id": "worker-b", "state": "online"}]}, render=True)[0]
         labels = [node["text"] for node in nodes(frame["svg"], "text")]
         self.assertIn("No live Bridge workers", labels)
         self.assertIn("Sessions not collected", labels)
@@ -215,7 +215,7 @@ class WebTopologyTests(unittest.TestCase):
         self.assertFalse({"img", "script", "foreignObject"} & {node["tag"] for node in nodes(frame["svg"])})
 
     def test_refresh_removes_closed_workers_and_does_not_duplicate_nodes(self):
-        initial = {"sessions": [session("finishes")], "hosts": [{"host_id": "linux-node-b", "state": "online"}]}
+        initial = {"sessions": [session("finishes")], "hosts": [{"host_id": "worker-b", "state": "online"}]}
         final = {"sessions": [session("finishes", desired="closed", alive=False, observed="stopped")], "hosts": initial["hosts"]}
         frames = self.execute(initial, render=True, frames=[initial, final])
         self.assertIn("data-session-id", json.dumps(frames[0]["svg"]))
@@ -224,7 +224,7 @@ class WebTopologyTests(unittest.TestCase):
         self.assertEqual(1, len(list(nodes(frames[1]["svg"], "path"))))
 
     def test_connections_do_not_animate_as_if_message_traffic_were_measured(self):
-        frame = self.execute({"hosts": [{"host_id": "linux-node-b", "state": "online"}],
+        frame = self.execute({"hosts": [{"host_id": "worker-b", "state": "online"}],
                               "sessions": [session("running")]}, render=True)[0]
         self.assertEqual([], list(nodes(frame["svg"], "animate")))
 

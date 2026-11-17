@@ -4,8 +4,10 @@ import base64
 import hashlib
 import json
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agent_bridge.config import Config, normalize_projects
@@ -293,6 +295,27 @@ class WorkspaceStoreTest(unittest.TestCase):
         with self.assertRaises(BridgeError) as caught:
             self.store.update_workspace_transfer_status("missing", "ready", 0)
         self.assertEqual(caught.exception.code, "not_found")
+
+    def test_concurrent_overlapping_chunks_cannot_poison_upload(self):
+        self.create()
+        barrier = threading.Barrier(2)
+
+        def record(offset, size):
+            barrier.wait(timeout=5)
+            try:
+                self.store.record_workspace_chunk("ws-1", SHA_A, offset, size, SHA_B, "/chunk")
+                return "accepted"
+            except BridgeError as error:
+                return error.code
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda span: record(*span), [(0, 10), (5, 5)]))
+        self.assertCountEqual(["accepted", PeerErrorCode.WORKSPACE_CONFLICT], results)
+        chunks = self.store.get_workspace_chunks("ws-1", SHA_A)
+        self.assertEqual(1, len(chunks))
+        if chunks[0]["offset"] == 5:
+            self.store.record_workspace_chunk("ws-1", SHA_A, 0, 5, SHA_A, "/prefix")
+        self.assertEqual(10, sum(chunk["size"] for chunk in self.store.get_workspace_chunks("ws-1", SHA_A)))
 
     def test_chunks_idempotent_and_conflict(self):
         self.create()

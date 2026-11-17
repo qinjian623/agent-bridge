@@ -442,27 +442,186 @@ def _display_path(value):
     return json.dumps(os.fsdecode(value), ensure_ascii=False)[1:-1].encode("utf-8", "backslashreplace").decode("utf-8")
 
 
+def _capture_root(path: Path) -> int:
+    absolute = path.absolute()
+    anchor = None
+    try:
+        anchor = os.open(
+            absolute.anchor,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        relative = absolute.relative_to(absolute.anchor).as_posix()
+        descriptor = os.dup(anchor) if relative == "." else _open_relative(anchor, relative, directory=True)
+    except (OSError, BridgeError) as error:
+        raise BridgeError("invalid_snapshot", "Could not open capture root without following links") from error
+    finally:
+        if anchor is not None:
+            os.close(anchor)
+    info = os.fstat(descriptor)
+    if not stat.S_ISDIR(info.st_mode):
+        os.close(descriptor)
+        raise BridgeError("invalid_snapshot", "Capture root must be a directory")
+    return descriptor
+
+
+def _open_relative(root_fd: int, name: str, *, directory: bool = False) -> int:
+    parts = name.split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise BridgeError("invalid_snapshot", "Captured paths must stay inside the workspace")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    current = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            next_descriptor = os.open(part, directory_flags, dir_fd=current)
+            os.close(current)
+            current = next_descriptor
+        # A regular file can become a FIFO after enumeration; do not wait for a writer.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        if directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        return os.open(parts[-1], flags, dir_fd=current)
+    except OSError as error:
+        raise BridgeError("snapshot_changed", f"Captured path changed during capture: {name!r}") from error
+    finally:
+        os.close(current)
+
+
+def _open_source_regular(root_fd: int, name: str) -> tuple[int, os.stat_result]:
+    descriptor = _open_relative(root_fd, name)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise BridgeError("snapshot_changed", f"Captured file is no longer regular: {name!r}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, info
+
+
+def _regular_digest(root_fd: int, name: str) -> tuple[str, int]:
+    descriptor, before = _open_source_regular(root_fd, name)
+    try:
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if file_identity(before) != file_identity(after):
+        raise BridgeError("snapshot_changed", "A captured file changed during capture")
+    return digest.hexdigest(), stat.S_IMODE(before.st_mode)
+
+
+def _retain_regular(
+    root_fd: int, name: str, target: Path, expected_sha256: str, expected_mode: int,
+) -> None:
+    descriptor, before = _open_source_regular(root_fd, name)
+    try:
+        if stat.S_IMODE(before.st_mode) != expected_mode:
+            raise BridgeError("snapshot_changed", "A captured file changed during capture")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        digest = hashlib.sha256()
+        with target.open("xb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                stream.write(block)
+            stream.flush()
+            os.fsync(stream.fileno())
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if file_identity(before) != file_identity(after):
+        raise BridgeError("snapshot_changed", "A captured file changed during capture")
+    with target.open("rb") as stream:
+        stored = hashlib.file_digest(stream, "sha256").hexdigest()
+    if digest.hexdigest() != expected_sha256 or stored != expected_sha256:
+        raise BridgeError("snapshot_changed", "A captured file changed during capture")
+
+
+def _capture_tree(root_fd: int) -> list[tuple[str, str, str | None]]:
+    entries: list[tuple[str, str, str | None]] = []
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+    def visit(directory_fd: int, prefix: str) -> None:
+        try:
+            with os.scandir(directory_fd) as iterator:
+                for entry in iterator:
+                    name = entry.name
+                    relative = f"{prefix}/{name}" if prefix else name
+                    try:
+                        if entry.is_symlink():
+                            entries.append((relative, "symlink", os.readlink(name, dir_fd=directory_fd)))
+                        elif entry.is_dir(follow_symlinks=False):
+                            child = os.open(name, directory_flags, dir_fd=directory_fd)
+                            try:
+                                info = os.fstat(child)
+                                if not stat.S_ISDIR(info.st_mode):
+                                    raise BridgeError(
+                                        "snapshot_changed", f"Captured directory changed during capture: {relative!r}",
+                                    )
+                                visit(child, relative)
+                            finally:
+                                os.close(child)
+                        elif entry.is_file(follow_symlinks=False):
+                            entries.append((relative, "file", None))
+                    except OSError as error:
+                        raise BridgeError(
+                            "snapshot_changed", f"Captured path changed during capture: {relative!r}",
+                        ) from error
+        except OSError as error:
+            raise BridgeError("snapshot_changed", f"Could not scan captured workspace: {error}") from error
+
+    visit(root_fd, "")
+    return entries
+
+
 def capture_patch(directory, destination, workspace=None):
     if workspace and workspace.get("kind") == "copy":
-        changes, current = {}, set()
         root = Path(directory)
-        for path in root.rglob("*"):
-            name = path.relative_to(root).as_posix()
-            if path.is_symlink():
-                changes[name] = {"symlink": os.readlink(path)}
-                current.add(name)
-            elif path.is_file():
-                current.add(name)
-                with path.open("rb") as stream:
-                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
-                mode = stat.S_IMODE(path.stat().st_mode)
+        root_fd = _capture_root(root)
+        try:
+            entries = _capture_tree(root_fd)
+            changes, regular = {}, {}
+            current = {name for name, _, _ in entries}
+            for name, kind, symlink_target in entries:
+                if kind == "symlink":
+                    changes[name] = {"symlink": symlink_target}
+                    continue
+                digest, mode = _regular_digest(root_fd, name)
                 original = workspace["files"].get(name, {})
                 if original.get("sha256") != digest or original.get("mode") != mode:
-                    changes[name] = {"sha256": digest, "mode": mode, "path": str(path)}
-        for name in workspace["files"].keys() - current:
-            changes[name] = {"deleted": True}
-        destination = destination.with_suffix(".files.json")
-        save_manifest(destination, changes)
+                    regular[name] = (digest, mode)
+            for name in workspace["files"].keys() - current:
+                changes[name] = {"deleted": True}
+            retained = None
+            try:
+                if regular:
+                    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    retained = Path(tempfile.mkdtemp(prefix=destination.name + ".files-", dir=destination.parent))
+                    for name, (digest, mode) in regular.items():
+                        target = retained / "files" / name
+                        _retain_regular(root_fd, name, target, digest, mode)
+                        changes[name] = {
+                            "sha256": digest,
+                            "mode": mode,
+                            "path": str(target),
+                            "source_path": str(root / name),
+                        }
+                destination = destination.with_suffix(".files.json")
+                save_manifest(destination, changes)
+            except BaseException:
+                if retained is not None:
+                    shutil.rmtree(retained, ignore_errors=True)
+                raise
+        finally:
+            os.close(root_fd)
         names = list(changes)
         result = {"patch": None, "changes": str(destination), "workspace": directory,
                   "changed_files": [_display_path(name) for name in names]}

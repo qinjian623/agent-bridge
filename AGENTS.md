@@ -1,47 +1,49 @@
+> Language: English | [中文](docs/zh/AGENTS.md)
+
 # Repository Guidelines
 
-## 项目结构
+## Project Structure
 
-- `src/agent_bridge/`：Python 源码。`cli.py` 和 `mcp_server.py` 提供入口，`broker.py` 管理请求，`worker.py` 执行任务，`store.py` 保存 SQLite 数据。
-- `tests/`：自动测试；`tests/fixtures/` 提供模拟 Codex、Antigravity CLI。
-- `scripts/`：本机安装、smoke 检查、基准测试和任务记录工具。
-- `docs/`：设计说明与检查记录；`skills/cli-agent-bridge/`：配套 skill 和提示词资源。
+- `src/agent_bridge/`: Python source code. `cli.py` and `mcp_server.py` provide entrypoints, `broker.py` manages requests, `worker.py` runs tasks, `init_config.py` drives interactive/non-interactive configuration, `updater.py` handles verified GitHub Releases OTA updates, and `store.py` persists SQLite state.
+- `tests/`: Automated tests; `tests/fixtures/` provides mock Codex and Antigravity CLIs.
+- `scripts/`: Local install, smoke check, benchmark, and task ledger helpers.
+- `docs/`: English design specs and verification records; `docs/zh/`: Chinese translations and mirrored documentation; `skills/cli-agent-bridge/`: companion skill and prompt resources.
 
-## 安装、运行与检查
+## Installation, Running, and Checks
 
-需要 Python 3.11+ 和 uv；运行本机服务还需要 Linux 用户级 systemd，调用真实模型需要对应 CLI 已完成登录。
+Requires Python 3.11+ and `uv`; managed user service features require Linux user-level `systemd` (or macOS `launchd`), and calling real models requires logging in via the target CLI beforehand.
 
 ```bash
-uv sync --locked                         # 按 uv.lock 安装依赖
-uv run agent-bridge init                 # 初始化本机配置
-uv run agent-bridge doctor               # 检查配置与运行环境
-uv run agent-bridge serve                # 前台运行 broker
+uv sync --locked                         # Install dependencies pinned in uv.lock
+uv run agent-bridge init                 # Initialize or edit local configuration interactively
+uv run agent-bridge doctor               # Check configuration and runtime environment
+uv run agent-bridge serve                # Run the broker in the foreground
 uv run python -m unittest discover -s tests -v
 uv run ruff check src tests scripts
 ```
 
-后两条命令分别运行完整自动测试和静态检查。从仓库根目录执行命令；修改依赖时同步更新 `pyproject.toml` 与 `uv.lock`。
+The final two commands run the full automated test suite and static lint checks. Run commands from the repository root; when changing dependencies, update both `pyproject.toml` and `uv.lock`.
 
-## 代码风格与命名
+## Code Style and Naming
 
-使用四空格缩进。模块、函数和变量采用 `snake_case`，类采用 `PascalCase`；保持现有类型标注和错误处理写法。Ruff 配置位于 `pyproject.toml`，目标版本为 Python 3.11，行长参考值为 120，未启用行长错误检查。沿用已有模块中的函数，避免为单次用途增加包装。
+Use 4-space indentation. Modules, functions, and variables use `snake_case`; classes use `PascalCase`; preserve existing type annotations and error-handling conventions. Ruff configuration lives in `pyproject.toml` (target Python 3.11, reference line length 120 without `E501` enforcement). Reuse existing helper functions rather than adding single-use wrappers.
 
-## 测试要求
+## Testing Requirements
 
-使用 `unittest.TestCase`；异步测试使用 `unittest.IsolatedAsyncioTestCase`。文件命名为 `tests/test_<module>.py`，方法命名为 `test_<behavior>`。单独检查示例：
+Use `unittest.TestCase`, and `unittest.IsolatedAsyncioTestCase` for async tests. Name files `tests/test_<module>.py` and methods `test_<behavior>`. Example targeted run:
 
 ```bash
 uv run python -m unittest discover -s tests -p 'test_store.py' -v
 ```
 
-修复缺陷时补充能重现问题的测试。涉及请求重试、并发或进程退出时，检查重复执行和结果保存行为。使用临时状态目录、模拟 CLI 与 mock；项目未设置覆盖率百分比要求。真实 CLI smoke 可能产生费用或操作会话，运行前核实脚本行为和目标。
+Add regression tests reproducing bugs when fixing defects. For request retry, concurrency, or process exit changes, verify idempotency and state persistence. Use temporary state directories, mock CLIs, and mocks; no percentage coverage threshold is enforced. Real CLI smoke scripts may incur model API charges or affect real sessions—verify script arguments and targets before running them.
 
-## 提交与 Pull Request
+## Commits and Pull Requests
 
-现有提交使用简短的英文祈使句，例如 `Add session groups and broadcast to bridge and native sessions`；沿用 `Add …`、`Fix …` 等写法。一次提交只包含相关修改。
+Use short imperative English commit subjects following existing history (for example, `Add session groups and broadcast to bridge and native sessions`, `Fix ...`). Keep each commit focused on related changes.
 
-PR 说明具体问题、修改后的行为、执行过的检查及结果；有相关 issue 时附链接。接口、配置或命令变化应更新 README 和对应文档。区分模拟测试结果与真实 CLI 检查结果。
+Pull requests should describe the problem, updated behavior, checks executed, and observed results; link related issues when applicable. Update `README.md` (and `docs/zh/` translations where appropriate) whenever interfaces, configuration, or commands change. Clearly separate simulated test results from real-CLI verification results.
 
-## 配置与私有数据
+## Configuration and Private Data
 
-默认状态目录为 `~/.local/state/cli-agent-bridge`；隔离检查可使用 `agent-bridge --state /tmp/bridge-check …`。不要提交密钥、认证文件、运行数据库、原始聊天记录或屏幕录制。配置引用的 `env_file` 应仅属主可读写（`0600`）。安装脚本会创建命令链接和用户服务；修改代码后不要顺手重启现有服务或向真实会话发送消息。
+The default state directory is `~/.local/state/cli-agent-bridge`; use `agent-bridge --state /tmp/bridge-check ...` for isolated checks. Never commit API keys, credential files, runtime SQLite databases, raw chat transcripts, or screen recordings. Referenced `env_file` files must be owner-only readable/writable (`0600`). Installation helpers create command links and user services; do not casually restart already-running user services or message real sessions while editing code.

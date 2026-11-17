@@ -79,505 +79,885 @@ _HTML_HEAD = """<!DOCTYPE html>
   <title>cli-agent-bridge | Multi-Agent Monitor</title>
   <style>
     :root {
-      --bg: #0d1117;
-      --card-bg: #161b22;
-      --card-border: #30363d;
-      --card-hover: #1c2128;
-      --text: #e6edf3;
-      --text-muted: #8b949e;
-      --accent: #58a6ff;
-      --green: #3fb950;
-      --green-bg: rgba(63, 185, 80, 0.15);
-      --yellow: #d29922;
-      --yellow-bg: rgba(210, 153, 34, 0.15);
-      --red: #f85149;
-      --red-bg: rgba(248, 81, 73, 0.15);
-      --blue: #388bfd;
-      --blue-bg: rgba(56, 139, 253, 0.15);
-      --purple: #bc8cff;
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --surface-muted: #f0f2f5;
+      --surface-hover: #f6f8fa;
+      --border: #d8dee4;
+      --border-strong: #c7d0d9;
+      --text: #1f2328;
+      --text-muted: #59636e;
+      --text-subtle: #6e7781;
+      --accent: #0969da;
+      --accent-soft: #ddf4ff;
+      --green: #1a7f37;
+      --green-soft: #dafbe1;
+      --yellow: #8a5a00;
+      --yellow-soft: #fff8c5;
+      --red: #cf222e;
+      --red-soft: #ffebe9;
+      --purple: #8250df;
+      --purple-soft: #fbefff;
+      --topo-bg: #0d1117;
+      --shadow: 0 1px 2px rgba(31, 35, 40, 0.05);
+      --radius: 10px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --surface: #161b22;
+        --surface-muted: #1c2128;
+        --surface-hover: #1f2630;
+        --border: #30363d;
+        --border-strong: #3d444d;
+        --text: #e6edf3;
+        --text-muted: #9ba7b4;
+        --text-subtle: #8b949e;
+        --accent: #58a6ff;
+        --accent-soft: rgba(56, 139, 253, 0.16);
+        --green: #3fb950;
+        --green-soft: rgba(63, 185, 80, 0.16);
+        --yellow: #d29922;
+        --yellow-soft: rgba(210, 153, 34, 0.16);
+        --red: #f85149;
+        --red-soft: rgba(248, 81, 73, 0.16);
+        --purple: #bc8cff;
+        --purple-soft: rgba(188, 140, 255, 0.16);
+        --topo-bg: #090d13;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.32);
+      }
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { min-height: 100%; }
     body {
-      background-color: var(--bg);
+      min-height: 100vh;
+      background: var(--bg);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      font-size: 13px;
+      font-size: 14px;
       line-height: 1.5;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
     }
-    header {
-      background: var(--card-bg);
-      border-bottom: 1px solid var(--card-border);
+    button, input { font: inherit; }
+    button { touch-action: manipulation; }
+    a { color: var(--accent); }
+    .skip-link {
+      position: absolute;
+      left: 12px;
+      top: -60px;
+      z-index: 1000;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .skip-link:focus { top: 12px; }
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    [hidden] { display: none !important; }
+
+    /* Header */
+    .app-header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .header-inner {
+      width: 100%;
+      max-width: 1440px;
+      margin: 0 auto;
       padding: 12px 24px;
       display: flex;
       justify-content: space-between;
       align-items: center;
-      position: sticky;
-      top: 0;
-      z-index: 100;
+      gap: 16px;
+      flex-wrap: wrap;
     }
     .brand {
       display: flex;
       align-items: center;
-      gap: 12px;
-      font-size: 16px;
-      font-weight: 600;
-      color: #fff;
+      gap: 10px;
+      min-width: 0;
+      flex: 1 1 340px;
     }
     .brand .logo {
-      width: 24px;
-      height: 24px;
-      background: linear-gradient(135deg, var(--accent), var(--purple));
-      border-radius: 6px;
+      width: 32px;
+      height: 32px;
+      flex: 0 0 auto;
+      background: var(--accent);
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      font-size: 13px;
+      font-weight: 800;
+      color: #fff;
+    }
+    .brand-copy {
       display: flex;
+      flex-direction: column;
+      min-width: 0;
+      line-height: 1.25;
+    }
+    .brand-name {
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .brand-sub {
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+    .coord-badge {
+      color: var(--text-muted);
+      background: var(--surface-muted);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 11px;
+      font-weight: 500;
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .connection-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 32px;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .connection-status::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: var(--text-subtle);
+    }
+    .connection-status[data-state="live"]::before { background: var(--green); }
+    .connection-status[data-state="stale"]::before { background: var(--yellow); }
+    .connection-status[data-state="error"]::before { background: var(--red); }
+    .connection-status[data-state="live"] { color: var(--green); }
+    .connection-status[data-state="stale"] { color: var(--yellow); }
+    .connection-status[data-state="error"] { color: var(--red); }
+
+    /* Buttons */
+    .btn {
+      min-height: 36px;
+      padding: 0 14px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      display: inline-flex;
       align-items: center;
       justify-content: center;
-      font-size: 12px;
-      color: #fff;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background-color 0.15s, border-color 0.15s, color 0.15s;
     }
-    .nav-stats {
-      display: flex;
-      gap: 20px;
-      align-items: center;
+    .btn:hover { filter: brightness(1.06); }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; filter: none; }
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border-color: var(--border-strong);
     }
-    .stat-pill {
-      display: flex;
-      flex-direction: column;
-      align-items: flex-end;
+    .btn-secondary:hover { background: var(--surface-muted); filter: none; }
+    .btn-danger {
+      background: transparent;
+      color: var(--red);
+      border-color: var(--border-strong);
     }
-    .stat-pill .val { font-size: 15px; font-weight: 700; color: #fff; }
-    .stat-pill .lbl { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .btn-danger:hover { background: var(--red-soft); border-color: var(--red); filter: none; }
+    .btn-sm { min-height: 32px; padding: 0 10px; font-size: 12px; }
 
+    /* Layout */
     main {
-      padding: 24px;
+      width: 100%;
       max-width: 1440px;
       margin: 0 auto;
+      padding: 24px;
       display: flex;
       flex-direction: column;
       gap: 20px;
     }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .stat-card {
+      min-width: 0;
+      padding: 13px 15px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+    .stat-label {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .stat-value {
+      display: block;
+      color: var(--text);
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.2;
+      font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere;
+    }
+    .stat-value.is-unknown { color: var(--yellow); font-size: 16px; line-height: 1.65; }
 
-    /* Alert Banner */
-    .alert-banner {
-      background: var(--yellow-bg);
-      border: 1px solid var(--yellow);
-      border-radius: 8px;
-      padding: 14px 18px;
+    /* Filters and runtime cards */
+    .toolbar {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      gap: 16px;
-      margin-bottom: 12px;
+      gap: 14px;
+      flex-wrap: wrap;
     }
-    .alert-banner.danger {
-      background: var(--red-bg);
-      border-color: var(--red);
-    }
-    .alert-title { font-weight: 600; color: #fff; margin-bottom: 2px; }
-    .alert-actions { display: flex; gap: 8px; flex: 0 0 auto; }
-    .btn {
-      background: var(--green);
-      color: #fff;
-      border: none;
-      padding: 6px 14px;
-      border-radius: 6px;
-      cursor: pointer;
+    .filter-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+    .filter-label { color: var(--text-muted); font-size: 12px; font-weight: 700; }
+    .filter-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .chip-btn {
+      min-height: 32px;
+      padding: 0 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--text-muted);
       font-size: 12px;
       font-weight: 600;
-      transition: opacity 0.2s;
+      cursor: pointer;
+      transition: background-color 0.15s, border-color 0.15s, color 0.15s;
     }
-    .btn:hover { opacity: 0.9; }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .btn-secondary {
-      background: var(--card-border);
-      color: var(--text);
+    .chip-btn:hover { background: var(--surface-muted); color: var(--text); }
+    .chip-btn.active {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent);
     }
-    .btn-danger {
-      background: var(--red);
-      color: #fff;
-    }
-
-    /* Grid Layout */
-    .grid-2 {
+    .runtime-grid {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
     }
-    @media (max-width: 1024px) {
-      .grid-2 { grid-template-columns: 1fr; }
-    }
-
-    .card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      overflow: hidden;
+    .runtime-card {
+      min-width: 0;
+      min-height: 98px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: var(--shadow);
+      cursor: pointer;
+      text-align: left;
       display: flex;
       flex-direction: column;
+      gap: 5px;
+      transition: background-color 0.15s, border-color 0.15s;
     }
-    .card-header {
-      padding: 12px 16px;
-      border-bottom: 1px solid var(--card-border);
-      font-weight: 600;
+    .runtime-card:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+    .runtime-card.selected { border-color: var(--accent); background: var(--accent-soft); }
+    .runtime-card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .runtime-title { font-weight: 700; font-size: 14px; color: var(--text); overflow-wrap: anywhere; }
+    .runtime-live { flex: 0 0 auto; font-size: 12px; font-weight: 700; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .runtime-live.has-live { color: var(--green); }
+    .runtime-meta {
+      color: var(--text-muted);
+      font-size: 11px;
       display: flex;
       justify-content: space-between;
-      align-items: center;
-      background: rgba(255,255,255,0.02);
-    }
-    .card-body {
-      padding: 16px;
-      flex: 1;
-      overflow-x: auto;
+      gap: 8px;
+      flex-wrap: wrap;
     }
 
-    /* Topology SVG */
+    /* Cards and tables */
+    .card {
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .card-heading { min-width: 0; }
+    .card-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+    .card-subtitle {
+      margin-top: 3px;
+      color: var(--text-muted);
+      font-size: 12px;
+      max-width: 820px;
+    }
+    .card-meta {
+      flex: 0 0 auto;
+      color: var(--text-muted);
+      font-size: 12px;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .card-body { padding: 16px; }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 20px;
+    }
+
+    .table-frame {
+      width: 100%;
+      max-height: 380px;
+      overflow: auto;
+      overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
+    }
+    .table-frame:focus-visible,
+    .log-container:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+    .table-frame--hosts { max-height: 340px; }
+    .table-frame--sessions,
+    .table-frame--broadcasts { max-height: 420px; }
+    .table-frame--native { max-height: 360px; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; text-align: left; }
+    .data-table { font-size: 13px; }
+    .data-table--hosts { min-width: 1020px; }
+    .data-table--sessions { min-width: 760px; }
+    .data-table--broadcasts { min-width: 650px; }
+    .data-table--native { min-width: 780px; }
+    .data-table--native td:nth-child(3) { max-width: 340px; }
+    .data-table--native td:nth-child(3) .cell-title { overflow-wrap: anywhere; }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      padding: 9px 12px;
+      background: var(--surface-muted);
+      border-bottom: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: var(--surface-hover); }
+    .empty-cell {
+      padding: 28px 16px !important;
+      color: var(--text-muted);
+      text-align: center;
+    }
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--surface-muted);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .cell-title { color: var(--text); font-weight: 700; font-size: 13px; overflow-wrap: anywhere; }
+    .cell-meta { color: var(--text-muted); font-size: 11px; margin-top: 2px; overflow-wrap: anywhere; }
+    .cell-goal,
+    .cell-kind { max-width: 280px; }
+    .cell-goal-text,
+    .cell-kind-text {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .cell-cost { color: var(--yellow); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .cell-cost.is-empty { color: var(--text-muted); }
+    .cell-muted { color: var(--text-muted); }
+
+    /* Badges */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      max-width: 100%;
+      padding: 3px 8px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.45;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .badge::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: currentColor;
+      opacity: 0.75;
+    }
+    .badge-running,
+    .badge-worker,
+    .badge-online { background: var(--green-soft); color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, transparent); }
+    .badge-idle { background: var(--accent-soft); color: var(--accent); }
+    .badge-waiting { background: var(--yellow-soft); color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
+    .badge-stopped,
+    .badge-unknown { background: var(--surface-muted); color: var(--text-muted); border-color: var(--border); }
+    .badge-offline { background: var(--red-soft); color: var(--red); border-color: color-mix(in srgb, var(--red) 35%, transparent); }
+    .badge-review { background: var(--purple-soft); color: var(--purple); border-color: color-mix(in srgb, var(--purple) 35%, transparent); }
+    .badge-recovery { background: var(--yellow-soft); color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
+    .badge-native { background: var(--purple-soft); color: var(--purple); border-color: color-mix(in srgb, var(--purple) 30%, transparent); }
+    .badge-node {
+      max-width: 170px;
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .badge-node::before { display: none; }
+    .badge-coord { background: var(--purple-soft); color: var(--purple); border-color: color-mix(in srgb, var(--purple) 35%, transparent); }
+
+    /* Alerts and approvals */
+    .connection-banner {
+      padding: 11px 14px;
+      border: 1px solid color-mix(in srgb, var(--yellow) 55%, var(--border));
+      border-radius: 8px;
+      background: var(--yellow-soft);
+      color: var(--text);
+      font-size: 13px;
+    }
+    .approval-section { display: flex; flex-direction: column; gap: 10px; }
+    .alert-banner {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      flex-wrap: wrap;
+      padding: 14px 16px;
+      border: 1px solid color-mix(in srgb, var(--yellow) 55%, var(--border));
+      border-radius: 8px;
+      background: var(--yellow-soft);
+    }
+    .alert-banner.danger { border-color: var(--red); background: var(--red-soft); }
+    .alert-info { flex: 1 1 360px; min-width: 0; }
+    .alert-title { color: var(--text); font-weight: 700; margin-bottom: 3px; overflow-wrap: anywhere; }
+    .alert-detail { color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+    .alert-detail code { white-space: pre-wrap; background: var(--surface); }
+    .alert-actions { display: flex; gap: 8px; flex: 0 0 auto; flex-wrap: wrap; }
+
+    /* Topology */
     .topo-container {
       width: 100%;
       height: 240px;
-      background: #090d13;
-      border-radius: 6px;
+      background: var(--topo-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
       position: relative;
       overflow-x: auto;
+      overflow-y: hidden;
+      overscroll-behavior-x: contain;
     }
     .topo-container:focus-visible {
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
     svg.topo-svg {
-      width: 100%;
+      display: block;
       height: 100%;
+      min-width: 100%;
     }
-
-    /* Tables */
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      text-align: left;
-    }
-    th {
+    .scope-note {
+      margin: 9px 2px 0;
       color: var(--text-muted);
-      font-weight: 500;
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--card-border);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-    }
-    td {
-      padding: 10px;
-      border-bottom: 1px solid rgba(48, 54, 61, 0.5);
-      vertical-align: middle;
-    }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: var(--card-hover); }
-
-    /* Badges */
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-    }
-    .badge-running { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
-    .badge-idle { background: var(--blue-bg); color: var(--blue); }
-    .badge-waiting { background: var(--yellow-bg); color: var(--yellow); border: 1px solid var(--yellow); animation: pulse 1.5s infinite; }
-    .badge-stopped { background: rgba(139, 148, 158, 0.15); color: var(--text-muted); }
-    .badge-online { background: var(--green-bg); color: var(--green); }
-    .badge-offline { background: var(--red-bg); color: var(--red); }
-    .badge-node { background: rgba(56, 139, 253, 0.15); color: var(--accent); border: 1px solid rgba(88, 166, 255, 0.3); font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
-    .badge-coord { background: rgba(188, 140, 255, 0.15); color: var(--purple); border: 1px solid rgba(188, 140, 255, 0.3); }
-    .btn-sm { padding: 3px 8px; font-size: 11px; }
-
-    @keyframes pulse {
-      0% { opacity: 1; }
-      50% { opacity: 0.5; }
-      100% { opacity: 1; }
-    }
-
-    /* Event Log */
-    .log-container {
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
       font-size: 12px;
-      max-height: 260px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
+      line-height: 1.55;
     }
-    .log-entry {
-      display: flex;
-      gap: 12px;
-      padding: 4px 8px;
-      border-radius: 4px;
-      background: rgba(0,0,0,0.2);
-    }
-    .log-time { color: var(--text-muted); min-width: 60px; }
-    .log-kind { color: var(--accent); min-width: 120px; font-weight: 600; }
-    .log-msg { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-    .pulse-dot {
+    .status-dot {
       display: inline-block;
       width: 8px;
       height: 8px;
+      flex: 0 0 auto;
       border-radius: 50%;
       background: var(--green);
-      margin-right: 6px;
-      box-shadow: 0 0 8px var(--green);
     }
-    .empty-cell { text-align: center; color: var(--text-muted); }
 
-    /* Runtime summary cards & filters */
-    .runtime-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 12px;
-    }
-    @media (max-width: 900px) {
-      .runtime-grid { grid-template-columns: repeat(2, 1fr); }
-    }
-    .runtime-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      padding: 12px 14px;
-      cursor: pointer;
-      text-align: left;
-      color: var(--text);
-      transition: border-color 0.15s, background 0.15s;
-    }
-    .runtime-card:hover { background: var(--card-hover); border-color: var(--accent); }
-    .runtime-card.selected { border-color: var(--accent); background: rgba(56, 139, 253, 0.10); }
-    .runtime-card-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-    .runtime-title { font-weight: 700; font-size: 14px; text-transform: uppercase; color: #fff; }
-    .runtime-live { font-size: 12px; font-weight: 700; color: var(--green); }
-    .runtime-live.zero { color: var(--text-muted); }
-    .runtime-meta { font-size: 11px; color: var(--text-muted); display: flex; justify-content: space-between; gap: 8px; }
-    .filter-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
-    .filter-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-    .chip-btn {
-      background: var(--card-bg);
-      color: var(--text-muted);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 4px 12px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .chip-btn.active { background: var(--blue-bg); color: var(--accent); border-color: var(--accent); }
-    .badge-worker { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
-    .badge-native { background: rgba(188, 140, 255, 0.15); color: var(--purple); }
-    .api-bar {
-      font-size: 11px;
-      color: var(--text-muted);
-      padding: 10px 14px;
-      border: 1px dashed var(--card-border);
-      border-radius: 8px;
+    /* Events */
+    .log-container {
+      max-height: 280px;
+      overflow: auto;
       display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
+      flex-direction: column;
+      gap: 4px;
+      overscroll-behavior: contain;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
     }
-    .api-bar code { color: var(--accent); background: rgba(56, 139, 253, 0.08); padding: 1px 6px; border-radius: 4px; }
+    .log-entry {
+      display: grid;
+      grid-template-columns: 72px 142px minmax(0, 1fr);
+      gap: 10px;
+      padding: 6px 8px;
+      border-radius: 5px;
+      background: var(--surface-muted);
+    }
+    .log-time { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .log-kind { color: var(--accent); font-weight: 700; overflow-wrap: anywhere; }
+    .log-msg { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
+    .empty-log { padding: 10px 2px; color: var(--text-muted); }
+
+    /* Integration reference */
+    .api-bar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+    .api-bar .api-label { color: var(--text-muted); font-weight: 700; }
+    .api-bar code {
+      color: var(--accent);
+      background: var(--accent-soft);
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 1100px) {
+      .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .runtime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-2 { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (max-width: 680px) {
+      .header-inner { padding: 10px 16px; align-items: flex-start; }
+      .brand { flex-basis: 100%; flex-wrap: wrap; }
+      .coord-badge { max-width: 100%; }
+      .header-actions { width: 100%; justify-content: space-between; }
+      .connection-status { order: -1; width: 100%; }
+      main { padding: 16px; gap: 14px; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .stat-card { padding: 12px; }
+      .stat-value { font-size: 20px; }
+      .toolbar { align-items: stretch; flex-direction: column; }
+      .filter-group { justify-content: space-between; }
+      .filter-chips { width: 100%; }
+      .chip-btn { flex: 1 1 auto; }
+      .card-header { padding: 12px 14px; }
+      .card-body { padding: 14px; }
+      .card-meta { white-space: normal; }
+      .table-frame { max-height: 62vh; }
+      .btn,
+      .btn-sm,
+      .chip-btn { min-height: 44px; }
+      .alert-actions { width: 100%; }
+      .alert-actions .btn { flex: 1 1 0; }
+      .log-entry { grid-template-columns: minmax(0, 1fr); gap: 1px; padding: 8px; }
+      .log-kind { font-size: 11px; }
+    }
+    @media (max-width: 380px) {
+      .runtime-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+        scroll-behavior: auto !important;
+      }
+    }
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#main">Skip to dashboard</a>
 """
-_HTML_BODY = """  <header>
-    <div class="brand">
-      <div class="logo">⚡</div>
-      <span>cli-agent-bridge Monitor</span>
-      <span id="coordBadge" style="font-size: 11px; color: var(--text-muted); font-weight: normal; margin-left: 8px;"></span>
-    </div>
-    <div class="nav-stats">
-      <div class="stat-pill">
-        <span class="val" id="statNodes">1/1</span>
-        <span class="lbl">Cluster Nodes</span>
+_HTML_BODY = """  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">B</div>
+        <div class="brand-copy">
+          <span class="brand-name">cli-agent-bridge Monitor</span>
+          <span class="brand-sub">Operations dashboard</span>
+        </div>
+        <span id="coordBadge" class="coord-badge"></span>
       </div>
-      <div class="stat-pill">
-        <span class="val" id="statActive">0</span>
-        <span class="lbl">Bridge Active</span>
-      </div>
-      <div class="stat-pill">
-        <span class="val" id="statNative">0</span>
-        <span class="lbl">Native Live</span>
-      </div>
-      <div class="stat-pill">
-        <span class="val" id="statTasks">0</span>
-        <span class="lbl">Running Tasks</span>
-      </div>
-      <div class="stat-pill">
-        <span class="val" id="statBroadcasts">0</span>
-        <span class="lbl">Broadcasts</span>
-      </div>
-      <div class="stat-pill">
-        <span class="val" id="statCost">$0.00</span>
-        <span class="lbl">Total Cost</span>
-      </div>
-      <div style="margin-left: 10px; display: flex; gap: 8px;">
-        <button class="btn btn-secondary" id="refreshBtn" type="button">↻ Refresh</button>
+      <div class="header-actions">
+        <span id="connectionStatus" class="connection-status" data-state="connecting" role="status" aria-live="polite">Connecting&hellip;</span>
+        <button class="btn btn-secondary" id="refreshBtn" type="button">Refresh</button>
         <button class="btn btn-danger" id="logoutBtn" type="button">Sign out</button>
       </div>
     </div>
   </header>
 
-  <main>
-    <!-- Pending Approvals Alert -->
-    <div id="approvalSection" style="display: none;"></div>
+  <main id="main" tabindex="-1">
+    <div id="connectionBanner" class="connection-banner" role="status" aria-live="polite" hidden></div>
+    <div id="approvalSection" class="approval-section" aria-label="Pending approvals" style="display: none;"></div>
 
-    <!-- Multi-Runtime Summary (pi / claude / agy / codex) -->
-    <div class="filter-bar">
-      <div class="filter-chips" id="runtimeFilterBar">
-        <button class="chip-btn active" type="button" data-runtime="all">All Runtimes</button>
-        <button class="chip-btn" type="button" data-runtime="pi">Pi</button>
-        <button class="chip-btn" type="button" data-runtime="claude">Claude</button>
-        <button class="chip-btn" type="button" data-runtime="antigravity">AGY</button>
-        <button class="chip-btn" type="button" data-runtime="codex">Codex</button>
+    <section class="summary-grid" aria-label="Snapshot summary">
+      <div class="stat-card">
+        <span class="stat-label">Hosts online</span>
+        <span class="stat-value" id="statNodes" title="Reachable Bridge execution hosts">&mdash;</span>
       </div>
-      <div class="filter-chips">
-        <button class="chip-btn" type="button" id="activeOnlyBtn">Active Only: OFF</button>
+      <div class="stat-card">
+        <span class="stat-label">Bridge workers</span>
+        <span class="stat-value" id="statActive" title="Bridge worker processes alive or waiting; idle workers are not executing a task">&mdash;</span>
       </div>
-    </div>
-    <div class="runtime-grid" id="runtimeGrid"></div>
+      <div class="stat-card">
+        <span class="stat-label">Native processes</span>
+        <span class="stat-value" id="statNative" title="Detected native CLI processes. Presence does not prove active inference.">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Tasks running</span>
+        <span class="stat-value" id="statTasks" title="Bridge tasks currently in the running state">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Broadcasts</span>
+        <span class="stat-value" id="statBroadcasts" title="Broadcast communications recorded in the snapshot">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Estimated cost</span>
+        <span class="stat-value" id="statCost" title="Reported cost for known attempts">&mdash;</span>
+      </div>
+    </section>
 
-    <!-- Cluster Topology Card -->
-    <div class="card">
+    <section class="toolbar" aria-label="Dashboard filters">
+      <div class="filter-group">
+        <span class="filter-label" id="runtimeFilterLabel">Runtime</span>
+        <div class="filter-chips" id="runtimeFilterBar" role="group" aria-labelledby="runtimeFilterLabel">
+          <button class="chip-btn active" type="button" data-runtime="all" aria-pressed="true">All runtimes</button>
+          <button class="chip-btn" type="button" data-runtime="pi" aria-pressed="false">Pi</button>
+          <button class="chip-btn" type="button" data-runtime="claude" aria-pressed="false">Claude</button>
+          <button class="chip-btn" type="button" data-runtime="antigravity" aria-pressed="false">AGY</button>
+          <button class="chip-btn" type="button" data-runtime="codex" aria-pressed="false">Codex</button>
+        </div>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label" id="viewFilterLabel">View</span>
+        <button class="chip-btn" type="button" id="activeOnlyBtn" aria-pressed="false" title="Hide stopped sessions and daemon processes">Active only</button>
+      </div>
+    </section>
+
+    <section aria-labelledby="runtimeOverviewTitle">
+      <h2 class="sr-only" id="runtimeOverviewTitle">Runtime overview</h2>
+      <div class="runtime-grid" id="runtimeGrid"></div>
+    </section>
+
+    <section class="card" aria-labelledby="topologyTitle">
       <div class="card-header">
-        <div><span class="pulse-dot"></span>Host Connections &amp; Live Bridge Sessions</div>
-        <div id="topoStats" style="font-size: 12px; color: var(--text-muted);"></div>
+        <div class="card-heading">
+          <h2 class="card-title" id="topologyTitle"><span class="status-dot" aria-hidden="true"></span>Host Connections &amp; Live Bridge Sessions</h2>
+          <p class="card-subtitle">SSH links and local Bridge workers. A live worker does not necessarily mean a task is executing.</p>
+        </div>
+        <div id="topoStats" class="card-meta"></div>
       </div>
-      <div class="card-body" style="padding: 10px;">
-        <div class="topo-container" tabindex="0" aria-label="Host connections; scroll horizontally if needed">
+      <div class="card-body">
+        <div class="topo-container" tabindex="0" role="group" aria-label="Host connections; scroll horizontally if needed" aria-describedby="topoScope">
           <svg class="topo-svg" id="topoGraph" aria-label="Host connections and live local Bridge sessions"></svg>
         </div>
-        <p id="topoScope" style="margin: 8px 4px 0; color: var(--text-muted); font-size: 12px;">
+        <p id="topoScope" class="scope-note">
           Host links show SSH connection status. Sessions shown: local Bridge workers with live processes.
-          Remote/native sessions and message traffic are not collected. (Live local native pi, claude, agy, codex processes appear in the Native Agents panel below.)
+          Remote/native sessions and message traffic are not collected. A live worker means the process exists; check the session status below for whether a task is executing.
         </p>
       </div>
-    </div>
+    </section>
 
-    <!-- Cluster Nodes Card -->
-    <div class="card">
+    <section class="card" aria-labelledby="hostsTitle">
       <div class="card-header">
-        <div>Cluster Nodes (Execution Hosts)</div>
-        <div id="hostStats" style="font-size: 12px; color: var(--text-muted);">1 node</div>
+        <div class="card-heading">
+          <h2 class="card-title" id="hostsTitle">Cluster Nodes (Execution Hosts)</h2>
+          <p class="card-subtitle">Coordinator and configured worker hosts. Link status is not a measure of model activity.</p>
+        </div>
+        <div id="hostStats" class="card-meta">1 node</div>
       </div>
-      <div class="card-body" style="max-height: 280px; overflow-y: auto;">
-        <table>
+      <div class="table-frame table-frame--hosts" tabindex="0" role="region" aria-label="Cluster nodes table; scroll horizontally if needed">
+        <table class="data-table data-table--hosts">
           <thead>
             <tr>
-              <th>Host ID</th>
-              <th>Role</th>
-              <th>Status</th>
-              <th>SSH Target</th>
-              <th>Node ID &amp; Generation</th>
-              <th>Managed Projects</th>
-              <th>Last Contact</th>
-              <th>Action</th>
+              <th scope="col">Host ID</th>
+              <th scope="col">Role</th>
+              <th scope="col">Status</th>
+              <th scope="col">SSH Target</th>
+              <th scope="col">Node ID &amp; Generation</th>
+              <th scope="col">Managed Projects</th>
+              <th scope="col">Last Contact</th>
+              <th scope="col">Action</th>
             </tr>
           </thead>
           <tbody id="hostTable">
-            <tr><td class="empty-cell" colspan="8">Loading cluster nodes...</td></tr>
+            <tr><td class="empty-cell" colspan="8">Loading cluster nodes&hellip;</td></tr>
           </tbody>
         </table>
       </div>
-    </div>
+    </section>
 
-    <!-- 2 Column Section -->
     <div class="grid-2">
-      <!-- Active Agents & Sessions -->
-      <div class="card">
+      <section class="card" aria-labelledby="sessionsTitle">
         <div class="card-header">
-          <div>Agents &amp; Active Sessions</div>
-          <div id="sessionCount" style="font-size: 12px; color: var(--text-muted);">0 sessions</div>
+          <div class="card-heading">
+            <h2 class="card-title" id="sessionsTitle">Agents &amp; Sessions</h2>
+            <p class="card-subtitle">Bridge status comes from worker and task state. Idle means no task is executing.</p>
+          </div>
+          <div id="sessionCount" class="card-meta">0 sessions</div>
         </div>
-        <div class="card-body" style="max-height: 420px; overflow-y: auto;">
-          <table>
+        <div class="table-frame table-frame--sessions" tabindex="0" role="region" aria-label="Agents and sessions table; scroll horizontally if needed">
+          <table class="data-table data-table--sessions">
             <thead>
               <tr>
-                <th>Agent / Session</th>
-                <th>Host</th>
-                <th>Runtime</th>
-                <th>Status</th>
-                <th>Goal / Task</th>
-                <th>Cost</th>
+                <th scope="col">Agent / Session</th>
+                <th scope="col">Host</th>
+                <th scope="col">Runtime</th>
+                <th scope="col">Status</th>
+                <th scope="col">Goal / Task</th>
+                <th scope="col">Cost</th>
               </tr>
             </thead>
             <tbody id="sessionTable">
-              <tr><td class="empty-cell" colspan="6">Loading agents...</td></tr>
+              <tr><td class="empty-cell" colspan="6">Loading agents and sessions&hellip;</td></tr>
             </tbody>
           </table>
         </div>
-      </div>
+      </section>
 
-      <!-- Communications & Groups -->
-      <div class="card">
+      <section class="card" aria-labelledby="broadcastsTitle">
         <div class="card-header">
-          <div>Communications &amp; Groups</div>
-          <div id="groupStats" style="font-size: 12px; color: var(--text-muted);">0 broadcasts</div>
+          <div class="card-heading">
+            <h2 class="card-title" id="broadcastsTitle">Communications &amp; Groups</h2>
+            <p class="card-subtitle">Broadcast delivery progress and recent group messages.</p>
+          </div>
+          <div id="groupStats" class="card-meta">0 broadcasts</div>
         </div>
-        <div class="card-body" style="max-height: 420px; overflow-y: auto;">
-          <table>
+        <div class="table-frame table-frame--broadcasts" tabindex="0" role="region" aria-label="Communications and groups table; scroll horizontally if needed">
+          <table class="data-table data-table--broadcasts">
             <thead>
               <tr>
-                <th>Broadcast / Group</th>
-                <th>Progress</th>
-                <th>Members</th>
-                <th>Message Preview</th>
-                <th>Age</th>
+                <th scope="col">Broadcast / Group</th>
+                <th scope="col">Progress</th>
+                <th scope="col">Members</th>
+                <th scope="col">Message Preview</th>
+                <th scope="col">Age</th>
               </tr>
             </thead>
             <tbody id="broadcastTable">
-              <tr><td class="empty-cell" colspan="5">No broadcasts yet</td></tr>
+              <tr><td class="empty-cell" colspan="5">No broadcasts recorded yet</td></tr>
             </tbody>
           </table>
         </div>
-      </div>
+      </section>
     </div>
 
-    <!-- Native CLI Processes & Workers -->
-    <div class="card">
+    <section class="card" aria-labelledby="nativeTitle">
       <div class="card-header">
-        <div>Native CLI Processes &amp; Workers (pi · claude · agy · codex)</div>
-        <div style="font-size: 11px; color: var(--text-muted);" id="nativeCount">0 native</div>
+        <div class="card-heading">
+          <h2 class="card-title" id="nativeTitle">Native CLI Processes &amp; Workers (pi &middot; claude &middot; agy &middot; codex)</h2>
+          <p class="card-subtitle">Process presence only. A detected process does not prove that the CLI is currently running inference.</p>
+        </div>
+        <div id="nativeCount" class="card-meta">0 native</div>
       </div>
-      <div class="card-body" style="max-height: 360px; overflow-y: auto;">
-        <table>
+      <div class="table-frame table-frame--native" tabindex="0" role="region" aria-label="Native CLI processes table; scroll horizontally if needed">
+        <table class="data-table data-table--native">
           <thead>
             <tr>
-              <th>Runtime</th>
-              <th>PID</th>
-              <th>Session / Title</th>
-              <th>Model</th>
-              <th>State</th>
-              <th>Kind / CWD</th>
+              <th scope="col">Runtime</th>
+              <th scope="col">PID</th>
+              <th scope="col">Session / Title</th>
+              <th scope="col">Model</th>
+              <th scope="col">Process</th>
+              <th scope="col">Kind / CWD</th>
             </tr>
           </thead>
           <tbody id="nativeTable">
-            <tr><td colspan="6" class="empty-cell">No native processes detected</td></tr>
+            <tr><td colspan="6" class="empty-cell">Loading native processes&hellip;</td></tr>
           </tbody>
         </table>
       </div>
-    </div>
+    </section>
 
-    <!-- Events Stream -->
-    <div class="card">
+    <section class="card" aria-labelledby="eventsTitle">
       <div class="card-header">
-        <div>Live Event Stream</div>
-        <div style="font-size: 11px; color: var(--text-muted);">Auto-updating</div>
+        <div class="card-heading">
+          <h2 class="card-title" id="eventsTitle">Live Event Stream</h2>
+          <p class="card-subtitle">Latest Bridge events from the current snapshot.</p>
+        </div>
+        <div class="card-meta">Auto-updating</div>
       </div>
       <div class="card-body">
-        <div class="log-container" id="eventLog">
-          <div style="color: var(--text-muted);">Waiting for events...</div>
+        <div class="log-container" id="eventLog" tabindex="0" role="region" aria-label="Event stream; scroll for older events" aria-live="off">
+          <div class="empty-log">Waiting for events&hellip;</div>
         </div>
       </div>
-    </div>
+    </section>
 
-    <!-- Integration API Reference -->
-    <div class="api-bar">
-      <span>Integration APIs:</span>
+    <section class="api-bar" aria-label="Integration APIs">
+      <span class="api-label">Integration APIs</span>
       <code>GET /api/v1/health</code>
       <code>GET /api/v1/runtimes</code>
       <code>GET /api/v1/sessions?runtime=all&amp;source=all&amp;status=active</code>
@@ -585,7 +965,7 @@ _HTML_BODY = """  <header>
       <code>GET /api/v1/stream</code>
       <code>GET /api/v1/schema</code>
       <code>GET /api/snapshot?runtime=agy</code>
-    </div>
+    </section>
   </main>
 
 """
@@ -598,6 +978,314 @@ _HTML_SCRIPT = """  <script>
     let selectedRuntime = 'all';
     let activeOnly = false;
     const approvalRequestIds = new Map();
+    let lastSuccessfulFetch = 0;
+    let lastFetchFailed = false;
+    let fetchInFlight = false;
+    let hasLoadedOnce = false;
+
+    function normalizeToken(value) {
+      return value === null || value === undefined ? '' : String(value).toLowerCase();
+    }
+
+    function bridgeStatus(session) {
+      const item = session || {};
+      const observed = normalizeToken(item.observed) || 'unknown';
+      const task = item.task && typeof item.task === 'object' ? item.task : {};
+      const taskStatus = normalizeToken(task.status);
+      const validation = normalizeToken(task.validation);
+      const alive = item.alive === true ? true : (item.alive === false ? false : null);
+
+      if (item.waiting_question || observed === 'waiting_input' || taskStatus === 'waiting_input') {
+        return {
+          label: item.waiting_question ? 'Waiting approval' : 'Waiting input',
+          tone: 'waiting',
+          detail: item.waiting_question
+            ? 'A tool permission request is waiting for a decision.'
+            : 'The Bridge task is waiting for input.'
+        };
+      }
+      if (observed === 'recovery_needed' || taskStatus === 'recovery_needed') {
+        return {
+          label: 'Recovery needed',
+          tone: 'recovery',
+          detail: 'Execution state is uncertain; inspect the session before retrying.'
+        };
+      }
+      if (taskStatus === 'completed') {
+        if (validation === 'pending') {
+          return {
+            label: 'Awaiting review',
+            tone: 'review',
+            detail: 'The task completed, but its result still needs review.'
+          };
+        }
+        if (validation === 'accepted') {
+          return { label: 'Completed \u00b7 accepted', tone: 'success', detail: 'The task completed and its result was accepted.' };
+        }
+        if (validation === 'rejected') {
+          return { label: 'Completed \u00b7 rejected', tone: 'danger', detail: 'The task completed, but its result was rejected.' };
+        }
+        return { label: 'Completed', tone: 'success', detail: 'The latest task completed.' };
+      }
+      if (taskStatus === 'failed' || taskStatus === 'interrupted' || taskStatus === 'cancelled') {
+        const label = taskStatus.charAt(0).toUpperCase() + taskStatus.slice(1);
+        return { label: label, tone: 'danger', detail: 'The latest Bridge task is ' + taskStatus + '.' };
+      }
+      if (alive === false) {
+        if (observed === 'stopped' || item.desired === 'closed') {
+          return { label: 'Stopped', tone: 'stopped', detail: 'The snapshot reports the Bridge worker process as not alive.' };
+        }
+        return { label: 'Worker offline', tone: 'danger', detail: 'The Bridge worker process is not alive; its task is not executing.' };
+      }
+      if (taskStatus === 'running' || taskStatus === 'assigned') {
+        return { label: 'Task running', tone: 'running', detail: 'The Bridge task is executing.' };
+      }
+      if (taskStatus === 'queued' || taskStatus === 'pending') {
+        return { label: 'Task queued', tone: 'idle', detail: 'A Bridge task is queued but not executing yet.' };
+      }
+      if (observed === 'running') {
+        return {
+          label: 'Worker running',
+          tone: 'running',
+          detail: 'The snapshot reports the Bridge worker as running; the task state is not reported.'
+        };
+      }
+      if (observed === 'idle') {
+        return {
+          label: 'Idle \u00b7 no task',
+          tone: 'idle',
+          detail: alive === true
+            ? 'The Bridge worker is alive, but no task is executing.'
+            : 'The snapshot reports the Bridge worker as idle; process liveness is not reported.'
+        };
+      }
+      if (observed === 'starting') {
+        return { label: 'Starting', tone: 'idle', detail: 'The snapshot reports the Bridge worker as starting.' };
+      }
+      if (observed === 'stopped') {
+        return { label: 'Stopped', tone: 'stopped', detail: 'The snapshot reports the Bridge worker as stopped.' };
+      }
+      if (alive === true) {
+        return { label: 'Worker alive', tone: 'idle', detail: 'The Bridge worker is alive; no executing task is reported.' };
+      }
+      return { label: 'Unknown', tone: 'unknown', detail: 'The snapshot does not report a reliable Bridge status.' };
+    }
+
+    function nativeProcessStatus(proc) {
+      const item = proc || {};
+      const kind = normalizeToken(item.kind);
+      const observed = normalizeToken(item.observed);
+      const alive = item.alive === true ? true : (item.alive === false ? false : null);
+      if (alive === false) {
+        return {
+          label: 'Process exited',
+          tone: 'stopped',
+          detail: 'The snapshot reports this native process as not alive.'
+        };
+      }
+      const liveness = alive === true
+        ? 'A native process is present.'
+        : 'The snapshot lists a native process, but its liveness is not reported.';
+      if (kind === 'daemon' || observed === 'daemon') {
+        return {
+          label: 'Daemon process',
+          tone: 'native',
+          detail: liveness + ' Its presence does not prove current inference.'
+        };
+      }
+      if (kind === 'worker' || observed === 'running') {
+        return {
+          label: 'Worker process',
+          tone: 'native',
+          detail: liveness + ' This does not prove it is currently inferencing.'
+        };
+      }
+      if (kind === 'interactive' || observed === 'active') {
+        return {
+          label: 'Interactive process',
+          tone: 'idle',
+          detail: liveness + ' It may be idle or waiting for input; its presence does not prove current inference.'
+        };
+      }
+      return {
+        label: 'Process present',
+        tone: 'native',
+        detail: liveness + ' Its presence does not prove current inference.'
+      };
+    }
+
+    function hostStatus(host) {
+      const state = normalizeToken(host && host.state) || 'unknown';
+      const statuses = {
+        online: { label: 'Online', tone: 'online', detail: 'The host link is online.' },
+        offline: { label: 'Offline', tone: 'offline', detail: 'The host link is offline.' },
+        identity_changed: { label: 'Identity changed', tone: 'recovery', detail: 'The host identity no longer matches the pinned identity.' },
+        state_corrupted: { label: 'State corrupted', tone: 'recovery', detail: 'The host state could not be verified.' }
+      };
+      return statuses[state] || {
+        label: 'Unknown',
+        tone: 'unknown',
+        detail: 'The host state is not reported; this is not treated as offline.'
+      };
+    }
+
+    function snapshotProvenance(data) {
+      const item = data && typeof data === 'object' ? data : {};
+      const raw = item.provenance && typeof item.provenance === 'object' && !Array.isArray(item.provenance)
+        ? item.provenance
+        : {};
+      const coordinator = item.coordinator && typeof item.coordinator === 'object' ? item.coordinator : {};
+      const source = normalizeToken(
+        raw.snapshot_source || raw.source || item.snapshot_source || coordinator.snapshot_source
+      ) || 'unknown';
+      const connectedValue = raw.broker_connected !== undefined
+        ? raw.broker_connected
+        : (item.broker_connected !== undefined ? item.broker_connected : coordinator.broker_connected);
+      let brokerConnected = null;
+      if (connectedValue === true || connectedValue === false) brokerConnected = connectedValue;
+      const brokerState = normalizeToken(
+        raw.broker_state || raw.connection_state || item.broker_state || coordinator.connection_state
+      );
+      if (brokerConnected === null) {
+        if (brokerState === 'connected') brokerConnected = true;
+        else if (brokerState === 'fallback' || brokerState === 'unavailable') brokerConnected = false;
+        else if (source === 'broker' || source === 'broker_rpc' || source === 'broker_local') brokerConnected = true;
+      }
+      const detail = typeof raw.detail === 'string' && raw.detail.trim() ? raw.detail.trim() : '';
+      return {
+        source: source,
+        brokerConnected: brokerConnected,
+        known: brokerConnected !== null || ['broker', 'broker_rpc', 'broker_local', 'local_db_fallback'].includes(source),
+        legacy: raw.legacy === true || item.legacy_broker === true,
+        detail: detail
+      };
+    }
+
+    function coordinatorStatus(provenance) {
+      const state = provenance && typeof provenance === 'object' ? provenance : {};
+      if (state.brokerConnected === true) {
+        return {
+          label: 'Broker connected',
+          tone: 'success',
+          detail: state.detail || 'The snapshot was served by the local broker.'
+        };
+      }
+      if (state.source === 'local_db_fallback') {
+        return {
+          label: 'Local fallback',
+          tone: 'recovery',
+          detail: state.detail || (state.brokerConnected === false
+            ? 'Broker unavailable; data is read directly from the local database. Host connectivity is not verified.'
+            : 'Local database fallback was used; broker connectivity is unknown.')
+        };
+      }
+      if (state.brokerConnected === false) {
+        return {
+          label: 'Broker unavailable',
+          tone: 'danger',
+          detail: state.detail || 'The snapshot reports that the local broker is unavailable.'
+        };
+      }
+      if (state.source === 'local_db') {
+        return {
+          label: 'Local data',
+          tone: 'recovery',
+          detail: state.detail || 'Data came from the local database; broker connectivity is not reported.'
+        };
+      }
+      return {
+        label: 'Unknown',
+        tone: 'unknown',
+        detail: state.detail || 'The snapshot does not include broker connectivity provenance.'
+      };
+    }
+
+    function aggregateHasAttempts(data) {
+      const item = data && typeof data === 'object' ? data : {};
+      const metrics = item.metrics && typeof item.metrics === 'object' ? item.metrics : {};
+      if (typeof metrics.has_attempts === 'boolean') return metrics.has_attempts;
+      const sessions = Array.isArray(item.sessions) ? item.sessions : [];
+      const observed = sessions.some((session) => Boolean(
+        session && (session.has_attempts || (session.attempt && typeof session.attempt === 'object'))
+      ));
+      if (!observed && metrics.total_sessions > sessions.length) return null;
+      return observed;
+    }
+
+    function aggregateHasCostGaps(data) {
+      const item = data && typeof data === 'object' ? data : {};
+      const metrics = item.metrics && typeof item.metrics === 'object' ? item.metrics : {};
+      if (typeof metrics.has_cost_gaps === 'boolean') return metrics.has_cost_gaps;
+      if (typeof metrics.unknown_cost_sessions === 'number' && Number.isFinite(metrics.unknown_cost_sessions)) {
+        return metrics.unknown_cost_sessions > 0;
+      }
+      if (metrics.cost_complete !== true && metrics.total_sessions > (Array.isArray(item.sessions) ? item.sessions.length : 0)) {
+        return true;
+      }
+      return metrics.cost_complete === false;
+    }
+
+    function statusBadgeClass(tone) {
+      const classes = {
+        running: 'badge badge-running',
+        idle: 'badge badge-idle',
+        waiting: 'badge badge-waiting',
+        recovery: 'badge badge-recovery',
+        review: 'badge badge-review',
+        success: 'badge badge-online',
+        danger: 'badge badge-offline',
+        stopped: 'badge badge-stopped',
+        native: 'badge badge-native',
+        unknown: 'badge badge-unknown'
+      };
+      return classes[tone] || classes.unknown;
+    }
+
+    function formatCost(value, complete, hasAttempts, digits, knownCostSessions) {
+      const precision = Number.isInteger(digits) ? digits : 3;
+      const isNumber = typeof value === 'number' && Number.isFinite(value);
+      if (!isNumber) {
+        if (hasAttempts || complete === false) {
+          return { text: 'Unknown', title: 'Cost is incomplete or unavailable; it is not treated as zero.', unknown: true };
+        }
+        return { text: '\u2014', title: 'No cost-bearing attempts recorded.', unknown: false };
+      }
+      if (complete === false && value === 0) {
+        const hasKnownCoverage = Number.isInteger(knownCostSessions)
+          && knownCostSessions >= 0
+          && (knownCostSessions > 0 || hasAttempts === false);
+        if (!hasKnownCoverage) {
+          return { text: 'Unknown', title: 'No known cost is available; the total is incomplete and is not treated as zero.', unknown: true };
+        }
+      }
+      return {
+        text: '$' + value.toFixed(precision) + (complete === false ? '*' : ''),
+        title: complete === false ? 'Known subtotal; some costs are unknown.' : 'Reported cost.',
+        unknown: false
+      };
+    }
+
+    function connectionState(lastSuccess, now, failed) {
+      const last = typeof lastSuccess === 'number' && Number.isFinite(lastSuccess) ? lastSuccess : 0;
+      const current = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
+      if (!last) {
+        return failed
+          ? { state: 'error', label: 'Not connected', detail: 'No dashboard snapshot has loaded; retrying.' }
+          : { state: 'connecting', label: 'Connecting\u2026', detail: 'Waiting for the first dashboard snapshot.' };
+      }
+      const age = Math.max(0, Math.floor((current - last) / 1000));
+      if (failed) {
+        return { state: 'error', label: 'Connection lost', detail: 'Showing the last snapshot from ' + age + 's ago; retrying.' };
+      }
+      if (age >= 10) {
+        return { state: 'stale', label: 'Stale \u00b7 ' + age + 's', detail: 'Last snapshot was ' + age + 's ago; waiting for a fresh update.' };
+      }
+      return {
+        state: 'live',
+        label: age <= 1 ? 'Live \u00b7 just now' : 'Live \u00b7 ' + age + 's ago',
+        detail: 'Last snapshot was ' + age + 's ago.'
+      };
+    }
 
     function runtimeLabel(runtime) {
       return runtime === 'antigravity' ? 'agy' : (runtime || '-');
@@ -606,7 +1294,9 @@ _HTML_SCRIPT = """  <script>
     function setRuntimeFilter(runtime) {
       selectedRuntime = runtime || 'all';
       document.querySelectorAll('#runtimeFilterBar .chip-btn').forEach((btn) => {
-        btn.classList.toggle('active', btn.dataset.runtime === selectedRuntime);
+        const isSelected = btn.dataset.runtime === selectedRuntime;
+        btn.classList.toggle('active', isSelected);
+        btn.setAttribute('aria-pressed', String(isSelected));
       });
       if (currentData) renderDashboard(currentData);
     }
@@ -669,18 +1359,61 @@ _HTML_SCRIPT = """  <script>
       }
     }
 
+    function setConnectionBanner(message) {
+      const banner = document.getElementById('connectionBanner');
+      if (!banner) return;
+      if (!message) {
+        banner.hidden = true;
+        setText(banner, '');
+        return;
+      }
+      banner.hidden = false;
+      setText(banner, message);
+    }
+
+    function updateConnectionStatus() {
+      const element = document.getElementById('connectionStatus');
+      if (!element) return;
+      const state = connectionState(lastSuccessfulFetch, Date.now(), lastFetchFailed);
+      element.dataset.state = state.state;
+      setText(element, state.label);
+      element.title = state.detail;
+      element.setAttribute('aria-label', state.label + '. ' + state.detail);
+    }
+
     async function fetchData() {
+      if (fetchInFlight) return;
+      fetchInFlight = true;
       try {
         const response = await fetch('/api/snapshot', { credentials: 'same-origin' });
         if (response.status === 401) {
           window.location.href = '/login';
           return;
         }
-        if (!response.ok) return;
-        currentData = await response.json();
+        if (!response.ok) {
+          lastFetchFailed = true;
+          setConnectionBanner('Could not refresh the dashboard. ' +
+            (hasLoadedOnce ? 'Showing the last snapshot while retrying.' : 'Retrying the first snapshot.'));
+          updateConnectionStatus();
+          return;
+        }
+        const payload = await response.json();
+        currentData = payload;
+        lastSuccessfulFetch = Date.now();
+        lastFetchFailed = false;
+        hasLoadedOnce = true;
+        setConnectionBanner('');
         renderDashboard(currentData);
+        document.getElementById('main').setAttribute('aria-busy', 'false');
+        updateConnectionStatus();
       } catch (error) {
+        lastFetchFailed = true;
+        setConnectionBanner('Could not reach the Bridge dashboard. ' +
+          (hasLoadedOnce ? 'Showing the last snapshot while retrying.' : 'Retrying the first snapshot.'));
+        updateConnectionStatus();
         console.error('Fetch error:', error);
+      } finally {
+        fetchInFlight = false;
       }
     }
 
@@ -745,40 +1478,41 @@ _HTML_SCRIPT = """  <script>
         section.style.display = 'none';
         return;
       }
-      section.style.display = 'block';
+      section.style.display = 'flex';
       questions.forEach((question) => {
         const banner = makeElement('div', 'alert-banner');
-        const info = makeElement('div');
+        banner.setAttribute('role', 'group');
+        const info = makeElement('div', 'alert-info');
         const title = makeElement('div', 'alert-title');
         const sessionName = question.session_name || String(question.session_id || '').substring(0, 8);
-        setText(
-          title,
-          '⚠ Action Required: Permission Approval for "' + sessionName + '" (' +
-          String(question.session_id || '').substring(0, 8) + ')'
-        );
+        setText(title, 'Approval needed for ' + sessionName);
         info.appendChild(title);
-        const detail = makeElement('div');
-        detail.style.color = 'var(--text)';
-        detail.style.fontSize = '12px';
-        detail.appendChild(document.createTextNode('Tool: '));
-        const toolName = makeElement('b', '', question.tool || '-');
-        detail.appendChild(toolName);
-        detail.appendChild(document.createTextNode(' | Command: '));
-        detail.appendChild(makeElement('code', '', question.command || question.description || '-'));
-        detail.appendChild(document.createTextNode(' (' + (question.created_rel || '-') + ')'));
+
+        const detail = makeElement('div', 'alert-detail');
+        detail.appendChild(document.createTextNode('Session '));
+        detail.appendChild(makeElement('code', '', String(question.session_id || '').substring(0, 8)));
+        detail.appendChild(document.createTextNode(' \u00b7 Tool '));
+        detail.appendChild(makeElement('b', '', question.tool || '-'));
+        detail.appendChild(document.createTextNode(' \u00b7 ' + (question.created_rel || '-')));
         info.appendChild(detail);
+
+        const command = makeElement('div', 'alert-detail');
+        command.appendChild(makeElement('code', '', question.command || question.description || '-'));
+        info.appendChild(command);
 
         const actions = makeElement('div', 'alert-actions');
         const revision = findSessionRevision(question.session_id);
-        const allowButton = makeElement('button', 'btn', '✓ Approve');
+        const allowButton = makeElement('button', 'btn', 'Approve');
         allowButton.type = 'button';
         allowButton.disabled = revision === null;
+        allowButton.title = revision === null ? 'Waiting for current session data' : 'Approve this request';
         allowButton.addEventListener('click', () => {
           submitDecision(question.session_id, question.id, 'allow', revision);
         });
-        const denyButton = makeElement('button', 'btn btn-secondary', '✕ Deny');
+        const denyButton = makeElement('button', 'btn btn-secondary', 'Deny');
         denyButton.type = 'button';
         denyButton.disabled = revision === null;
+        denyButton.title = revision === null ? 'Waiting for current session data' : 'Deny this request';
         denyButton.addEventListener('click', () => {
           submitDecision(question.session_id, question.id, 'deny', revision);
         });
@@ -791,18 +1525,22 @@ _HTML_SCRIPT = """  <script>
       });
     }
 
-    function renderHosts(hosts, coordinator) {
+    function renderHosts(hosts, coordinator, provenance) {
       const body = document.getElementById('hostTable');
       body.replaceChildren();
       const totalNodes = (hosts ? hosts.length : 0) + 1;
-      document.getElementById('hostStats').textContent = totalNodes + ' nodes';
+      const coordinatorView = coordinatorStatus(provenance);
+      const hostStats = document.getElementById('hostStats');
+      hostStats.textContent = totalNodes + (totalNodes === 1 ? ' node' : ' nodes') +
+        ' \u00b7 ' + coordinatorView.label;
+      hostStats.title = coordinatorView.detail;
 
       // 1. Coordinator Row
       const cRow = document.createElement('tr');
       const cNameCell = document.createElement('td');
-      const cNameLine = makeElement('div', '', (coordinator.host_id || 'coordinator') + ' ⚡');
-      cNameLine.style.fontWeight = '700';
-      cNameLine.style.color = '#fff';
+      const coordinatorName = coordinator.host_id || 'coordinator';
+      const cNameLine = makeElement('div', 'cell-title', coordinatorName);
+      cNameLine.title = coordinatorName;
       cNameCell.appendChild(cNameLine);
       cRow.appendChild(cNameCell);
 
@@ -811,26 +1549,39 @@ _HTML_SCRIPT = """  <script>
       cRow.appendChild(cRoleCell);
 
       const cStatusCell = document.createElement('td');
-      cStatusCell.appendChild(makeElement('span', 'badge badge-online', 'ONLINE'));
+      const coordinatorBadge = makeElement(
+        'span', statusBadgeClass(coordinatorView.tone), coordinatorView.label
+      );
+      coordinatorBadge.title = coordinatorView.detail;
+      coordinatorBadge.setAttribute('aria-label', coordinatorView.label + '. ' + coordinatorView.detail);
+      cStatusCell.appendChild(coordinatorBadge);
       cRow.appendChild(cStatusCell);
 
       const cTargetCell = document.createElement('td');
-      cTargetCell.appendChild(makeElement('code', '', 'local (unix sock)'));
+      const targetText = provenance && provenance.brokerConnected === true
+        ? 'local (unix socket)'
+        : (provenance && provenance.source === 'local_db_fallback' ? 'local database (fallback)' : 'not reported');
+      cTargetCell.appendChild(makeElement('code', '', targetText));
       cRow.appendChild(cTargetCell);
 
       const cNodeCell = document.createElement('td');
-      cNodeCell.appendChild(makeElement('code', '', coordinator.node_id ? String(coordinator.node_id).substring(0, 16) : '-'));
+      const coordinatorNode = coordinator.node_id ? String(coordinator.node_id) : '-';
+      const coordinatorNodeCode = makeElement('code', '', coordinator.node_id ? coordinatorNode.substring(0, 16) : '-');
+      coordinatorNodeCode.title = coordinatorNode;
+      cNodeCell.appendChild(coordinatorNodeCode);
       cRow.appendChild(cNodeCell);
 
-      const cProjsCell = makeElement('td', '', 'bridge (local)');
+      const cProjsCell = makeElement('td', 'cell-muted', 'bridge (local)');
       cRow.appendChild(cProjsCell);
 
-      const cContactCell = makeElement('td', '', 'active');
-      cContactCell.style.color = 'var(--green)';
+      let contactText = 'unknown';
+      if (provenance && provenance.brokerConnected === true) contactText = 'verified';
+      else if (provenance && provenance.source === 'local_db_fallback') contactText = 'not verified';
+      else if (provenance && provenance.brokerConnected === false) contactText = 'unavailable';
+      const cContactCell = makeElement('td', 'cell-muted', contactText);
       cRow.appendChild(cContactCell);
 
-      const cActionCell = makeElement('td', '', '-');
-      cActionCell.style.color = 'var(--text-muted)';
+      const cActionCell = makeElement('td', 'cell-muted', '\u2014');
       cRow.appendChild(cActionCell);
       body.appendChild(cRow);
 
@@ -839,43 +1590,49 @@ _HTML_SCRIPT = """  <script>
         hosts.forEach((host) => {
           const row = document.createElement('tr');
           const nameCell = document.createElement('td');
-          const nameLine = makeElement('div', '', host.host_id || '-');
-          nameLine.style.fontWeight = '600';
-          nameLine.style.color = '#fff';
+          const hostName = host.host_id || '-';
+          const nameLine = makeElement('div', 'cell-title', hostName);
+          nameLine.title = hostName;
           nameCell.appendChild(nameLine);
           row.appendChild(nameCell);
 
           const roleCell = document.createElement('td');
-          roleCell.appendChild(makeElement('span', 'badge badge-idle', 'Worker Node'));
+          roleCell.appendChild(makeElement('span', 'badge badge-idle', 'Worker node'));
           row.appendChild(roleCell);
 
           const statusCell = document.createElement('td');
-          const isOnline = host.state === 'online';
-          const isOffline = host.state === 'offline';
-          const badgeClass = isOnline ? 'badge-online' : (isOffline ? 'badge-offline' : 'badge-waiting');
-          statusCell.appendChild(makeElement('span', 'badge ' + badgeClass, String(host.state || 'offline').toUpperCase()));
+          const linkStatus = hostStatus(host);
+          const statusBadge = makeElement('span', statusBadgeClass(linkStatus.tone), linkStatus.label);
+          statusBadge.title = linkStatus.detail;
+          statusBadge.setAttribute('aria-label', linkStatus.label + '. ' + linkStatus.detail);
+          statusCell.appendChild(statusBadge);
           row.appendChild(statusCell);
 
           const targetCell = document.createElement('td');
-          targetCell.appendChild(makeElement('code', '', host.ssh_target || '-'));
+          const targetCode = makeElement('code', '', host.ssh_target || '-');
+          targetCode.title = host.ssh_target || '';
+          targetCell.appendChild(targetCode);
           row.appendChild(targetCell);
 
           const nodeCell = document.createElement('td');
-          const nodeStr = host.node_id ? String(host.node_id).substring(0, 16) + '…' : '-';
-          nodeCell.appendChild(makeElement('code', '', nodeStr));
+          const nodeStr = host.node_id ? String(host.node_id).substring(0, 16) + '\u2026' : '-';
+          const nodeCode = makeElement('code', '', nodeStr);
+          nodeCode.title = host.node_id ? String(host.node_id) : '';
+          nodeCell.appendChild(nodeCode);
           row.appendChild(nodeCell);
 
           const projs = host.projects && typeof host.projects === 'object' ? Object.keys(host.projects).join(', ') : '-';
           const projsCell = makeElement('td', '', projs || '-');
+          projsCell.title = projs || '';
           row.appendChild(projsCell);
 
-          const contactCell = makeElement('td', '', host.last_contact_rel || '-');
-          contactCell.style.color = 'var(--text-muted)';
+          const contactCell = makeElement('td', 'cell-muted', host.last_contact_rel || '-');
           row.appendChild(contactCell);
 
           const actionCell = document.createElement('td');
           const pingButton = makeElement('button', 'btn btn-secondary btn-sm', 'Ping');
           pingButton.type = 'button';
+          pingButton.setAttribute('aria-label', 'Ping host ' + hostName);
           pingButton.addEventListener('click', () => {
             pingHost(host.host_id, pingButton);
           });
@@ -920,38 +1677,41 @@ _HTML_SCRIPT = """  <script>
       const order = ['pi', 'claude', 'antigravity', 'codex'];
       order.forEach((key) => {
         const info = (runtimes && runtimes[key]) || {};
+        const isSelected = selectedRuntime === key;
         const card = document.createElement('button');
         card.type = 'button';
-        card.className = 'runtime-card' + (selectedRuntime === key ? ' selected' : '');
+        card.className = 'runtime-card' + (isSelected ? ' selected' : '');
+        card.setAttribute('aria-pressed', String(isSelected));
+        card.setAttribute('aria-label', 'Filter dashboard to ' + (info.display_name || runtimeLabel(key)) + ' runtime');
         card.addEventListener('click', () => {
-          setRuntimeFilter(selectedRuntime === key ? 'all' : key);
+          setRuntimeFilter(isSelected ? 'all' : key);
         });
 
+        const bridgeActive = Number(info.bridge_active || 0);
+        const bridgeRunning = Number(info.bridge_running || 0);
+        const bridgeWaiting = Number(info.bridge_waiting || 0);
+        const bridgeRecovery = Number(info.bridge_recovery || 0);
+        const nativeActive = Number(info.native_active || 0);
         const top = makeElement('div', 'runtime-card-top');
         const label = info.display_name || runtimeLabel(key);
-        top.appendChild(makeElement('span', 'runtime-title', label.toUpperCase()));
-        const liveTotal = Number(info.total_live || 0);
+        top.appendChild(makeElement('span', 'runtime-title', label));
         const liveEl = makeElement(
           'span',
-          'runtime-live' + (liveTotal === 0 ? ' zero' : ''),
-          liveTotal + ' live'
+          'runtime-live' + (bridgeActive > 0 ? ' has-live' : ''),
+          bridgeActive + ' bridge'
         );
+        liveEl.title = 'Bridge worker processes alive or waiting';
         top.appendChild(liveEl);
         card.appendChild(top);
 
         const meta1 = makeElement('div', 'runtime-meta');
-        meta1.appendChild(makeElement('span', '', 'Bridge: ' + (info.bridge_active || 0) + ' active / ' + (info.bridge_total || 0) + ' total'));
-        const waiting = Number(info.bridge_waiting || 0);
-        if (waiting > 0) {
-          const waitEl = makeElement('span', '', waiting + ' waiting');
-          waitEl.style.color = 'var(--yellow)';
-          meta1.appendChild(waitEl);
-        }
+        let bridgeDetail = 'Bridge: ' + bridgeRunning + ' running \u00b7 ' + bridgeWaiting + ' waiting';
+        if (bridgeRecovery > 0) bridgeDetail += ' \u00b7 ' + bridgeRecovery + ' recovery';
+        meta1.appendChild(makeElement('span', '', bridgeDetail));
         card.appendChild(meta1);
 
         const meta2 = makeElement('div', 'runtime-meta');
-        meta2.style.marginTop = '4px';
-        meta2.appendChild(makeElement('span', '', 'Native CLI: ' + (info.native_active || 0)));
+        meta2.appendChild(makeElement('span', '', 'Native: ' + nativeActive + (nativeActive === 1 ? ' process' : ' processes')));
         if (info.native_daemons) {
           meta2.appendChild(makeElement('span', '', '+' + info.native_daemons + ' daemon'));
         }
@@ -964,23 +1724,26 @@ _HTML_SCRIPT = """  <script>
       const body = document.getElementById('sessionTable');
       body.replaceChildren();
       const filtered = (sessions || []).filter(sessionMatchesFilter);
-      document.getElementById('sessionCount').textContent =
-        filtered.length + '/' + (sessions ? sessions.length : 0) + ' shown (' + (metrics.active_sessions || 0) + ' active)';
+      const total = sessions ? sessions.length : 0;
+      const shown = Math.min(filtered.length, 60);
+      const countText = shown + ' of ' + total + ' shown' +
+        (filtered.length > 60 ? ' (first 60)' : '') + ' \u00b7 ' + (metrics.active_sessions || 0) + ' live';
+      const sessionCount = document.getElementById('sessionCount');
+      setText(sessionCount, countText);
+      sessionCount.title = 'Live includes running, idle, waiting, or alive worker processes.';
       if (!filtered.length) {
-        body.appendChild(emptyRow(6, 'No matching bridge sessions'));
+        const message = total ? 'No sessions match the current runtime and active filters' : 'No Bridge sessions recorded yet';
+        body.appendChild(emptyRow(6, message));
         return;
       }
       filtered.slice(0, 60).forEach((session) => {
         const row = document.createElement('tr');
         const nameCell = document.createElement('td');
-        const nameLine = makeElement('div', '', session.name || String(session.id || '').substring(0, 10));
-        nameLine.style.fontWeight = '600';
-        nameLine.style.color = '#fff';
-        nameLine.style.fontSize = '13px';
-        const modelSuffix = session.model ? ' • ' + session.model : '';
-        const metaLine = makeElement('div', '', (session.profile || '-') + modelSuffix + ' • ');
-        metaLine.style.fontSize = '11px';
-        metaLine.style.color = 'var(--text-muted)';
+        const sessionName = session.name || String(session.id || '').substring(0, 10);
+        const nameLine = makeElement('div', 'cell-title', sessionName);
+        nameLine.title = sessionName;
+        const modelSuffix = session.model ? ' \u00b7 ' + session.model : '';
+        const metaLine = makeElement('div', 'cell-meta', (session.profile || '-') + modelSuffix + ' \u00b7 ');
         metaLine.appendChild(makeElement('code', '', String(session.id || '').substring(0, 8)));
         nameCell.appendChild(nameLine);
         nameCell.appendChild(metaLine);
@@ -988,6 +1751,7 @@ _HTML_SCRIPT = """  <script>
         const hostCell = document.createElement('td');
         const hostName = session.host_id || 'local';
         const hostBadge = makeElement('span', 'badge-node', hostName);
+        hostBadge.title = hostName;
         hostCell.appendChild(hostBadge);
 
         const runtimeCell = document.createElement('td');
@@ -997,34 +1761,26 @@ _HTML_SCRIPT = """  <script>
         runtimeCell.appendChild(runtimeText);
 
         const statusCell = document.createElement('td');
-        let badgeClass = 'badge-stopped';
-        if (session.waiting_question) badgeClass = 'badge-waiting';
-        else if (session.observed === 'running') badgeClass = 'badge-running';
-        else if (session.observed === 'idle') badgeClass = 'badge-idle';
-        const statusText = session.waiting_question ? 'WAITING APPROVAL' : (session.observed || 'unknown');
-        statusCell.appendChild(makeElement('span', 'badge ' + badgeClass, statusText));
+        const status = bridgeStatus(session);
+        const statusBadge = makeElement('span', statusBadgeClass(status.tone), status.label);
+        statusBadge.title = status.detail;
+        statusBadge.setAttribute('aria-label', status.label + '. ' + status.detail);
+        statusCell.appendChild(statusBadge);
 
         const goal = (session.task && session.task.instruction)
           ? session.task.instruction
-          : (session.error ? session.error : (session.cwd || (session.observed === 'running' ? 'Active' : '-')));
-        const goalCell = makeElement('td', '', goal || '-');
-        goalCell.style.maxWidth = '240px';
-        goalCell.style.overflow = 'hidden';
-        goalCell.style.textOverflow = 'ellipsis';
-        goalCell.style.whiteSpace = 'nowrap';
-        goalCell.title = goal || '';
+          : (session.error ? session.error : (session.cwd || ''));
+        const goalCell = makeElement('td', 'cell-goal');
+        const goalText = makeElement('span', 'cell-goal-text', goal || '\u2014');
+        goalText.title = goal || 'No task instruction recorded.';
+        goalCell.appendChild(goalText);
 
         const costNum = (typeof session.cost_usd === 'number')
           ? session.cost_usd
           : (session.attempt && typeof session.attempt.cost_usd === 'number' ? session.attempt.cost_usd : null);
-        let cost = '-';
-        if (costNum !== null) {
-          cost = '$' + costNum.toFixed(3) + (session.cost_complete === false ? '*' : '');
-        } else if (session.has_attempts) {
-          cost = 'unknown';
-        }
-        const costCell = makeElement('td', '', cost);
-        costCell.style.color = 'var(--yellow)';
+        const cost = formatCost(costNum, session.cost_complete, session.has_attempts, 3, costNum !== null ? 1 : undefined);
+        const costCell = makeElement('td', 'cell-cost' + (cost.unknown ? ' is-unknown' : (cost.text === '\u2014' ? ' is-empty' : '')), cost.text);
+        costCell.title = cost.title;
 
         row.appendChild(nameCell);
         row.appendChild(hostCell);
@@ -1046,10 +1802,14 @@ _HTML_SCRIPT = """  <script>
         if (activeOnly && proc.kind === 'daemon') return false;
         return true;
       });
-      document.getElementById('nativeCount').textContent =
-        filtered.length + '/' + allNative.length + ' processes (' + (metrics.native_sessions || 0) + ' active)';
+      const shown = Math.min(filtered.length, 60);
+      const nativeCount = document.getElementById('nativeCount');
+      nativeCount.textContent = shown + ' of ' + allNative.length + ' shown' +
+        (filtered.length > 60 ? ' (first 60)' : '') + ' \u00b7 ' + (metrics.native_sessions || 0) + ' non-daemon';
+      nativeCount.title = 'Detected native CLI processes. Presence does not prove active inference.';
       if (!filtered.length) {
-        body.appendChild(emptyRow(6, 'No matching native CLI processes'));
+        const message = allNative.length ? 'No native processes match the current filters' : 'No native CLI processes detected';
+        body.appendChild(emptyRow(6, message));
         return;
       }
       filtered.slice(0, 60).forEach((proc) => {
@@ -1062,28 +1822,25 @@ _HTML_SCRIPT = """  <script>
         pidCell.appendChild(makeElement('code', '', String(proc.pid || '-')));
 
         const title = proc.name || proc.native_id || proc.comm || '-';
-        const titleCell = makeElement('td', '', title);
-        titleCell.style.maxWidth = '260px';
-        titleCell.style.overflow = 'hidden';
-        titleCell.style.textOverflow = 'ellipsis';
-        titleCell.style.whiteSpace = 'nowrap';
-        titleCell.title = (proc.native_id ? proc.native_id + ' — ' : '') + title;
+        const titleCell = document.createElement('td');
+        const titleLine = makeElement('div', 'cell-title', title);
+        titleLine.title = (proc.native_id ? proc.native_id + ' \u2014 ' : '') + title;
+        titleCell.appendChild(titleLine);
 
-        const modelCell = makeElement('td', '', proc.model || '-');
-        modelCell.style.color = 'var(--text-muted)';
+        const modelCell = makeElement('td', 'cell-muted', proc.model || '\u2014');
 
         const stateCell = document.createElement('td');
-        const badgeClass = (proc.observed === 'running' || proc.observed === 'active') ? 'badge-worker' : 'badge-idle';
-        stateCell.appendChild(makeElement('span', 'badge ' + badgeClass, proc.observed || 'unknown'));
+        const processStatus = nativeProcessStatus(proc);
+        const processBadge = makeElement('span', statusBadgeClass(processStatus.tone), processStatus.label);
+        processBadge.title = processStatus.detail;
+        processBadge.setAttribute('aria-label', processStatus.label + '. ' + processStatus.detail);
+        stateCell.appendChild(processBadge);
 
-        const kindText = (proc.kind || 'cli') + (proc.cwd ? ' • ' + proc.cwd : '');
-        const kindCell = makeElement('td', '', kindText);
-        kindCell.style.maxWidth = '240px';
-        kindCell.style.overflow = 'hidden';
-        kindCell.style.textOverflow = 'ellipsis';
-        kindCell.style.whiteSpace = 'nowrap';
-        kindCell.style.color = 'var(--text-muted)';
-        kindCell.title = kindText;
+        const kindText = (proc.kind || 'cli') + (proc.cwd ? ' \u00b7 ' + proc.cwd : '');
+        const kindCell = makeElement('td', 'cell-kind cell-muted');
+        const kindLine = makeElement('span', 'cell-kind-text', kindText);
+        kindLine.title = kindText;
+        kindCell.appendChild(kindLine);
 
         row.appendChild(rtCell);
         row.appendChild(pidCell);
@@ -1098,47 +1855,44 @@ _HTML_SCRIPT = """  <script>
     function renderBroadcasts(broadcasts) {
       const body = document.getElementById('broadcastTable');
       body.replaceChildren();
-      document.getElementById('groupStats').textContent = broadcasts.length + ' broadcasts';
+      document.getElementById('groupStats').textContent = broadcasts.length +
+        (broadcasts.length === 1 ? ' broadcast' : ' broadcasts');
       if (!broadcasts.length) {
-        body.appendChild(emptyRow(5, 'No broadcast communications recorded'));
+        body.appendChild(emptyRow(5, 'No broadcast communications recorded yet'));
         return;
       }
       broadcasts.forEach((broadcast) => {
         const row = document.createElement('tr');
         const idCell = document.createElement('td');
-        const idLine = makeElement('div', '', String(broadcast.broadcast_id || '').substring(0, 12));
-        idLine.style.fontWeight = '600';
-        idLine.style.color = '#fff';
-        const groupLine = makeElement('div', '', broadcast.group_id || '-');
-        groupLine.style.fontSize = '11px';
-        groupLine.style.color = 'var(--text-muted)';
+        const broadcastId = String(broadcast.broadcast_id || '');
+        const idLine = makeElement('div', 'cell-title', broadcastId.substring(0, 12));
+        idLine.title = broadcastId;
+        const groupLine = makeElement('div', 'cell-meta', broadcast.group_id || '-');
+        groupLine.title = broadcast.group_id || '';
         idCell.appendChild(idLine);
         idCell.appendChild(groupLine);
 
         const progressCell = document.createElement('td');
         const received = makeElement('span', '', broadcast.received);
+        const total = Number(broadcast.total || 0);
         received.style.color = 'var(--green)';
-        received.style.fontWeight = '600';
+        received.style.fontWeight = '700';
         progressCell.appendChild(received);
-        progressCell.appendChild(document.createTextNode(' / ' + broadcast.total + ' recv'));
+        progressCell.appendChild(document.createTextNode(' / ' + total + ' received'));
         if (broadcast.uncertain) {
-          const uncertain = makeElement('span', '', ' (' + broadcast.uncertain + ' uncert)');
+          const uncertain = makeElement('span', '', ' \u00b7 ' + broadcast.uncertain + ' uncertain');
           uncertain.style.color = 'var(--red)';
           progressCell.appendChild(uncertain);
         }
 
-        const membersCell = document.createElement('td');
-        setText(membersCell, (broadcast.total || 0) + ' targets');
-        membersCell.style.color = 'var(--text-muted)';
+        const membersCell = makeElement('td', 'cell-muted', total + ' targets');
 
-        const messageCell = makeElement('td', '', broadcast.message_preview || '-');
-        messageCell.style.maxWidth = '200px';
-        messageCell.style.overflow = 'hidden';
-        messageCell.style.textOverflow = 'ellipsis';
-        messageCell.style.whiteSpace = 'nowrap';
+        const messageCell = makeElement('td', 'cell-goal');
+        const messageText = makeElement('span', 'cell-goal-text', broadcast.message_preview || '\u2014');
+        messageText.title = broadcast.message_preview || 'No message preview';
+        messageCell.appendChild(messageText);
 
-        const ageCell = makeElement('td', '', broadcast.created_rel || '-');
-        ageCell.style.color = 'var(--text-muted)';
+        const ageCell = makeElement('td', 'cell-muted', broadcast.created_rel || '-');
 
         row.appendChild(idCell);
         row.appendChild(progressCell);
@@ -1164,9 +1918,10 @@ _HTML_SCRIPT = """  <script>
         });
       }
       if (!list.length) {
-        const placeholder = makeElement('div', '', 'Waiting for events...');
-        placeholder.style.color = 'var(--text-muted)';
-        container.appendChild(placeholder);
+        const message = selectedRuntime === 'all'
+          ? 'No Bridge events recorded yet. New activity will appear here.'
+          : 'No events for this runtime yet. Clear the runtime filter to see all activity.';
+        container.appendChild(makeElement('div', 'empty-log', message));
         return;
       }
       list.slice(0, 25).forEach((event) => {
@@ -1302,31 +2057,62 @@ _HTML_SCRIPT = """  <script>
     function renderDashboard(data) {
       const metrics = data.metrics || {};
       const coordinator = data.coordinator || {};
+      const provenance = snapshotProvenance(data);
+      const provenanceView = coordinatorStatus(provenance);
 
-      document.getElementById('coordBadge').textContent =
-        (coordinator.host_id || 'localhost') + ' • Node ' +
-        (coordinator.node_id ? String(coordinator.node_id).substring(0, 8) : '?');
-      document.getElementById('statNodes').textContent =
-        (metrics.online_hosts || 1) + '/' + (metrics.total_hosts || 1);
+      const coordinatorName = coordinator.host_id || 'localhost';
+      const coordinatorNode = coordinator.node_id ? String(coordinator.node_id) : '?';
+      const coordBadge = document.getElementById('coordBadge');
+      setText(
+        coordBadge,
+        coordinatorName + ' \u00b7 Node ' + coordinatorNode.substring(0, 8) + ' \u00b7 ' + provenanceView.label
+      );
+      coordBadge.title = coordinatorName + ' \u00b7 node ' + coordinatorNode + ' \u00b7 ' + provenanceView.detail;
+
+      const onlineHosts = typeof metrics.online_hosts === 'number' ? metrics.online_hosts : 0;
+      const totalHosts = typeof metrics.total_hosts === 'number' ? metrics.total_hosts : 1;
+      const statNodes = document.getElementById('statNodes');
+      statNodes.classList.remove('is-unknown');
+      if (provenance.brokerConnected === true) {
+        statNodes.textContent = onlineHosts + '/' + totalHosts;
+        statNodes.title = onlineHosts + ' of ' + totalHosts + ' configured hosts are online.';
+      } else if (provenance.brokerConnected === false) {
+        const remoteHosts = Array.isArray(data.hosts) ? data.hosts : [];
+        const remoteOnline = remoteHosts.filter((host) => host && host.state === 'online').length;
+        statNodes.textContent = Math.min(remoteOnline, totalHosts) + '/' + totalHosts;
+        statNodes.title = 'Local broker is unavailable; coordinator status is not verified. ' +
+          'Remote hosts online: ' + remoteOnline + ' of ' + Math.max(0, totalHosts - 1) + '.';
+        statNodes.classList.add('is-unknown');
+      } else if (provenance.source === 'local_db_fallback') {
+        statNodes.textContent = '\u2014';
+        statNodes.title = 'The snapshot came from a local database fallback; broker and coordinator status are unknown.';
+        statNodes.classList.add('is-unknown');
+      } else {
+        statNodes.textContent = '\u2014';
+        statNodes.title = 'Broker and coordinator provenance is not reported; host online status is unknown.';
+        statNodes.classList.add('is-unknown');
+      }
       document.getElementById('statActive').textContent = metrics.active_sessions || 0;
       const statNative = document.getElementById('statNative');
       if (statNative) statNative.textContent = metrics.native_sessions || 0;
       document.getElementById('statTasks').textContent = metrics.running_tasks || 0;
       document.getElementById('statBroadcasts').textContent = metrics.total_broadcasts || 0;
-      const costComplete = metrics.cost_complete !== false;
+
+      const costComplete = metrics.cost_complete !== false && !aggregateHasCostGaps(data);
       const totalCostNum = typeof metrics.total_cost_usd === 'number' ? metrics.total_cost_usd : null;
-      const hasAttempts = (data.sessions || []).some((s) => Boolean(s.has_attempts));
-      let costText;
-      if (totalCostNum === null || (!costComplete && totalCostNum === 0 && hasAttempts)) {
-        costText = 'unknown';
-      } else {
-        costText = '$' + totalCostNum.toFixed(4) + (costComplete ? '' : '*');
-      }
-      document.getElementById('statCost').textContent = costText;
+      const hasAttempts = aggregateHasAttempts(data);
+      const knownCostAttempts = typeof metrics.known_cost_attempt_sessions === 'number'
+        ? metrics.known_cost_attempt_sessions
+        : undefined;
+      const cost = formatCost(totalCostNum, costComplete, hasAttempts, 4, knownCostAttempts);
+      const statCost = document.getElementById('statCost');
+      statCost.textContent = cost.text;
+      statCost.title = cost.title;
+      statCost.classList.toggle('is-unknown', cost.unknown);
 
       renderApprovals(data.pending_questions || []);
       renderRuntimes(data.runtimes || {});
-      renderHosts(data.hosts || [], coordinator);
+      renderHosts(data.hosts || [], coordinator, provenance);
       renderSessions(data.sessions || [], metrics);
       renderNativeSessions(data.native_sessions || [], metrics);
       renderBroadcasts(data.broadcasts || []);
@@ -1338,6 +2124,8 @@ _HTML_SCRIPT = """  <script>
     }
 
     async function init() {
+      document.getElementById('main').setAttribute('aria-busy', 'true');
+      updateConnectionStatus();
       const authenticated = await loadSession();
       if (!authenticated) {
         window.location.href = '/login';
@@ -1345,6 +2133,10 @@ _HTML_SCRIPT = """  <script>
       }
       await fetchData();
       window.setInterval(fetchData, 2000);
+      window.setInterval(updateConnectionStatus, 1000);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') fetchData();
+      });
     }
 
     document.querySelectorAll('#runtimeFilterBar .chip-btn').forEach((btn) => {
@@ -1355,7 +2147,8 @@ _HTML_SCRIPT = """  <script>
       activeOnlyBtn.addEventListener('click', () => {
         activeOnly = !activeOnly;
         activeOnlyBtn.classList.toggle('active', activeOnly);
-        setText(activeOnlyBtn, 'Active Only: ' + (activeOnly ? 'ON' : 'OFF'));
+        activeOnlyBtn.setAttribute('aria-pressed', String(activeOnly));
+        setText(activeOnlyBtn, activeOnly ? 'Active only: On' : 'Active only');
         if (currentData) renderDashboard(currentData);
       });
     }
@@ -1383,20 +2176,33 @@ LOGIN_PAGE = """<!DOCTYPE html>
   <meta name="referrer" content="no-referrer">
   <title>cli-agent-bridge | Sign in</title>
   <style>
-    :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --red:#f85149; }
+    :root {
+      color-scheme: light;
+      --bg:#f6f7f9; --card:#ffffff; --surface:#f0f2f5; --border:#d8dee4; --text:#1f2328; --muted:#59636e;
+      --accent:#0969da; --red:#cf222e; --shadow:0 1px 2px rgba(31,35,40,.05);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg:#0d1117; --card:#161b22; --surface:#1c2128; --border:#30363d; --text:#e6edf3; --muted:#9ba7b4;
+        --accent:#58a6ff; --red:#f85149; --shadow:0 1px 2px rgba(0,0,0,.32);
+      }
+    }
     * { box-sizing:border-box; margin:0; padding:0; }
-    body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif; font-size:13px; }
+    body { min-height:100vh; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif; font-size:14px; line-height:1.5; }
     main { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
-    .card { width:100%; max-width:380px; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:28px; }
-    h1 { font-size:18px; margin-bottom:6px; }
-    p { color:var(--muted); margin-bottom:20px; line-height:1.5; }
-    label { display:block; font-weight:600; margin-bottom:6px; }
-    input { width:100%; padding:10px 12px; border-radius:6px; border:1px solid var(--border); background:#0d1117; color:var(--text); font-size:14px; }
-    input:focus { outline:2px solid var(--accent); outline-offset:1px; }
-    button { width:100%; margin-top:16px; padding:10px 12px; border:none; border-radius:6px; background:var(--accent); color:#fff; font-size:14px; font-weight:600; cursor:pointer; }
-    button:hover { opacity:.9; }
-    .error { min-height:20px; margin-top:12px; color:var(--red); }
-    .hint { margin-top:18px; color:var(--muted); font-size:11px; line-height:1.5; }
+    .card { width:100%; max-width:380px; background:var(--card); border:1px solid var(--border); border-radius:10px; box-shadow:var(--shadow); padding:28px; }
+    h1 { font-size:19px; line-height:1.3; margin-bottom:6px; }
+    p { color:var(--muted); margin-bottom:20px; line-height:1.55; }
+    label { display:block; font-weight:700; margin-bottom:6px; }
+    input { width:100%; min-height:44px; padding:10px 12px; border-radius:7px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:16px; }
+    input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+    button { width:100%; min-height:44px; margin-top:16px; padding:10px 12px; border:1px solid transparent; border-radius:7px; background:var(--accent); color:#fff; font-size:14px; font-weight:700; cursor:pointer; }
+    button:hover { filter:brightness(1.06); }
+    button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+    .error { min-height:21px; margin-top:12px; color:var(--red); overflow-wrap:anywhere; }
+    .hint { margin-top:18px; color:var(--muted); font-size:12px; line-height:1.55; }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition:none !important; animation:none !important; } }
   </style>
 </head>
 <body>
@@ -1405,10 +2211,10 @@ LOGIN_PAGE = """<!DOCTYPE html>
       <h1>cli-agent-bridge Monitor</h1>
       <p>Sign in with the local admin token. The token is read from the private state directory and is never stored in the page.</p>
       <label for="token">Admin token</label>
-      <input id="token" name="token" type="password" autocomplete="current-password" required>
+      <input id="token" name="token" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" aria-describedby="loginHint" required>
       <button type="submit">Sign in</button>
-      <div class="error" id="loginError" role="alert"></div>
-      <div class="hint">Use SSH port forwarding or an HTTPS reverse proxy on untrusted networks.</div>
+      <div class="error" id="loginError" role="alert" aria-live="polite"></div>
+      <div class="hint" id="loginHint">Use SSH port forwarding or an HTTPS reverse proxy on untrusted networks.</div>
     </form>
   </main>
   <script>
@@ -1482,6 +2288,18 @@ def normalize_allowed_hosts(values: Any) -> set[str]:
             if normalized:
                 result.add(normalized)
     return result or set(DEFAULT_ALLOWED_HOSTS)
+
+
+def loopback_allowed_hosts(port: int | None = None) -> set[str]:
+    """Build the default Host allowlist for a loopback listener's actual port."""
+    hosts = {"127.0.0.1", "localhost", "[::1]"}
+    if port is not None:
+        hosts.update(f"{name}:{port}" for name in ("127.0.0.1", "localhost", "[::1]"))
+    return hosts
+
+
+HTTP_REQUEST_TIMEOUT_SECONDS = 10.0
+MAX_CONCURRENT_HTTP_REQUESTS = 64
 
 
 def canonical_origin(value: str) -> str | None:
@@ -1615,6 +2433,135 @@ class _BrokerProtocolError(Exception):
     pass
 
 
+class _DeadlineReader:
+    """Buffered request reader with one absolute deadline for header parsing."""
+
+    def __init__(self, reader: Any, connection: Any, deadline: float) -> None:
+        self._reader = reader
+        self._connection = connection
+        self.deadline = deadline
+
+    def _arm(self) -> None:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("request deadline exceeded")
+        settimeout = getattr(self._connection, "settimeout", None)
+        if settimeout is not None:
+            try:
+                settimeout(remaining)
+            except (OSError, ValueError):
+                pass
+
+    def readline(self, size: int | None = -1) -> bytes:
+        if size == 0:
+            return b""
+        limit = size if size is not None and size > 0 else None
+        data = bytearray()
+        while limit is None or len(data) < limit:
+            self._arm()
+            chunk = self._reader.read(1)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if chunk == b"\n":
+                break
+        return bytes(data)
+
+    def read1(self, size: int = -1) -> bytes:
+        self._arm()
+        return self._reader.read1(size)
+
+    def read(self, size: int = -1) -> bytes:
+        self._arm()
+        return self._reader.read(size)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._reader, name)
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server with finite request reads and a hard client cap."""
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler: type[BaseHTTPRequestHandler],
+        *,
+        max_concurrent_requests: int | None = None,
+        request_timeout: float | None = None,
+        **server_options: Any,
+    ) -> None:
+        if max_concurrent_requests is None:
+            max_concurrent_requests = MAX_CONCURRENT_HTTP_REQUESTS
+        if request_timeout is None:
+            request_timeout = HTTP_REQUEST_TIMEOUT_SECONDS
+        if max_concurrent_requests < 1:
+            raise ValueError("max_concurrent_requests must be positive")
+        if request_timeout <= 0:
+            raise ValueError("request_timeout must be positive")
+        self.request_timeout = request_timeout
+        self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        self._request_deadlines: dict[int, float] = {}
+        self._request_deadlines_lock = threading.Lock()
+        super().__init__(server_address, handler, **server_options)
+
+    def _remember_request_deadline(self, request: Any) -> None:
+        with self._request_deadlines_lock:
+            self._request_deadlines[id(request)] = time.monotonic() + self.request_timeout
+
+    def _forget_request_deadline(self, request: Any) -> None:
+        with self._request_deadlines_lock:
+            self._request_deadlines.pop(id(request), None)
+
+    def take_request_deadline(self, request: Any) -> float | None:
+        with self._request_deadlines_lock:
+            return self._request_deadlines.pop(id(request), None)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            request.settimeout(self.request_timeout)
+        except (OSError, ValueError):
+            self.shutdown_request(request)
+            return
+        self._remember_request_deadline(request)
+        if not self._request_slots.acquire(blocking=False):
+            self._reject_overloaded(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._forget_request_deadline(request)
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+    def close_request(self, request: Any) -> None:
+        self._forget_request_deadline(request)
+        super().close_request(request)
+
+    def _reject_overloaded(self, request: socket.socket) -> None:
+        try:
+            request.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: 0\r\n"
+                b"Cache-Control: no-store\r\n\r\n"
+            )
+        except OSError:
+            pass
+        finally:
+            self.shutdown_request(request)
+
+    def handle_error(self, request: socket.socket, client_address: Any) -> None:
+        # Never print handler tracebacks: they can include request details and credentials.
+        logger.debug("Web monitor request failed")
+
+
 class WebMonitorHandler(BaseHTTPRequestHandler):
     collector: MonitorCollector | None = None
     state: Path | None = None
@@ -1625,6 +2572,24 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:
         pass  # Never log headers, cookies or bodies.
+
+    def setup(self) -> None:
+        super().setup()
+        timeout = float(getattr(self.server, "request_timeout", HTTP_REQUEST_TIMEOUT_SECONDS))
+        take_deadline = getattr(self.server, "take_request_deadline", None)
+        deadline = take_deadline(self.connection) if take_deadline is not None else None
+        if deadline is None:
+            deadline = time.monotonic() + timeout
+        self._request_timeout = timeout
+        self._first_request = True
+        self._deadline_reader = _DeadlineReader(self.rfile, self.connection, deadline)
+        self.rfile = self._deadline_reader
+
+    def handle_one_request(self) -> None:
+        if not self._first_request:
+            self._deadline_reader.deadline = time.monotonic() + self._request_timeout
+        self._first_request = False
+        super().handle_one_request()
 
     def send_response(self, code: int, message: str | None = None) -> None:
         super().send_response(code, message)
@@ -1747,9 +2712,41 @@ class WebMonitorHandler(BaseHTTPRequestHandler):
             raise _HTTPError(413, "Request body too large")
         return length
 
+    def _read_exact_body(self, length: int) -> bytes:
+        if not length:
+            return b""
+        timeout = float(getattr(self.server, "request_timeout", HTTP_REQUEST_TIMEOUT_SECONDS))
+        deadline = time.monotonic() + timeout
+        if isinstance(self.rfile, _DeadlineReader):
+            self.rfile.deadline = deadline
+        body = bytearray()
+        while len(body) < length:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.close_connection = True
+                raise _HTTPError(408, "Request body timed out")
+            settimeout = getattr(self.connection, "settimeout", None)
+            if settimeout is not None:
+                try:
+                    settimeout(min(timeout, remaining))
+                except (OSError, ValueError):
+                    pass
+            try:
+                chunk = self.rfile.read1(min(length - len(body), 65536))
+            except TimeoutError:
+                self.close_connection = True
+                raise _HTTPError(408, "Request body timed out") from None
+            except OSError:
+                self.close_connection = True
+                raise _HTTPError(400, "Unable to read request body") from None
+            if not chunk:
+                break
+            body.extend(chunk)
+        return bytes(body)
+
     def _read_json_body(self) -> dict[str, Any]:
         length = self._declared_body_length()
-        body = self.rfile.read(length) if length else b""
+        body = self._read_exact_body(length)
         if len(body) != length:
             raise _HTTPError(400, "Incomplete request body")
         try:
@@ -2909,16 +3906,19 @@ def run_web_monitor(
                 "public_origin must be an http(s) origin such as https://monitor.example.com"
             )
         public_origin = canonical
-    hosts = normalize_allowed_hosts(allowed_hosts)
+    hosts = normalize_allowed_hosts(allowed_hosts) if allowed_hosts is not None else None
 
     WebMonitorHandler.collector = MonitorCollector(state_dir)
     WebMonitorHandler.state = state_dir
-    WebMonitorHandler.allowed_hosts = hosts
     WebMonitorHandler.public_origin = public_origin
     WebMonitorHandler.sessions = WebSessionManager()
 
-    server = ThreadingHTTPServer((host, port), WebMonitorHandler)
-    url = f"http://{host}:{port}"
+    server = BoundedThreadingHTTPServer((host, port), WebMonitorHandler)
+    bound_port = int(server.server_address[1])
+    if hosts is None:
+        hosts = loopback_allowed_hosts(bound_port)
+    WebMonitorHandler.allowed_hosts = hosts
+    url = f"http://{host}:{bound_port}"
     print(f"\033[36m⚡ cli-agent-bridge Web Monitor running at:\033[0m \033[1m\033[32m{url}\033[0m")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         print(

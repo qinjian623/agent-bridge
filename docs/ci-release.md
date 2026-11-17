@@ -1,20 +1,21 @@
-# GitHub 测试与发布
+> Language: English | [中文](zh/ci-release.md)
 
-`.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行：
+# GitHub Testing and Releases
 
-- Ubuntu / Python 3.11、3.13、3.14：按 `uv.lock` 安装，运行 Ruff 和完整离线测试。测试使用模拟 CLI，不需要模型账号或密钥。
-- 上述检查通过后，Ubuntu 和 macOS 分别构建 wheel、源码包，写入 `SHA256SUMS`，并在新虚拟环境中安装 wheel、检查命令和初始化配置。构建文件保留为 14 天的私有 Actions artifact。
+`.github/workflows/ci.yml` runs on push, pull request, and manual dispatch:
 
-macOS 检查安装和打包；完整测试含 Linux `/proc` 检查，目前仅在 Ubuntu 运行。它不代表真实远程 AGY、模型工具或服务升级已验证。
+- Ubuntu / Python 3.11, 3.13, 3.14: installs dependencies from `uv.lock`, then runs Ruff and the full offline test suite. Tests use mock CLIs and require no model accounts or API keys.
+- After tests pass, both Ubuntu and macOS build a wheel and source distribution (`sdist`), generate `SHA256SUMS` and `latest.json`, install the wheel inside a fresh virtual environment, verify CLI entrypoints, test idempotent `agent-bridge init` configuration, and run `agent-bridge doctor`. Build artifacts are retained as private Actions artifacts for 14 days.
 
-发布稳定版本时，先让 `pyproject.toml`、包版本以及锁文件保持一致，再推送同版本的 `vX.Y.Z` tag。tag 版本不匹配时禁止发布。所有测试和两台构建任务通过后，发布任务取 Ubuntu 的构建结果并重新核对 SHA256，先创建 draft release、上传完整附件，再公布为 latest：
+macOS jobs validate packaging, clean installation, and environment initialization; the full unit test suite (which includes Linux `/proc` inspection tests) currently runs on Ubuntu. CI passing does not claim real remote Antigravity/model CLI inference or live service upgrades were executed.
+
+When publishing a stable release, keep `pyproject.toml`, package metadata (`__version__`), and `uv.lock` aligned, then push the matching `vX.Y.Z` tag. Tag mismatches abort publishing. Once all test and packaging jobs pass, the release job downloads the Ubuntu build artifacts, re-verifies SHA-256 digests, creates a draft release, uploads all release assets, and publishes the release:
 
 ```text
 cli_agent_bridge-X.Y.Z-py3-none-any.whl
 cli_agent_bridge-X.Y.Z.tar.gz
 SHA256SUMS
+latest.json
 ```
 
-Actions 的测试、构建任务只有仓库读取权限；仅 tag 发布任务具有写 Release 的权限。第三方 Action 固定到已经核对的 commit。流程不推送 PyPI、不更新终端、不重启 Bridge，也不自动覆盖已有 Release；节点自动更新程序另行读取 latest stable release。
-
-私有仓库下载附件需要对应仓库的读取权限。可使用终端已有的 `gh` 登录；不要把 GitHub token 写进仓库、workflow 或包文件。
+Test and packaging jobs hold read-only repository permissions; only the tag-triggered release job has write access to Releases. Third-party Actions are pinned to verified commit SHAs. The release workflow never publishes to PyPI, updates interactive terminals, restarts running Bridge daemons, or overwrites existing releases. Nodes with periodic updates enabled fetch `latest.json`, the wheel, and `SHA256SUMS` directly from public GitHub Releases over unauthenticated HTTPS without requiring `gh` CLI authentication; never commit GitHub tokens into repositories, workflows, or built packages.

@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import stat as stat_module
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .errors import BridgeError
@@ -109,21 +109,92 @@ class Config:
 
     @classmethod
     def load(cls, path: Path):
-        data = json.loads(path.read_text())
-        profiles = {name: Profile(name=name, **value).validate() for name, value in data.pop("profiles").items()}
-        hosts = parse_hosts(data.pop("hosts", {}))
-        config = cls(profiles=profiles, hosts=hosts, **data)
-        config.projects = normalize_projects(config.projects)
-        if config.default_strategy not in {"balanced", "cost", "speed"}:
-            raise BridgeError("invalid_config", "default_strategy must be balanced, cost or speed")
-        if config.parallel_limit < 1 or config.quota_limit < 1:
-            raise BridgeError("invalid_config", "Parallel limits must be positive")
-        if config.worker_launcher not in {"systemd", "detached"}:
-            raise BridgeError("invalid_config", "worker_launcher must be systemd or detached")
-        if any(not math.isfinite(value) or value <= 0 for value in (config.task_timeout, config.interrupt_timeout)):
-            raise BridgeError("invalid_config", "Timeouts must be positive finite values")
-        if config.token_budget is not None and (not isinstance(config.token_budget, int) or config.token_budget <= 0):
-            raise BridgeError("invalid_config", "token_budget must be a positive integer")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeError) as error:
+            raise BridgeError("invalid_config", "config.json must contain valid UTF-8 JSON") from error
+        except OSError as error:
+            raise BridgeError("invalid_config", "Could not read config.json") from error
+        if not isinstance(data, dict):
+            raise BridgeError("invalid_config", "config.json must contain a JSON object")
+        profile_fields = {item.name for item in fields(Profile)}
+        config_fields = {item.name for item in fields(cls)}
+        if "profiles" not in data:
+            raise BridgeError("invalid_config", "config.json must contain a profiles object")
+        raw_profiles = data.pop("profiles")
+        if not isinstance(raw_profiles, dict):
+            raise BridgeError("invalid_config", "profiles must be a JSON object")
+        profiles = {}
+        for name, value in raw_profiles.items():
+            if not isinstance(name, str) or not name:
+                raise BridgeError("invalid_config", "Profile names must be non-empty strings")
+            if not isinstance(value, dict):
+                raise BridgeError("invalid_config", "Each profile must be a JSON object")
+            unknown = sorted(set(value) - profile_fields)
+            if unknown:
+                raise BridgeError(
+                    "invalid_config",
+                    "Profile contains unknown fields; see the profile configuration reference",
+                )
+            if "name" in value:
+                if value["name"] != name:
+                    raise BridgeError("invalid_config", "Profile has a mismatched name field")
+                value = {key: item for key, item in value.items() if key != "name"}
+            for key in ("runtime", "model", "provider", "quota_group", "billing_mode"):
+                if key in value and not isinstance(value[key], str):
+                    raise BridgeError("invalid_config", f"Profile field {key!r} must be a string")
+            for key in ("endpoint_host", "effort", "service_tier", "executable", "env_file", "verified_at"):
+                if value.get(key) is not None and not isinstance(value[key], str):
+                    raise BridgeError("invalid_config", f"Profile field {key!r} must be a string or null")
+            for key in ("input_types", "tools"):
+                if key in value and (
+                    not isinstance(value[key], list) or any(not isinstance(item, str) for item in value[key])
+                ):
+                    raise BridgeError("invalid_config", f"Profile field {key!r} must be a list of strings")
+            if "verified" in value and type(value["verified"]) is not bool:
+                raise BridgeError("invalid_config", "Profile field 'verified' must be a boolean")
+            if value.get("context_window") is not None and type(value["context_window"]) is not int:
+                raise BridgeError("invalid_config", "Profile field 'context_window' must be an integer or null")
+            try:
+                profiles[name] = Profile(name=name, **value).validate()
+            except BridgeError:
+                raise
+            except (TypeError, ValueError, OverflowError) as error:
+                raise BridgeError("invalid_config", "Profile has invalid field types") from error
+        raw_hosts = data.pop("hosts", {})
+        unknown_top = sorted(set(data) - config_fields)
+        if unknown_top:
+            raise BridgeError("invalid_config", "Config contains unknown fields; see the configuration reference")
+        try:
+            hosts = parse_hosts(raw_hosts)
+        except BridgeError as error:
+            raise BridgeError("invalid_config", "Invalid hosts configuration") from error
+        try:
+            config = cls(profiles=profiles, hosts=hosts, **data)
+            try:
+                config.projects = normalize_projects(config.projects)
+            except BridgeError as error:
+                raise BridgeError("invalid_config", "Invalid projects configuration") from error
+            for key in ("codex_async_python", "telegram_database"):
+                if getattr(config, key) is not None and not isinstance(getattr(config, key), str):
+                    raise BridgeError("invalid_config", f"Config field {key!r} must be a string or null")
+            if config.default_strategy not in {"balanced", "cost", "speed"}:
+                raise BridgeError("invalid_config", "default_strategy must be balanced, cost or speed")
+            if any(type(value) is not int or value < 1 for value in (config.parallel_limit, config.quota_limit)):
+                raise BridgeError("invalid_config", "Parallel limits must be positive integers")
+            if config.worker_launcher not in {"systemd", "detached"}:
+                raise BridgeError("invalid_config", "worker_launcher must be systemd or detached")
+            if any(
+                type(value) not in {int, float} or not math.isfinite(value) or value <= 0
+                for value in (config.task_timeout, config.interrupt_timeout)
+            ):
+                raise BridgeError("invalid_config", "Timeouts must be positive finite values")
+            if config.token_budget is not None and (type(config.token_budget) is not int or config.token_budget <= 0):
+                raise BridgeError("invalid_config", "token_budget must be a positive integer")
+        except BridgeError:
+            raise
+        except (TypeError, ValueError, AttributeError, OverflowError) as error:
+            raise BridgeError("invalid_config", "Config contains invalid field types") from error
         return config
 
 
@@ -135,7 +206,10 @@ def normalize_projects(value: object) -> dict[str, str]:
     for project_id, root in value.items():
         if not isinstance(project_id, str) or not project_id or not isinstance(root, str) or not root.strip():
             raise BridgeError("invalid_config", "projects must map non-empty project ids to directory paths")
-        resolved = Path(root).expanduser().resolve()
+        try:
+            resolved = Path(root).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as error:
+            raise BridgeError("invalid_config", "Project root cannot be resolved") from error
         if not resolved.is_dir():
             raise BridgeError("invalid_config", f"Project {project_id!r} root is not a directory")
         projects[project_id] = str(resolved)

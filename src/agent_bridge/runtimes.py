@@ -172,6 +172,7 @@ class CodexRuntime:
     def __init__(self, profile: Profile, session, state: Path, on_question):
         self.profile, self.session = profile, session
         keep = {
+            "item/started",
             "item/completed",
             "item/agentMessage/delta",
             "turn/completed",
@@ -259,6 +260,7 @@ class CodexRuntime:
         self.turn_id = reply["turn"]["id"]
         await on_started(self.turn_id)
         answers, actual_model = {}, self.profile.model
+        started_tools = {}
         first_output = False
         while True:
             event = await self.client.event()
@@ -285,15 +287,26 @@ class CodexRuntime:
                 actual_model = data.get("toModel")
                 await on_event("model_changed", {"requested": self.profile.model, "reported": actual_model})
                 await self.interrupt()
+            elif method == "item/started" and data.get("turnId") == self.turn_id:
+                item = data.get("item", {})
+                if item.get("type") in {"commandExecution", "fileChange"}:
+                    if isinstance(item.get("id"), str) and item["id"]:
+                        started_tools[item["id"]] = item
+                    await on_event("tool_started", item)
             elif method == "item/completed" and data.get("turnId") == self.turn_id:
                 item = data.get("item", {})
                 if item.get("type") == "agentMessage" and item.get("phase") in {None, "final_answer"}:
                     answers[item["id"]] = item.get("text", "")
                 elif item.get("type") in {"commandExecution", "fileChange"}:
+                    started_tools.pop(item.get("id"), None)
                     await on_event("tool_completed", item)
             elif method == "turn/completed" and data.get("turn", {}).get("id") == self.turn_id:
                 turn = data["turn"]
                 status = turn["status"]
+                if status == "interrupted":
+                    for tool_id, item in started_tools.items():
+                        await on_event("tool_completed", {**item, "id": tool_id, "status": status})
+                    started_tools.clear()
                 answer = "\n\n".join(answers.values()).strip()
                 usage = (
                     usage_difference(before, self.total_usage)
@@ -525,8 +538,6 @@ def claude_environment(profile):
         environment["ANTHROPIC_BASE_URL"] = base
         environment["ANTHROPIC_AUTH_TOKEN"] = key
         environment["ANTHROPIC_API_KEY"] = ""
-        environment["HTTPS_PROXY"] = environment.get("HTTPS_PROXY") or "http://127.0.0.1:1080"
-        environment["HTTP_PROXY"] = environment.get("HTTP_PROXY") or environment["HTTPS_PROXY"]
         return environment
     endpoint = urlsplit(environment.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).hostname
     expected = profile.endpoint_host or {
