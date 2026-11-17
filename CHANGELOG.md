@@ -2,9 +2,9 @@
 
 # Changes
 
-## 0.3.0 — Unreleased
+## 0.3.0 — 2026-11-18
 
-This is an open-source preparation candidate, not a published release or an industrial certification.
+This release publishes the reviewed open-source candidate. It is not an industrial certification.
 
 - Add Apache-2.0 licensing, English documentation with Chinese translations, a short installation guide, and safe uninstall instructions.
 - Add interactive configuration, explicit first-run profiles, environment checks, and clear errors for invalid configuration. Profiles are not automatically marked inference-verified.
