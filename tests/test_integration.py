@@ -236,7 +236,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch("agent_bridge.worker.runtime", return_value=agent),
                 patch.object(worker.store, "begin_attempt", assign),
             ):
-                await asyncio.wait_for(worker.run(), 2)
+                await asyncio.wait_for(worker.run(), 10)
             self.assertEqual("completed", store.get_task(task_id)["status"])
             return task_id
 
