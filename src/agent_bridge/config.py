@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .errors import BridgeError
 from .hosts import HostConfig, parse_hosts
+from .i18n import validate_language
 from .usage import validate_price
 
 
@@ -106,6 +107,7 @@ class Config:
     default_strategy: str = "balanced"
     hosts: dict[str, HostConfig] = field(default_factory=dict)
     projects: dict[str, str] = field(default_factory=dict)  # project_id -> resolved local root directory
+    language: str | None = None
 
     @classmethod
     def load(cls, path: Path):
@@ -171,6 +173,11 @@ class Config:
             raise BridgeError("invalid_config", "Invalid hosts configuration") from error
         try:
             config = cls(profiles=profiles, hosts=hosts, **data)
+            if config.language is not None:
+                try:
+                    config.language = validate_language(config.language)
+                except ValueError as error:
+                    raise BridgeError("invalid_config", "language must be en, zh-CN or auto") from error
             try:
                 config.projects = normalize_projects(config.projects)
             except BridgeError as error:

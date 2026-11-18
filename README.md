@@ -34,6 +34,8 @@ agent-bridge call agent_inspect --json '{}'
 
 For background startup, see [managed services](docs/getting-started.md#managed-services).
 
+CLI help, setup prompts, the terminal monitor, Web pages, and parent task notices support English and Simplified Chinese. Try `agent-bridge --lang zh-CN --help`; the Web dashboard and login page have their own language selector. See [language settings](docs/getting-started.md#language).
+
 ## Connect MCP
 
 For Codex, run in the second terminal:

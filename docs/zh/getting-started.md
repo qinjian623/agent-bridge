@@ -74,6 +74,23 @@ agent-bridge --state "$HOME/.local/state/bridge-test" serve
 
 `doctor` 检查配置、可执行文件、服务可用情况与 socket 是否存在，不证明登录、模型推理或远端任务已经可用。成功调用 `agent_inspect` 才证明当前客户端能与运行中的 broker 通信。
 
+<a id="language"></a>
+## 语言设置
+
+CLI 默认使用英文。在子命令之前或之后传入 `--lang`（也可用 `--language`），或设置 `AGENT_BRIDGE_LANG`：
+
+```bash
+agent-bridge --lang zh-CN --help
+agent-bridge monitor --lang zh-CN --once
+AGENT_BRIDGE_LANG=zh-CN agent-bridge init
+```
+
+可选值为 `en`、`zh-CN` 和 `auto`。`auto` 依次读取 `LC_ALL`、`LC_MESSAGES`、`LANG`；不支持的语言使用英文。要保存默认语言，在私有 `config.json` 顶层加入 `"language": "zh-CN"`，保留其他设置。缺少该字段或值为 `null` 时默认英文。优先级为 CLI 参数、`AGENT_BRIDGE_LANG`、配置文件、英文。配置向导会保留该字段；临时选择显示语言不会改写配置。父任务通知采用 broker 的语言，已经排队的通知保留原正文。
+
+仪表盘和登录页可选择 Auto、English 和简体中文，浏览器会记住选择。Auto 按浏览器语言显示，不支持时使用英文。切换语言只改变显示，不发送、重试或取消任务。
+
+帮助、向导、监控标签、固定的界面错误提示和父任务通知会翻译，包括 CLI 输出到 stderr 的错误说明。工具名、ID、JSON 字段名、错误码、状态码、工具返回的原始内容、任务原文、模型回答及供应商诊断信息保持原样；没有翻译的提示回退到英文。
+
 <a id="mcp-setup"></a>
 ## MCP 设置
 

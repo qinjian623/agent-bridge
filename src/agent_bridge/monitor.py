@@ -20,6 +20,7 @@ from typing import Any
 from .config import state_directory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
+from .i18n import translate as _
 from .native_monitor import (
     MONITORED_RUNTIMES,
     collect_native_sessions,
@@ -2227,28 +2228,28 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
     compact = width < 96
 
     # 1. Header Banner
-    title = " cli-agent-bridge Monitor "
-    border_len = (width - len(title) - 2) // 2
-    header_bar = f"{CYAN}┌{'─' * border_len}{BOLD}{WHITE}{title}{RESET}{CYAN}{'─' * (width - border_len - len(title) - 2)}┐{RESET}"
+    title = _(" cli-agent-bridge Monitor ")
+    border_len = (width - _display_width(title) - 2) // 2
+    header_bar = f"{CYAN}┌{'─' * border_len}{BOLD}{WHITE}{title}{RESET}{CYAN}{'─' * (width - border_len - _display_width(title) - 2)}┐{RESET}"
     lines.append(header_bar)
 
     host_clean = _sanitize_tui_text(coord.get("host_id") or "-", 18 if compact else 24)
     node_clean = _sanitize_tui_text(str(coord.get("node_id") or "")[:8], 8)
-    coord_plain = f" Coord: {host_clean} | Node: {node_clean} | DB: {_format_bytes(coord.get('db_size'))} | {now_str}" if compact else f" Coordinator: {host_clean} | Node: {node_clean}... | DB: {_format_bytes(coord.get('db_size'))} | Time: {now_str}"
+    coord_plain = f" {_('Coord')}: {host_clean} | {_('Node')}: {node_clean} | {_('DB')}: {_format_bytes(coord.get('db_size'))} | {now_str}" if compact else f" {_('Coordinator')}: {host_clean} | {_('Node')}: {node_clean}... | {_('DB')}: {_format_bytes(coord.get('db_size'))} | {_('Time')}: {now_str}"
     if _display_width(coord_plain) > width - 2:
         coord_plain = _pad_display(coord_plain, width - 2)
     if compact:
         coord_info = (
-            f"{CYAN}│{RESET} Coord: {BOLD}{host_clean}{RESET} | "
-            f"Node: {DIM}{node_clean}{RESET} | "
-            f"DB: {DIM}{_format_bytes(coord.get('db_size'))}{RESET} | {now_str}"
+            f"{CYAN}│{RESET} {_('Coord')}: {BOLD}{host_clean}{RESET} | "
+            f"{_('Node')}: {DIM}{node_clean}{RESET} | "
+            f"{_('DB')}: {DIM}{_format_bytes(coord.get('db_size'))}{RESET} | {now_str}"
         )
     else:
         coord_info = (
-            f"{CYAN}│{RESET} Coordinator: {BOLD}{host_clean}{RESET} | "
-            f"Node: {DIM}{node_clean}...{RESET} | "
-            f"DB: {DIM}{_format_bytes(coord.get('db_size'))}{RESET} | "
-            f"Time: {now_str}"
+            f"{CYAN}│{RESET} {_('Coordinator')}: {BOLD}{host_clean}{RESET} | "
+            f"{_('Node')}: {DIM}{node_clean}...{RESET} | "
+            f"{_('DB')}: {DIM}{_format_bytes(coord.get('db_size'))}{RESET} | "
+            f"{_('Time')}: {now_str}"
         )
     pad = max(0, width - _display_width(coord_plain) - 2)
     lines.append(f"{coord_info}{' ' * pad}{CYAN}│{RESET}")
@@ -2281,27 +2282,27 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
         and float(total_cost_val or 0.0) == 0.0
         and (not known_coverage or (cost_has_attempts is not False and known_cost_attempts == 0))
     ):
-        cost_label = "unknown"
+        cost_label = _("unknown")
     elif not cost_complete:
         cost_label = f"${float(total_cost_val or 0.0):.4f}*"
     else:
         cost_label = f"${float(total_cost_val or 0.0):.4f}"
     if compact:
         metrics_str = (
-            f" Agents: {GREEN}{BOLD}{metrics.get('active_sessions', 0)}{RESET}/{metrics.get('total_sessions', 0)} | "
-            f"Tasks: {BLUE}{BOLD}{metrics.get('running_tasks', 0)}{RESET} | "
-            f"Wait: {RED if metrics.get('waiting_questions') else GREEN}{BOLD}{metrics.get('waiting_questions', 0)}{RESET} | "
-            f"Cost: {YELLOW}{cost_label}{RESET}"
+            f" {_('Agents')}: {GREEN}{BOLD}{metrics.get('active_sessions', 0)}{RESET}/{metrics.get('total_sessions', 0)} | "
+            f"{_('Tasks')}: {BLUE}{BOLD}{metrics.get('running_tasks', 0)}{RESET} | "
+            f"{_('Wait')}: {RED if metrics.get('waiting_questions') else GREEN}{BOLD}{metrics.get('waiting_questions', 0)}{RESET} | "
+            f"{_('Cost')}: {YELLOW}{cost_label}{RESET}"
         )
-        plain_m = f" Agents: {metrics.get('active_sessions', 0)}/{metrics.get('total_sessions', 0)} | Tasks: {metrics.get('running_tasks', 0)} | Wait: {metrics.get('waiting_questions', 0)} | Cost: {cost_label}"
+        plain_m = f" {_('Agents')}: {metrics.get('active_sessions', 0)}/{metrics.get('total_sessions', 0)} | {_('Tasks')}: {metrics.get('running_tasks', 0)} | {_('Wait')}: {metrics.get('waiting_questions', 0)} | {_('Cost')}: {cost_label}"
     else:
         metrics_str = (
-            f" Active Agents: {GREEN}{BOLD}{metrics.get('active_sessions', 0)}{RESET}/{metrics.get('total_sessions', 0)} | "
-            f"Running Tasks: {BLUE}{BOLD}{metrics.get('running_tasks', 0)}{RESET} | "
-            f"Pending Approvals: {RED if metrics.get('waiting_questions') else GREEN}{BOLD}{metrics.get('waiting_questions', 0)}{RESET} | "
-            f"Cost: {YELLOW}{cost_label}{RESET}"
+            f" {_('Active Agents')}: {GREEN}{BOLD}{metrics.get('active_sessions', 0)}{RESET}/{metrics.get('total_sessions', 0)} | "
+            f"{_('Running Tasks')}: {BLUE}{BOLD}{metrics.get('running_tasks', 0)}{RESET} | "
+            f"{_('Pending Approvals')}: {RED if metrics.get('waiting_questions') else GREEN}{BOLD}{metrics.get('waiting_questions', 0)}{RESET} | "
+            f"{_('Cost')}: {YELLOW}{cost_label}{RESET}"
         )
-        plain_m = f" Active Agents: {metrics.get('active_sessions', 0)}/{metrics.get('total_sessions', 0)} | Running Tasks: {metrics.get('running_tasks', 0)} | Pending Approvals: {metrics.get('waiting_questions', 0)} | Cost: {cost_label}"
+        plain_m = f" {_('Active Agents')}: {metrics.get('active_sessions', 0)}/{metrics.get('total_sessions', 0)} | {_('Running Tasks')}: {metrics.get('running_tasks', 0)} | {_('Pending Approvals')}: {metrics.get('waiting_questions', 0)} | {_('Cost')}: {cost_label}"
     if _display_width(plain_m) > width - 2:
         metrics_str = _clip_ansi_to_width(metrics_str, width - 2)
         pad_m = max(0, width - _display_width(_ANSI_SGR_RE.sub("", metrics_str)) - 2)
@@ -2318,7 +2319,7 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
             for s in snapshot.get("sessions", [])
             if isinstance(s, dict) and s.get("id")
         }
-        lines.append(f"\n{BG_YELLOW}{BOLD} ⚠ ACTION REQUIRED: {len(pending_q)} PENDING APPROVAL(S) {RESET}")
+        lines.append(f"\n{BG_YELLOW}{BOLD} {_('⚠ ACTION REQUIRED')}: {len(pending_q)} {_('PENDING APPROVAL(S)')} {RESET}")
         for q in pending_q:
             q_id = _sanitize_tui_text(q.get("id", ""), 36)
             s_id = _sanitize_tui_text(q.get("session_id", ""), 48)
@@ -2356,19 +2357,19 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
     hosts = snapshot.get("hosts", [])
     total_nodes = len(hosts) + 1
     ch_w, cr_w, cs_w, ct_w, cn_w, cl_w = (14, 11, 9, 14, 12, 9) if compact else (18, 13, 12, 20, 18, 15)
-    lines.append(f"\n{BOLD}{CYAN}▶ Cluster Nodes ({total_nodes}){RESET}")
-    lines.append(f"{DIM}  {'Host ID':<{ch_w}} {'Role':<{cr_w}} {'State':<{cs_w}} {'Target':<{ct_w}} {'Node ID':<{cn_w}} {'Contact' if compact else 'Last Contact'}{RESET}")
+    lines.append(f"\n{BOLD}{CYAN}▶ {_('Cluster Nodes')} ({total_nodes}){RESET}")
+    lines.append(f"{DIM}  {_pad_display(_('Host ID'), ch_w)} {_pad_display(_('Role'), cr_w)} {_pad_display(_('State'), cs_w)} {_pad_display(_('Target'), ct_w)} {_pad_display(_('Node ID'), cn_w)} {_('Contact') if compact else _('Last Contact')}{RESET}")
     lines.append(f"  {DIM}{'─' * ch_w} {'─' * cr_w} {'─' * cs_w} {'─' * ct_w} {'─' * cn_w} {'─' * cl_w}{RESET}")
     lines.append(
         f"  {BOLD}{_pad_display(host_clean, ch_w)}{RESET} "
-        f"{BLUE}{_pad_display('coordinator', cr_w)}{RESET} "
-        f"{GREEN}{_pad_display('online', cs_w)}{RESET} "
-        f"{_pad_display('local', ct_w)} "
+        f"{BLUE}{_pad_display(_('coordinator'), cr_w)}{RESET} "
+        f"{GREEN}{_pad_display(_('online'), cs_w)}{RESET} "
+        f"{_pad_display(_('local'), ct_w)} "
         f"{DIM}{_pad_display(_sanitize_tui_text(coord.get('node_id') or '-', cn_w - 2), cn_w)}{RESET} "
-        f"active"
+        f"{_('active')}"
     )
     for h in hosts:
-        state = _sanitize_tui_text(h.get("state", "offline"), cs_w)
+        state = _sanitize_tui_text(h.get("state", "offline"))
         st_color = GREEN if state == "online" else (YELLOW if state == "offline" else RED)
         h_id = _pad_display(_sanitize_tui_text(h.get("host_id", "-"), ch_w), ch_w)
         h_tgt = _pad_display(_sanitize_tui_text(h.get("ssh_target", "-"), ct_w), ct_w)
@@ -2376,8 +2377,8 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
         rel_str = _sanitize_tui_text(h.get("last_contact_rel") or _format_relative_time(h.get("last_contact")), cl_w)
         lines.append(
             f"  {BOLD}{h_id}{RESET} "
-            f"{CYAN}{_pad_display('worker', cr_w)}{RESET} "
-            f"{st_color}{_pad_display(state, cs_w)}{RESET} "
+            f"{CYAN}{_pad_display(_('worker'), cr_w)}{RESET} "
+            f"{st_color}{_pad_display(_(state), cs_w)}{RESET} "
             f"{h_tgt} "
             f"{DIM}{node_id_str}{RESET} "
             f"{rel_str}"
@@ -2385,8 +2386,8 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
 
     # 3b. Runtime Coverage (pi · claude · agy · codex)
     runtimes = snapshot.get("runtimes") or {}
-    lines.append(f"\n{BOLD}{CYAN}▶ Runtimes (Pi · Claude · AGY · Codex){RESET}")
-    lines.append(f"{DIM}  {'Runtime':<10} {'Bridge Live/All':<17} {'Native Live':<13} {'Running':<9} {'Waiting':<9} {'Cost'}{RESET}")
+    lines.append(f"\n{BOLD}{CYAN}▶ {_('Runtimes (Pi · Claude · AGY · Codex)')}{RESET}")
+    lines.append(f"{DIM}  {_pad_display(_('Runtime'), 10)} {_pad_display(_('Bridge Live/All'), 17)} {_pad_display(_('Native Live'), 13)} {_pad_display(_('Running'), 9)} {_pad_display(_('Waiting'), 9)} {_('Cost')}{RESET}")
     lines.append(f"  {DIM}{'─' * 10} {'─' * 17} {'─' * 13} {'─' * 9} {'─' * 9} {'─' * 10}{RESET}")
     for rt_key in MONITORED_RUNTIMES:
         info = runtimes.get(rt_key, {})
@@ -2402,7 +2403,7 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
         rt_known = info.get("known_cost_attempt_sessions")
         rt_coverage = isinstance(rt_known, int) and not isinstance(rt_known, bool) and rt_known >= 0
         if not rt_complete and rt_cost_val == 0.0 and (not rt_coverage or (info.get("has_attempts") is not False and rt_known == 0)):
-            rt_cost = "unknown"
+            rt_cost = _("unknown")
         elif not rt_complete:
             rt_cost = f"${rt_cost_val:.3f}*"
         else:
@@ -2427,27 +2428,28 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
     fixed_cols = 2 + host_w + 1 + rt_w + 1 + model_w + 1 + status_w + 1 + pid_w + 1 + cost_w + id_cols
     name_w = max(12, min(28, width - fixed_cols - 1))
     sessions = snapshot.get("sessions", [])
-    lines.append(f"\n{BOLD}{CYAN}▶ Bridge Sessions ({len(sessions)}){RESET}")
-    name_hdr = _pad_display("Name" if compact else "Agent / Session Name", name_w)
+    lines.append(f"\n{BOLD}{CYAN}▶ {_('Bridge Sessions')} ({len(sessions)}){RESET}")
+    name_hdr = _pad_display(_("Name") if compact else _("Agent / Session Name"), name_w)
     hdr = (
-        f"  {name_hdr} {'Host':<{host_w}} {'RT':<{rt_w}} "
-        f"{'Model':<{model_w}} {'Status':<{status_w}} {'PID':<{pid_w}} {'Cost':<{cost_w}}"
+        f"  {name_hdr} {_pad_display(_('Host'), host_w)} {_pad_display(_('RT'), rt_w)} "
+        f"{_pad_display(_('Model'), model_w)} {_pad_display(_('Status'), status_w)} {_pad_display(_('PID'), pid_w)} {_pad_display(_('Cost'), cost_w)}"
     )
     sep = (
         f"  {'─' * name_w} {'─' * host_w} {'─' * rt_w} {'─' * model_w} "
         f"{'─' * status_w} {'─' * pid_w} {'─' * cost_w}"
     )
     if not compact:
-        hdr += f" {'ID':<8}"
+        hdr += f" {_pad_display(_('ID'), 8)}"
         sep += f" {'─' * 8}"
     lines.append(f"{DIM}{hdr}{RESET}")
     lines.append(f"{DIM}{sep}{RESET}")
     if not sessions:
-        lines.append(f"  {DIM}(No sessions created yet){RESET}")
+        lines.append(f"  {DIM}{_('(No sessions created yet)')}{RESET}")
     else:
         for s in sessions[:20]:
-            obs = _sanitize_tui_text(s.get("observed", "stopped"), status_w)
-            status_txt = _pad_display("WAIT_INPUT" if s.get("waiting_question") else obs.upper() if obs in {"running", "idle"} else ("WAIT_INPUT" if obs == "waiting_input" else ("RECOVERY" if obs == "recovery_needed" else obs)), status_w)
+            obs = _sanitize_tui_text(s.get("observed", "stopped"))
+            status_label = "WAIT_INPUT" if s.get("waiting_question") else obs.upper() if obs in {"running", "idle"} else ("WAIT_INPUT" if obs == "waiting_input" else ("RECOVERY" if obs == "recovery_needed" else obs))
+            status_txt = _pad_display(_(status_label), status_w)
             if s.get("waiting_question"):
                 status_str = f"{BG_YELLOW}{BOLD}{status_txt}{RESET}"
             elif obs == "running":
@@ -2471,7 +2473,7 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
                 suffix = "*" if s.get("cost_complete") is False else ""
                 cost = f"${float(cost_val):.3f}{suffix}"
             elif s.get("has_attempts"):
-                cost = "unknown"
+                cost = _("unknown")
             else:
                 cost = "-"
             s_name = _pad_display(_sanitize_tui_text(s.get("name") or s["id"][:8], name_w), name_w)
@@ -2500,20 +2502,20 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
     n_model_w = 12 if compact else 16
     n_name_w = 18 if compact else min(28, max(18, width - 70))
     n_cwd_w = max(8, width - (2 + n_name_w + 1 + n_rt_w + 1 + n_mode_w + 1 + n_model_w + 1 + n_pid_w + 1))
-    lines.append(f"\n{BOLD}{CYAN}▶ Native CLI Processes & Workers ({len(native_sessions)}){RESET}")
+    lines.append(f"\n{BOLD}{CYAN}▶ {_('Native CLI Processes & Workers')} ({len(native_sessions)}){RESET}")
     lines.append(
-        f"{DIM}  {'Title / Session' if compact else 'Title / Native Session':<{n_name_w}} {'RT':<{n_rt_w}} {'Mode':<{n_mode_w}} "
-        f"{'Model':<{n_model_w}} {'PID':<{n_pid_w}} {'CWD'}{RESET}"
+        f"{DIM}  {_pad_display(_('Title / Session') if compact else _('Title / Native Session'), n_name_w)} {_pad_display(_('RT'), n_rt_w)} {_pad_display(_('Mode'), n_mode_w)} "
+        f"{_pad_display(_('Model'), n_model_w)} {_pad_display(_('PID'), n_pid_w)} {_('CWD')}{RESET}"
     )
     lines.append(
         f"  {DIM}{'─' * n_name_w} {'─' * n_rt_w} {'─' * n_mode_w} {'─' * n_model_w} {'─' * n_pid_w} {'─' * min(n_cwd_w, 28)}{RESET}"
     )
     if not native_sessions:
-        lines.append(f"  {DIM}(No live native pi/claude/agy/codex processes){RESET}")
+        lines.append(f"  {DIM}{_('(No live native pi/claude/agy/codex processes)')}{RESET}")
     else:
         for n in native_sessions[:20]:
             rt_tag = _pad_display(_sanitize_tui_text(n.get("display_runtime") or n.get("runtime") or "-", n_rt_w), n_rt_w)
-            mode_clean = _sanitize_tui_text(n.get("mode") or "-", n_mode_w)
+            mode_clean = _sanitize_tui_text(n.get("mode") or "-")
             m_color = GREEN if mode_clean == "headless" else (CYAN if mode_clean == "interactive" else DIM)
             n_title = _pad_display(_sanitize_tui_text(n.get("name") or "-", n_name_w), n_name_w)
             n_model = _pad_display(_sanitize_tui_text(n.get("model") or "-", n_model_w), n_model_w)
@@ -2521,7 +2523,7 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
             lines.append(
                 f"  {BOLD}{n_title}{RESET} "
                 f"{rt_tag} "
-                f"{m_color}{_pad_display(mode_clean, n_mode_w)}{RESET} "
+                f"{m_color}{_pad_display(_(mode_clean), n_mode_w)}{RESET} "
                 f"{n_model} "
                 f"{_pad_display(_sanitize_tui_text(n.get('pid') or '-', n_pid_w), n_pid_w)} "
                 f"{DIM}{n_cwd}{RESET}"
@@ -2532,14 +2534,14 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
     groups = snapshot.get("groups", [])
     b_w, g_w, p_w = (12, 12, 14) if compact else (16, 14, 18)
     b_prev_w = max(12, width - (2 + b_w + 1 + g_w + 1 + p_w + 1))
-    lines.append(f"\n{BOLD}{CYAN}▶ Communications & Groups ({len(groups)} groups, {len(broadcasts)} broadcasts){RESET}")
+    lines.append(f"\n{BOLD}{CYAN}▶ {_('Communications & Groups')} ({len(groups)} {_('groups')}, {len(broadcasts)} {_('broadcasts')}){RESET}")
     if broadcasts:
-        lines.append(f"{DIM}  {'Broadcast ID':<{b_w}} {'Group':<{g_w}} {'Progress':<{p_w}} {'Message Preview'}{RESET}")
+        lines.append(f"{DIM}  {_pad_display(_('Broadcast ID'), b_w)} {_pad_display(_('Group'), g_w)} {_pad_display(_('Progress'), p_w)} {_('Message Preview')}{RESET}")
         lines.append(f"  {DIM}{'─' * b_w} {'─' * g_w} {'─' * p_w} {'─' * min(b_prev_w, 40)}{RESET}")
         for b in broadcasts[:5]:
-            prog_txt = f"{b['received']}/{b['total']} recv"
+            prog_txt = f"{b['received']}/{b['total']} {_('recv')}"
             if b.get("uncertain"):
-                prog_txt += f" ({b['uncertain']} uncert)"
+                prog_txt += f" ({b['uncertain']} {_('uncert')})"
             b_id = _pad_display(_sanitize_tui_text(b.get("broadcast_id", ""), b_w), b_w)
             g_id = _pad_display(_sanitize_tui_text(b.get("group_id", ""), g_w), g_w)
             preview = _sanitize_tui_text(b.get("message_preview", ""), b_prev_w)
@@ -2550,17 +2552,17 @@ def render_tui(snapshot: dict[str, Any], width: int = 100) -> str:
                 f"{preview}"
             )
     else:
-        lines.append(f"  {DIM}(No broadcast activity recorded){RESET}")
+        lines.append(f"  {DIM}{_('(No broadcast activity recorded)')}{RESET}")
 
     # 6. Recent Event Tail
     events = snapshot.get("events", [])
     e_sq, e_tm, e_kd, e_sn = (5, 8, 14, 12) if compact else (6, 10, 18, 16)
     e_sm = max(12, width - (2 + e_sq + 1 + e_tm + 1 + e_kd + 1 + e_sn + 1))
-    lines.append(f"\n{BOLD}{CYAN}▶ Live Events (Recent {len(events)}){RESET}")
-    lines.append(f"{DIM}  {'Seq':<{e_sq}} {'Time':<{e_tm}} {'Kind':<{e_kd}} {'Session':<{e_sn}} {'Detail / Summary'}{RESET}")
+    lines.append(f"\n{BOLD}{CYAN}▶ {_('Live Events')} ({_('Recent')} {len(events)}){RESET}")
+    lines.append(f"{DIM}  {_pad_display(_('Seq'), e_sq)} {_pad_display(_('Time'), e_tm)} {_pad_display(_('Kind'), e_kd)} {_pad_display(_('Session'), e_sn)} {_('Detail / Summary')}{RESET}")
     lines.append(f"  {DIM}{'─' * e_sq} {'─' * e_tm} {'─' * e_kd} {'─' * e_sn} {'─' * min(e_sm, 45)}{RESET}")
     if not events:
-        lines.append(f"  {DIM}(No events yet){RESET}")
+        lines.append(f"  {DIM}{_('(No events yet)')}{RESET}")
     else:
         for e in events[:8]:
             kind = _sanitize_tui_text(e["kind"], e_kd)
@@ -2620,10 +2622,10 @@ def run_tui_monitor(
             snapshot = collector.collect(limit=15, **collect_kwargs)
             output = render_tui(snapshot, width=term_width)
             # Home cursor and redraw
-            print("\033[H" + output + f"\n\n{DIM}[Press Ctrl+C to exit monitor | Refreshing every {interval}s]{RESET}\033[J", flush=True)
+            print("\033[H" + output + f"\n\n{DIM}{_('[Press Ctrl+C to exit monitor | Refreshing every {interval}s]', interval=interval)}{RESET}\033[J", flush=True)
             time.sleep(interval)
     except KeyboardInterrupt:
-        print(f"\n{DIM}Monitor stopped.{RESET}")
+        print(f"\n{DIM}{_('Monitor stopped.')}{RESET}")
 
 
 def set_session_name(state: Path | str | None, session_id: str, name: str) -> str:
@@ -2631,7 +2633,7 @@ def set_session_name(state: Path | str | None, session_id: str, name: str) -> st
     state_dir = state_directory(state)
     db_path = state_dir / "bridge.sqlite"
     if not db_path.exists():
-        raise ValueError(f"State database not found: {db_path}")
+        raise ValueError(_("State database not found: {db_path}", db_path=db_path))
 
     store = Store(state_dir)
     # Resolve session_id if given as prefix
@@ -2641,7 +2643,7 @@ def set_session_name(state: Path | str | None, session_id: str, name: str) -> st
             (session_id, f"{session_id}%"),
         ).fetchall()
     if not rows:
-        raise ValueError(f"Session not found matching: {session_id}")
+        raise ValueError(_("Session not found matching: {session_id}", session_id=session_id))
     full_sid = rows[0]["id"]
     store.set_session_name(full_sid, name)
     return full_sid

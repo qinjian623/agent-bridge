@@ -34,6 +34,8 @@ agent-bridge call agent_inspect --json '{}'
 
 需要后台启动时，见[托管服务](getting-started.md#managed-services)。
 
+CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英文与简体中文。运行 `agent-bridge --lang zh-CN --help` 查看中文帮助；Web 仪表盘和登录页可单独选择语言，见[语言设置](getting-started.md#language)。
+
 ## 接入 MCP
 
 Codex 用户在第二个终端执行：

@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .config import MAX_TOKEN_BYTES, read_admin_token, safe_error, state_directory  # noqa: F401 (re-exported)
 from .errors import BridgeError
+from .i18n import get_catalog
 from .monitor import MonitorCollector
 from .native_monitor import (
     MONITORED_RUNTIMES,
@@ -70,13 +71,145 @@ DEFAULT_ALLOWED_HOSTS = {
     "localhost:8080",
 }
 
+
+def _script_json(value: Any) -> str:
+    """Serialize trusted catalog data for a script element without terminating it early."""
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+_WEB_I18N_SCRIPT = """    const WEB_I18N_CATALOG = __WEB_I18N_CATALOG__;
+    const WEB_LANGUAGE_STORAGE_KEY = 'cli-agent-bridge.web-language';
+    let webLanguageChoice = 'auto';
+    let webLanguage = 'en';
+
+    function normalizeUiLanguage(value) {
+      if (typeof value !== 'string') return null;
+      const normalized = value.trim().split('.', 1)[0].split('@', 1)[0].replace(/_/g, '-').toLowerCase();
+      if (normalized === 'auto') return 'auto';
+      if (normalized === 'c' || normalized === 'posix' || normalized === 'en' || normalized.startsWith('en-')) {
+        return 'en';
+      }
+      if (normalized === 'zh' || normalized === 'zh-cn' || normalized === 'zh-sg' ||
+          normalized === 'zh-hans' || normalized.startsWith('zh-hans-')) {
+        return 'zh-CN';
+      }
+      return null;
+    }
+
+    function readBrowserLanguagePreferences() {
+      if (typeof navigator === 'undefined') return [];
+      const preferences = Array.isArray(navigator.languages) ? navigator.languages.slice() : [];
+      if (typeof navigator.language === 'string' && navigator.language) preferences.push(navigator.language);
+      return preferences;
+    }
+
+    function resolveUiLanguage(choice) {
+      const normalized = normalizeUiLanguage(choice);
+      if (normalized === 'en' || normalized === 'zh-CN') return normalized;
+      if (normalized !== 'auto') return 'en';
+      // Auto follows the browser preference; unsupported browser locales use English.
+      for (const preference of readBrowserLanguagePreferences()) {
+        const language = normalizeUiLanguage(preference);
+        if (language === 'en' || language === 'zh-CN') return language;
+      }
+      return 'en';
+    }
+
+    function readStoredUiLanguage() {
+      try {
+        if (typeof window === 'undefined' || !window.localStorage) return 'auto';
+        return normalizeUiLanguage(window.localStorage.getItem(WEB_LANGUAGE_STORAGE_KEY)) || 'auto';
+      } catch (error) {
+        return 'auto';
+      }
+    }
+
+    function storeUiLanguage(choice) {
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) {
+          window.localStorage.setItem(WEB_LANGUAGE_STORAGE_KEY, choice);
+        }
+      } catch (error) {
+        // Storage can be unavailable in hardened or private browser contexts; keep the in-memory choice.
+      }
+    }
+
+    function interpolateUi(message, values) {
+      if (!values) return message;
+      return message.replace(/\\{([a-zA-Z_][a-zA-Z0-9_]*)\\}/g, (match, key) => (
+        Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : match
+      ));
+    }
+
+    function translateUi(message, values) {
+      const key = message === null || message === undefined ? '' : String(message);
+      const template = webLanguage === 'zh-CN' && Object.prototype.hasOwnProperty.call(WEB_I18N_CATALOG, key)
+        ? WEB_I18N_CATALOG[key]
+        : key;
+      return interpolateUi(template, values);
+    }
+
+    function applyUiTranslations() {
+      if (document.documentElement) {
+        document.documentElement.lang = webLanguage;
+        document.documentElement.setAttribute('data-language', webLanguage);
+      }
+      document.querySelectorAll('[data-i18n]').forEach((element) => {
+        const key = element.getAttribute('data-i18n');
+        if (key) element.textContent = translateUi(key);
+      });
+      document.querySelectorAll('[data-i18n-aria-label]').forEach((element) => {
+        const key = element.getAttribute('data-i18n-aria-label');
+        if (key) element.setAttribute('aria-label', translateUi(key));
+      });
+      document.querySelectorAll('[data-i18n-title]').forEach((element) => {
+        const key = element.getAttribute('data-i18n-title');
+        if (key) element.setAttribute('title', translateUi(key));
+      });
+      document.querySelectorAll('[data-i18n-placeholder]').forEach((element) => {
+        const key = element.getAttribute('data-i18n-placeholder');
+        if (key) element.setAttribute('placeholder', translateUi(key));
+      });
+    }
+
+    function setUiLanguage(choice, persist) {
+      webLanguageChoice = normalizeUiLanguage(choice) || 'en';
+      webLanguage = resolveUiLanguage(webLanguageChoice);
+      if (persist) storeUiLanguage(webLanguageChoice);
+      const select = document.getElementById('languageSelect');
+      if (select) select.value = webLanguageChoice;
+      applyUiTranslations();
+      if (typeof onUiLanguageChanged === 'function') onUiLanguageChanged();
+    }
+
+    function initializeUiLanguage() {
+      const select = document.getElementById('languageSelect');
+      if (select && !select.dataset.i18nBound) {
+        select.dataset.i18nBound = 'true';
+        select.addEventListener('change', () => setUiLanguage(select.value, true));
+      }
+      setUiLanguage(readStoredUiLanguage(), false);
+    }
+
+"""
+_WEB_I18N_SCRIPT = _WEB_I18N_SCRIPT.replace(
+    "__WEB_I18N_CATALOG__", _script_json(get_catalog("zh-CN"))
+)
+
 _HTML_HEAD = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
-  <title>cli-agent-bridge | Multi-Agent Monitor</title>
+  <title data-i18n="cli-agent-bridge | Multi-Agent Monitor">cli-agent-bridge | Multi-Agent Monitor</title>
   <style>
     :root {
       color-scheme: light;
@@ -363,6 +496,21 @@ _HTML_HEAD = """<!DOCTYPE html>
     .filter-group { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
     .filter-label { color: var(--text-muted); font-size: 12px; font-weight: 700; }
     .filter-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .language-group { margin-left: auto; }
+    .language-select {
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--text);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .language-select:hover { background: var(--surface-muted); border-color: var(--border-strong); }
+    .language-select option { background: var(--surface); color: var(--text); }
     .chip-btn {
       min-height: 32px;
       padding: 0 12px;
@@ -712,6 +860,8 @@ _HTML_HEAD = """<!DOCTYPE html>
       .toolbar { align-items: stretch; flex-direction: column; }
       .filter-group { justify-content: space-between; }
       .filter-chips { width: 100%; }
+      .language-group { margin-left: 0; }
+      .language-select { flex: 1 1 auto; min-height: 44px; }
       .chip-btn { flex: 1 1 auto; }
       .card-header { padding: 12px 14px; }
       .card-body { padding: 14px; }
@@ -738,62 +888,62 @@ _HTML_HEAD = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <a class="skip-link" href="#main">Skip to dashboard</a>
+  <a class="skip-link" href="#main" data-i18n="Skip to dashboard">Skip to dashboard</a>
 """
 _HTML_BODY = """  <header class="app-header">
     <div class="header-inner">
       <div class="brand">
         <div class="logo" aria-hidden="true">B</div>
         <div class="brand-copy">
-          <span class="brand-name">cli-agent-bridge Monitor</span>
-          <span class="brand-sub">Operations dashboard</span>
+          <span class="brand-name" data-i18n="cli-agent-bridge Monitor">cli-agent-bridge Monitor</span>
+          <span class="brand-sub" data-i18n="Operations dashboard">Operations dashboard</span>
         </div>
         <span id="coordBadge" class="coord-badge"></span>
       </div>
       <div class="header-actions">
-        <span id="connectionStatus" class="connection-status" data-state="connecting" role="status" aria-live="polite">Connecting&hellip;</span>
-        <button class="btn btn-secondary" id="refreshBtn" type="button">Refresh</button>
-        <button class="btn btn-danger" id="logoutBtn" type="button">Sign out</button>
+        <span id="connectionStatus" class="connection-status" data-state="connecting" role="status" aria-live="polite" data-i18n="Connecting…">Connecting&hellip;</span>
+        <button class="btn btn-secondary" id="refreshBtn" type="button" data-i18n="Refresh">Refresh</button>
+        <button class="btn btn-danger" id="logoutBtn" type="button" data-i18n="Sign out">Sign out</button>
       </div>
     </div>
   </header>
 
   <main id="main" tabindex="-1">
     <div id="connectionBanner" class="connection-banner" role="status" aria-live="polite" hidden></div>
-    <div id="approvalSection" class="approval-section" aria-label="Pending approvals" style="display: none;"></div>
+    <div id="approvalSection" class="approval-section" aria-label="Pending approvals" data-i18n-aria-label="Pending approvals" style="display: none;"></div>
 
-    <section class="summary-grid" aria-label="Snapshot summary">
+    <section class="summary-grid" aria-label="Snapshot summary" data-i18n-aria-label="Snapshot summary">
       <div class="stat-card">
-        <span class="stat-label">Hosts online</span>
-        <span class="stat-value" id="statNodes" title="Reachable Bridge execution hosts">&mdash;</span>
+        <span class="stat-label" data-i18n="Hosts online">Hosts online</span>
+        <span class="stat-value" id="statNodes" title="Reachable Bridge execution hosts" data-i18n-title="Reachable Bridge execution hosts">&mdash;</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">Bridge workers</span>
-        <span class="stat-value" id="statActive" title="Bridge worker processes alive or waiting; idle workers are not executing a task">&mdash;</span>
+        <span class="stat-label" data-i18n="Bridge workers">Bridge workers</span>
+        <span class="stat-value" id="statActive" title="Bridge worker processes alive or waiting; idle workers are not executing a task" data-i18n-title="Bridge worker processes alive or waiting; idle workers are not executing a task">&mdash;</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">Native processes</span>
-        <span class="stat-value" id="statNative" title="Detected native CLI processes. Presence does not prove active inference.">&mdash;</span>
+        <span class="stat-label" data-i18n="Native processes">Native processes</span>
+        <span class="stat-value" id="statNative" title="Detected native CLI processes. Presence does not prove active inference." data-i18n-title="Detected native CLI processes. Presence does not prove active inference.">&mdash;</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">Tasks running</span>
-        <span class="stat-value" id="statTasks" title="Bridge tasks currently in the running state">&mdash;</span>
+        <span class="stat-label" data-i18n="Tasks running">Tasks running</span>
+        <span class="stat-value" id="statTasks" title="Bridge tasks currently in the running state" data-i18n-title="Bridge tasks currently in the running state">&mdash;</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">Broadcasts</span>
-        <span class="stat-value" id="statBroadcasts" title="Broadcast communications recorded in the snapshot">&mdash;</span>
+        <span class="stat-label" data-i18n="Broadcasts">Broadcasts</span>
+        <span class="stat-value" id="statBroadcasts" title="Broadcast communications recorded in the snapshot" data-i18n-title="Broadcast communications recorded in the snapshot">&mdash;</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">Estimated cost</span>
-        <span class="stat-value" id="statCost" title="Reported cost for known attempts">&mdash;</span>
+        <span class="stat-label" data-i18n="Estimated cost">Estimated cost</span>
+        <span class="stat-value" id="statCost" title="Reported cost for known attempts" data-i18n-title="Reported cost for known attempts">&mdash;</span>
       </div>
     </section>
 
-    <section class="toolbar" aria-label="Dashboard filters">
+    <section class="toolbar" aria-label="Dashboard filters" data-i18n-aria-label="Dashboard filters">
       <div class="filter-group">
-        <span class="filter-label" id="runtimeFilterLabel">Runtime</span>
+        <span class="filter-label" id="runtimeFilterLabel" data-i18n="Runtime">Runtime</span>
         <div class="filter-chips" id="runtimeFilterBar" role="group" aria-labelledby="runtimeFilterLabel">
-          <button class="chip-btn active" type="button" data-runtime="all" aria-pressed="true">All runtimes</button>
+          <button class="chip-btn active" type="button" data-runtime="all" aria-pressed="true" data-i18n="All runtimes">All runtimes</button>
           <button class="chip-btn" type="button" data-runtime="pi" aria-pressed="false">Pi</button>
           <button class="chip-btn" type="button" data-runtime="claude" aria-pressed="false">Claude</button>
           <button class="chip-btn" type="button" data-runtime="antigravity" aria-pressed="false">AGY</button>
@@ -801,59 +951,64 @@ _HTML_BODY = """  <header class="app-header">
         </div>
       </div>
       <div class="filter-group">
-        <span class="filter-label" id="viewFilterLabel">View</span>
-        <button class="chip-btn" type="button" id="activeOnlyBtn" aria-pressed="false" title="Hide stopped sessions and daemon processes">Active only</button>
+        <span class="filter-label" id="viewFilterLabel" data-i18n="View">View</span>
+        <button class="chip-btn" type="button" id="activeOnlyBtn" aria-pressed="false" title="Hide stopped sessions and daemon processes" data-i18n-title="Hide stopped sessions and daemon processes">Active only</button>
+      </div>
+      <div class="filter-group language-group">
+        <label class="filter-label" for="languageSelect" data-i18n="Language">Language</label>
+        <select class="language-select" id="languageSelect" aria-label="Language" data-i18n-aria-label="Language">
+          <option value="auto" data-i18n="Auto">Auto</option>
+          <option value="en">English</option>
+          <option value="zh-CN">简体中文</option>
+        </select>
       </div>
     </section>
 
     <section aria-labelledby="runtimeOverviewTitle">
-      <h2 class="sr-only" id="runtimeOverviewTitle">Runtime overview</h2>
+      <h2 class="sr-only" id="runtimeOverviewTitle" data-i18n="Runtime overview">Runtime overview</h2>
       <div class="runtime-grid" id="runtimeGrid"></div>
     </section>
 
     <section class="card" aria-labelledby="topologyTitle">
       <div class="card-header">
         <div class="card-heading">
-          <h2 class="card-title" id="topologyTitle"><span class="status-dot" aria-hidden="true"></span>Host Connections &amp; Live Bridge Sessions</h2>
-          <p class="card-subtitle">SSH links and local Bridge workers. A live worker does not necessarily mean a task is executing.</p>
+          <h2 class="card-title" id="topologyTitle"><span class="status-dot" aria-hidden="true"></span><span data-i18n="Host Connections &amp; Live Bridge Sessions">Host Connections &amp; Live Bridge Sessions</span></h2>
+          <p class="card-subtitle" data-i18n="SSH links and local Bridge workers. A live worker does not necessarily mean a task is executing.">SSH links and local Bridge workers. A live worker does not necessarily mean a task is executing.</p>
         </div>
         <div id="topoStats" class="card-meta"></div>
       </div>
       <div class="card-body">
-        <div class="topo-container" tabindex="0" role="group" aria-label="Host connections; scroll horizontally if needed" aria-describedby="topoScope">
-          <svg class="topo-svg" id="topoGraph" aria-label="Host connections and live local Bridge sessions"></svg>
+        <div class="topo-container" tabindex="0" role="group" aria-label="Host connections; scroll horizontally if needed" data-i18n-aria-label="Host connections; scroll horizontally if needed" aria-describedby="topoScope">
+          <svg class="topo-svg" id="topoGraph" aria-label="Host connections and live local Bridge sessions" data-i18n-aria-label="Host connections and live local Bridge sessions"></svg>
         </div>
-        <p id="topoScope" class="scope-note">
-          Host links show SSH connection status. Sessions shown: local Bridge workers with live processes.
-          Remote/native sessions and message traffic are not collected. A live worker means the process exists; check the session status below for whether a task is executing.
-        </p>
+        <p id="topoScope" class="scope-note" data-i18n="Host links show SSH connection status. Sessions shown: local Bridge workers with live processes. Remote/native sessions and message traffic are not collected. A live worker means the process exists; check the session status below for whether a task is executing.">Host links show SSH connection status. Sessions shown: local Bridge workers with live processes. Remote/native sessions and message traffic are not collected. A live worker means the process exists; check the session status below for whether a task is executing.</p>
       </div>
     </section>
 
     <section class="card" aria-labelledby="hostsTitle">
       <div class="card-header">
         <div class="card-heading">
-          <h2 class="card-title" id="hostsTitle">Cluster Nodes (Execution Hosts)</h2>
-          <p class="card-subtitle">Coordinator and configured worker hosts. Link status is not a measure of model activity.</p>
+          <h2 class="card-title" id="hostsTitle" data-i18n="Cluster Nodes (Execution Hosts)">Cluster Nodes (Execution Hosts)</h2>
+          <p class="card-subtitle" data-i18n="Coordinator and configured worker hosts. Link status is not a measure of model activity.">Coordinator and configured worker hosts. Link status is not a measure of model activity.</p>
         </div>
-        <div id="hostStats" class="card-meta">1 node</div>
+        <div id="hostStats" class="card-meta" data-i18n="1 node">1 node</div>
       </div>
-      <div class="table-frame table-frame--hosts" tabindex="0" role="region" aria-label="Cluster nodes table; scroll horizontally if needed">
+      <div class="table-frame table-frame--hosts" tabindex="0" role="region" aria-label="Cluster nodes table; scroll horizontally if needed" data-i18n-aria-label="Cluster nodes table; scroll horizontally if needed">
         <table class="data-table data-table--hosts">
           <thead>
             <tr>
-              <th scope="col">Host ID</th>
-              <th scope="col">Role</th>
-              <th scope="col">Status</th>
-              <th scope="col">SSH Target</th>
-              <th scope="col">Node ID &amp; Generation</th>
-              <th scope="col">Managed Projects</th>
-              <th scope="col">Last Contact</th>
-              <th scope="col">Action</th>
+              <th scope="col" data-i18n="Host ID">Host ID</th>
+              <th scope="col" data-i18n="Role">Role</th>
+              <th scope="col" data-i18n="Status">Status</th>
+              <th scope="col" data-i18n="SSH Target">SSH Target</th>
+              <th scope="col" data-i18n="Node ID &amp; Generation">Node ID &amp; Generation</th>
+              <th scope="col" data-i18n="Managed Projects">Managed Projects</th>
+              <th scope="col" data-i18n="Last Contact">Last Contact</th>
+              <th scope="col" data-i18n="Action">Action</th>
             </tr>
           </thead>
           <tbody id="hostTable">
-            <tr><td class="empty-cell" colspan="8">Loading cluster nodes&hellip;</td></tr>
+            <tr><td class="empty-cell" colspan="8" data-i18n="Loading cluster nodes…">Loading cluster nodes&hellip;</td></tr>
           </tbody>
         </table>
       </div>
@@ -863,25 +1018,25 @@ _HTML_BODY = """  <header class="app-header">
       <section class="card" aria-labelledby="sessionsTitle">
         <div class="card-header">
           <div class="card-heading">
-            <h2 class="card-title" id="sessionsTitle">Agents &amp; Sessions</h2>
-            <p class="card-subtitle">Bridge status comes from worker and task state. Idle means no task is executing.</p>
+            <h2 class="card-title" id="sessionsTitle" data-i18n="Agents &amp; Sessions">Agents &amp; Sessions</h2>
+            <p class="card-subtitle" data-i18n="Bridge status comes from worker and task state. Idle means no task is executing.">Bridge status comes from worker and task state. Idle means no task is executing.</p>
           </div>
-          <div id="sessionCount" class="card-meta">0 sessions</div>
+          <div id="sessionCount" class="card-meta" data-i18n="0 sessions">0 sessions</div>
         </div>
-        <div class="table-frame table-frame--sessions" tabindex="0" role="region" aria-label="Agents and sessions table; scroll horizontally if needed">
+        <div class="table-frame table-frame--sessions" tabindex="0" role="region" aria-label="Agents and sessions table; scroll horizontally if needed" data-i18n-aria-label="Agents and sessions table; scroll horizontally if needed">
           <table class="data-table data-table--sessions">
             <thead>
               <tr>
-                <th scope="col">Agent / Session</th>
-                <th scope="col">Host</th>
-                <th scope="col">Runtime</th>
-                <th scope="col">Status</th>
-                <th scope="col">Goal / Task</th>
-                <th scope="col">Cost</th>
+                <th scope="col" data-i18n="Agent / Session">Agent / Session</th>
+                <th scope="col" data-i18n="Host">Host</th>
+                <th scope="col" data-i18n="Runtime">Runtime</th>
+                <th scope="col" data-i18n="Status">Status</th>
+                <th scope="col" data-i18n="Goal / Task">Goal / Task</th>
+                <th scope="col" data-i18n="Cost">Cost</th>
               </tr>
             </thead>
             <tbody id="sessionTable">
-              <tr><td class="empty-cell" colspan="6">Loading agents and sessions&hellip;</td></tr>
+              <tr><td class="empty-cell" colspan="6" data-i18n="Loading agents and sessions…">Loading agents and sessions&hellip;</td></tr>
             </tbody>
           </table>
         </div>
@@ -890,24 +1045,24 @@ _HTML_BODY = """  <header class="app-header">
       <section class="card" aria-labelledby="broadcastsTitle">
         <div class="card-header">
           <div class="card-heading">
-            <h2 class="card-title" id="broadcastsTitle">Communications &amp; Groups</h2>
-            <p class="card-subtitle">Broadcast delivery progress and recent group messages.</p>
+            <h2 class="card-title" id="broadcastsTitle" data-i18n="Communications &amp; Groups">Communications &amp; Groups</h2>
+            <p class="card-subtitle" data-i18n="Broadcast delivery progress and recent group messages.">Broadcast delivery progress and recent group messages.</p>
           </div>
-          <div id="groupStats" class="card-meta">0 broadcasts</div>
+          <div id="groupStats" class="card-meta" data-i18n="0 broadcasts">0 broadcasts</div>
         </div>
-        <div class="table-frame table-frame--broadcasts" tabindex="0" role="region" aria-label="Communications and groups table; scroll horizontally if needed">
+        <div class="table-frame table-frame--broadcasts" tabindex="0" role="region" aria-label="Communications and groups table; scroll horizontally if needed" data-i18n-aria-label="Communications and groups table; scroll horizontally if needed">
           <table class="data-table data-table--broadcasts">
             <thead>
               <tr>
-                <th scope="col">Broadcast / Group</th>
-                <th scope="col">Progress</th>
-                <th scope="col">Members</th>
-                <th scope="col">Message Preview</th>
-                <th scope="col">Age</th>
+                <th scope="col" data-i18n="Broadcast / Group">Broadcast / Group</th>
+                <th scope="col" data-i18n="Progress">Progress</th>
+                <th scope="col" data-i18n="Members">Members</th>
+                <th scope="col" data-i18n="Message Preview">Message Preview</th>
+                <th scope="col" data-i18n="Age">Age</th>
               </tr>
             </thead>
             <tbody id="broadcastTable">
-              <tr><td class="empty-cell" colspan="5">No broadcasts recorded yet</td></tr>
+              <tr><td class="empty-cell" colspan="5" data-i18n="No broadcasts recorded yet">No broadcasts recorded yet</td></tr>
             </tbody>
           </table>
         </div>
@@ -917,25 +1072,25 @@ _HTML_BODY = """  <header class="app-header">
     <section class="card" aria-labelledby="nativeTitle">
       <div class="card-header">
         <div class="card-heading">
-          <h2 class="card-title" id="nativeTitle">Native CLI Processes &amp; Workers (pi &middot; claude &middot; agy &middot; codex)</h2>
-          <p class="card-subtitle">Process presence only. A detected process does not prove that the CLI is currently running inference.</p>
+          <h2 class="card-title" id="nativeTitle" data-i18n="Native CLI Processes &amp; Workers (pi · claude · agy · codex)">Native CLI Processes &amp; Workers (pi &middot; claude &middot; agy &middot; codex)</h2>
+          <p class="card-subtitle" data-i18n="Process presence only. A detected process does not prove that the CLI is currently running inference.">Process presence only. A detected process does not prove that the CLI is currently running inference.</p>
         </div>
-        <div id="nativeCount" class="card-meta">0 native</div>
+        <div id="nativeCount" class="card-meta" data-i18n="0 native">0 native</div>
       </div>
-      <div class="table-frame table-frame--native" tabindex="0" role="region" aria-label="Native CLI processes table; scroll horizontally if needed">
+      <div class="table-frame table-frame--native" tabindex="0" role="region" aria-label="Native CLI processes table; scroll horizontally if needed" data-i18n-aria-label="Native CLI processes table; scroll horizontally if needed">
         <table class="data-table data-table--native">
           <thead>
             <tr>
-              <th scope="col">Runtime</th>
+              <th scope="col" data-i18n="Runtime">Runtime</th>
               <th scope="col">PID</th>
-              <th scope="col">Session / Title</th>
-              <th scope="col">Model</th>
-              <th scope="col">Process</th>
-              <th scope="col">Kind / CWD</th>
+              <th scope="col" data-i18n="Session / Title">Session / Title</th>
+              <th scope="col" data-i18n="Model">Model</th>
+              <th scope="col" data-i18n="Process">Process</th>
+              <th scope="col" data-i18n="Kind / CWD">Kind / CWD</th>
             </tr>
           </thead>
           <tbody id="nativeTable">
-            <tr><td colspan="6" class="empty-cell">Loading native processes&hellip;</td></tr>
+            <tr><td colspan="6" class="empty-cell" data-i18n="Loading native processes…">Loading native processes&hellip;</td></tr>
           </tbody>
         </table>
       </div>
@@ -944,20 +1099,20 @@ _HTML_BODY = """  <header class="app-header">
     <section class="card" aria-labelledby="eventsTitle">
       <div class="card-header">
         <div class="card-heading">
-          <h2 class="card-title" id="eventsTitle">Live Event Stream</h2>
-          <p class="card-subtitle">Latest Bridge events from the current snapshot.</p>
+          <h2 class="card-title" id="eventsTitle" data-i18n="Live Event Stream">Live Event Stream</h2>
+          <p class="card-subtitle" data-i18n="Latest Bridge events from the current snapshot.">Latest Bridge events from the current snapshot.</p>
         </div>
-        <div class="card-meta">Auto-updating</div>
+        <div class="card-meta" data-i18n="Auto-updating">Auto-updating</div>
       </div>
       <div class="card-body">
-        <div class="log-container" id="eventLog" tabindex="0" role="region" aria-label="Event stream; scroll for older events" aria-live="off">
-          <div class="empty-log">Waiting for events&hellip;</div>
+        <div class="log-container" id="eventLog" tabindex="0" role="region" aria-label="Event stream; scroll for older events" data-i18n-aria-label="Event stream; scroll for older events" aria-live="off">
+          <div class="empty-log" data-i18n="Waiting for events…">Waiting for events&hellip;</div>
         </div>
       </div>
     </section>
 
-    <section class="api-bar" aria-label="Integration APIs">
-      <span class="api-label">Integration APIs</span>
+    <section class="api-bar" aria-label="Integration APIs" data-i18n-aria-label="Integration APIs">
+      <span class="api-label" data-i18n="Integration APIs">Integration APIs</span>
       <code>GET /api/v1/health</code>
       <code>GET /api/v1/runtimes</code>
       <code>GET /api/v1/sessions?runtime=all&amp;source=all&amp;status=active</code>
@@ -972,12 +1127,56 @@ _HTML_BODY = """  <header class="app-header">
 _HTML_SCRIPT = """  <script>
     'use strict';
 
+/*__WEB_I18N__*/
     const SVG_NS = 'http://www.w3.org/2000/svg';
     let currentData = null;
     let csrfToken = null;
     let selectedRuntime = 'all';
     let activeOnly = false;
     const approvalRequestIds = new Map();
+
+    function uiText(message, values) {
+      if (typeof translateUi === 'function') return translateUi(message, values);
+      if (!values) return message;
+      return message.replace(/\\{([a-zA-Z_][a-zA-Z0-9_]*)\\}/g, (match, key) => (
+        Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : match
+      ));
+    }
+
+    function localizeStatus(status) {
+      if (!status || typeof status !== 'object') return status;
+      const separator = typeof webLanguage === 'string' && webLanguage === 'zh-CN' ? '' : ' ';
+      const detail = Array.isArray(status.detailParts)
+        ? status.detailParts.map((part) => uiText(part.message, part.values)).join(separator)
+        : uiText(status.detailKey || status.detail, status.detailValues || {});
+      return { ...status, label: uiText(status.label), detail: detail };
+    }
+
+    function formatUiCount(value) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return value === null || value === undefined ? '' : String(value);
+      try {
+        return new Intl.NumberFormat(
+          typeof webLanguage === 'string' && webLanguage === 'zh-CN' ? 'zh-CN' : 'en-US',
+          { maximumFractionDigits: 0 }
+        ).format(number);
+      } catch (error) {
+        return String(number);
+      }
+    }
+
+    function formatUiRelative(value) {
+      const text = value === null || value === undefined ? '' : String(value);
+      if (!text || text === '-') return text;
+      if (text === 'now') return uiText('now');
+      const match = /^(\\d+)([smhd]) ago$/.exec(text);
+      if (!match) return text;
+      const templates = {
+        s: '{count}s ago', m: '{count}m ago', h: '{count}h ago', d: '{count}d ago'
+      };
+      return uiText(templates[match[2]], { count: formatUiCount(match[1]) });
+    }
+
     let lastSuccessfulFetch = 0;
     let lastFetchFailed = false;
     let fetchInFlight = false;
@@ -1029,7 +1228,13 @@ _HTML_SCRIPT = """  <script>
       }
       if (taskStatus === 'failed' || taskStatus === 'interrupted' || taskStatus === 'cancelled') {
         const label = taskStatus.charAt(0).toUpperCase() + taskStatus.slice(1);
-        return { label: label, tone: 'danger', detail: 'The latest Bridge task is ' + taskStatus + '.' };
+        return {
+          label: label,
+          tone: 'danger',
+          detail: 'The latest Bridge task is ' + taskStatus + '.',
+          detailKey: 'The latest Bridge task is {status}.',
+          detailValues: { status: taskStatus }
+        };
       }
       if (alive === false) {
         if (observed === 'stopped' || item.desired === 'closed') {
@@ -1086,31 +1291,40 @@ _HTML_SCRIPT = """  <script>
       const liveness = alive === true
         ? 'A native process is present.'
         : 'The snapshot lists a native process, but its liveness is not reported.';
+      const presenceParts = [{
+        message: alive === true
+          ? 'A native process is present.'
+          : 'The snapshot lists a native process, but its liveness is not reported.'
+      }];
       if (kind === 'daemon' || observed === 'daemon') {
         return {
           label: 'Daemon process',
           tone: 'native',
-          detail: liveness + ' Its presence does not prove current inference.'
+          detail: liveness + ' Its presence does not prove current inference.',
+          detailParts: [...presenceParts, { message: 'Its presence does not prove current inference.' }]
         };
       }
       if (kind === 'worker' || observed === 'running') {
         return {
           label: 'Worker process',
           tone: 'native',
-          detail: liveness + ' This does not prove it is currently inferencing.'
+          detail: liveness + ' This does not prove it is currently inferencing.',
+          detailParts: [...presenceParts, { message: 'This does not prove it is currently inferencing.' }]
         };
       }
       if (kind === 'interactive' || observed === 'active') {
         return {
           label: 'Interactive process',
           tone: 'idle',
-          detail: liveness + ' It may be idle or waiting for input; its presence does not prove current inference.'
+          detail: liveness + ' It may be idle or waiting for input; its presence does not prove current inference.',
+          detailParts: [...presenceParts, { message: 'It may be idle or waiting for input; its presence does not prove current inference.' }]
         };
       }
       return {
         label: 'Process present',
         tone: 'native',
-        detail: liveness + ' Its presence does not prove current inference.'
+        detail: liveness + ' Its presence does not prove current inference.',
+        detailParts: [...presenceParts, { message: 'Its presence does not prove current inference.' }]
       };
     }
 
@@ -1270,20 +1484,51 @@ _HTML_SCRIPT = """  <script>
       const current = typeof now === 'number' && Number.isFinite(now) ? now : Date.now();
       if (!last) {
         return failed
-          ? { state: 'error', label: 'Not connected', detail: 'No dashboard snapshot has loaded; retrying.' }
-          : { state: 'connecting', label: 'Connecting\u2026', detail: 'Waiting for the first dashboard snapshot.' };
+          ? {
+            state: 'error',
+            label: 'Not connected',
+            detail: 'No dashboard snapshot has loaded; retrying.',
+            labelKey: 'Not connected',
+            detailKey: 'No dashboard snapshot has loaded; retrying.'
+          }
+          : {
+            state: 'connecting',
+            label: 'Connecting\u2026',
+            detail: 'Waiting for the first dashboard snapshot.',
+            labelKey: 'Connecting\u2026',
+            detailKey: 'Waiting for the first dashboard snapshot.'
+          };
       }
       const age = Math.max(0, Math.floor((current - last) / 1000));
       if (failed) {
-        return { state: 'error', label: 'Connection lost', detail: 'Showing the last snapshot from ' + age + 's ago; retrying.' };
+        return {
+          state: 'error',
+          label: 'Connection lost',
+          detail: 'Showing the last snapshot from ' + age + 's ago; retrying.',
+          labelKey: 'Connection lost',
+          detailKey: 'Showing the last snapshot from {age}s ago; retrying.',
+          detailValues: { age: age }
+        };
       }
       if (age >= 10) {
-        return { state: 'stale', label: 'Stale \u00b7 ' + age + 's', detail: 'Last snapshot was ' + age + 's ago; waiting for a fresh update.' };
+        return {
+          state: 'stale',
+          label: 'Stale \u00b7 ' + age + 's',
+          detail: 'Last snapshot was ' + age + 's ago; waiting for a fresh update.',
+          labelKey: 'Stale \u00b7 {age}s',
+          labelValues: { age: age },
+          detailKey: 'Last snapshot was {age}s ago; waiting for a fresh update.',
+          detailValues: { age: age }
+        };
       }
       return {
         state: 'live',
         label: age <= 1 ? 'Live \u00b7 just now' : 'Live \u00b7 ' + age + 's ago',
-        detail: 'Last snapshot was ' + age + 's ago.'
+        detail: 'Last snapshot was ' + age + 's ago.',
+        labelKey: age <= 1 ? 'Live \u00b7 just now' : 'Live \u00b7 {age}s ago',
+        labelValues: { age: age },
+        detailKey: 'Last snapshot was {age}s ago.',
+        detailValues: { age: age }
       };
     }
 
@@ -1359,26 +1604,36 @@ _HTML_SCRIPT = """  <script>
       }
     }
 
-    function setConnectionBanner(message) {
+    function setConnectionBanner(messageKey) {
       const banner = document.getElementById('connectionBanner');
       if (!banner) return;
-      if (!message) {
+      if (!messageKey) {
         banner.hidden = true;
+        delete banner.dataset.i18nMessage;
         setText(banner, '');
         return;
       }
+      banner.dataset.i18nMessage = messageKey;
       banner.hidden = false;
-      setText(banner, message);
+      setText(banner, uiText(messageKey));
+    }
+
+    function retranslateConnectionBanner() {
+      const banner = document.getElementById('connectionBanner');
+      if (!banner || banner.hidden || !banner.dataset.i18nMessage) return;
+      setText(banner, uiText(banner.dataset.i18nMessage));
     }
 
     function updateConnectionStatus() {
       const element = document.getElementById('connectionStatus');
       if (!element) return;
       const state = connectionState(lastSuccessfulFetch, Date.now(), lastFetchFailed);
+      const label = uiText(state.labelKey || state.label, state.labelValues);
+      const detail = uiText(state.detailKey || state.detail, state.detailValues);
       element.dataset.state = state.state;
-      setText(element, state.label);
-      element.title = state.detail;
-      element.setAttribute('aria-label', state.label + '. ' + state.detail);
+      setText(element, label);
+      element.title = detail;
+      element.setAttribute('aria-label', label + '. ' + detail);
     }
 
     async function fetchData() {
@@ -1392,8 +1647,9 @@ _HTML_SCRIPT = """  <script>
         }
         if (!response.ok) {
           lastFetchFailed = true;
-          setConnectionBanner('Could not refresh the dashboard. ' +
-            (hasLoadedOnce ? 'Showing the last snapshot while retrying.' : 'Retrying the first snapshot.'));
+          setConnectionBanner(hasLoadedOnce
+            ? 'Could not refresh the dashboard. Showing the last snapshot while retrying.'
+            : 'Could not refresh the dashboard. Retrying the first snapshot.');
           updateConnectionStatus();
           return;
         }
@@ -1408,8 +1664,9 @@ _HTML_SCRIPT = """  <script>
         updateConnectionStatus();
       } catch (error) {
         lastFetchFailed = true;
-        setConnectionBanner('Could not reach the Bridge dashboard. ' +
-          (hasLoadedOnce ? 'Showing the last snapshot while retrying.' : 'Retrying the first snapshot.'));
+        setConnectionBanner(hasLoadedOnce
+          ? 'Could not reach the Bridge dashboard. Showing the last snapshot while retrying.'
+          : 'Could not reach the Bridge dashboard. Retrying the first snapshot.');
         updateConnectionStatus();
         console.error('Fetch error:', error);
       } finally {
@@ -1460,14 +1717,14 @@ _HTML_SCRIPT = """  <script>
         }
         if (response.status === 409) {
           approvalRequestIds.delete(key);
-          window.alert('This approval is stale or was already handled. Refreshing.');
+          window.alert(uiText('This approval is stale or was already handled. Refreshing.'));
           await fetchData();
           return;
         }
         // Keep the same request id for transient failures so a retry is idempotent.
-        window.alert('Approval failed: ' + (payload.error || 'unknown error'));
+        window.alert(uiText('Approval failed: {error}', { error: payload.error || uiText('unknown error') }));
       } catch (error) {
-        window.alert('Failed to send approval: ' + error);
+        window.alert(uiText('Failed to send approval: {error}', { error: error }));
       }
     }
 
@@ -1485,15 +1742,21 @@ _HTML_SCRIPT = """  <script>
         const info = makeElement('div', 'alert-info');
         const title = makeElement('div', 'alert-title');
         const sessionName = question.session_name || String(question.session_id || '').substring(0, 8);
-        setText(title, 'Approval needed for ' + sessionName);
+        setText(title, uiText('Approval needed for {name}', { name: sessionName }));
         info.appendChild(title);
 
         const detail = makeElement('div', 'alert-detail');
-        detail.appendChild(document.createTextNode('Session '));
-        detail.appendChild(makeElement('code', '', String(question.session_id || '').substring(0, 8)));
-        detail.appendChild(document.createTextNode(' \u00b7 Tool '));
-        detail.appendChild(makeElement('b', '', question.tool || '-'));
-        detail.appendChild(document.createTextNode(' \u00b7 ' + (question.created_rel || '-')));
+        const sessionId = String(question.session_id || '').substring(0, 8);
+        const tool = question.tool || '-';
+        const age = formatUiRelative(question.created_rel || '-');
+        detail.appendChild(document.createTextNode(uiText('Session') + ' '));
+        detail.appendChild(makeElement('code', '', sessionId));
+        detail.appendChild(document.createTextNode(' \u00b7 ' + uiText('Tool') + ' '));
+        detail.appendChild(makeElement('b', '', tool));
+        detail.appendChild(document.createTextNode(' \u00b7 ' + age));
+        detail.setAttribute('aria-label', uiText('Session {id} \u00b7 Tool {tool} \u00b7 {age}', {
+          id: sessionId, tool: tool, age: age
+        }));
         info.appendChild(detail);
 
         const command = makeElement('div', 'alert-detail');
@@ -1502,17 +1765,17 @@ _HTML_SCRIPT = """  <script>
 
         const actions = makeElement('div', 'alert-actions');
         const revision = findSessionRevision(question.session_id);
-        const allowButton = makeElement('button', 'btn', 'Approve');
+        const allowButton = makeElement('button', 'btn', uiText('Approve'));
         allowButton.type = 'button';
         allowButton.disabled = revision === null;
-        allowButton.title = revision === null ? 'Waiting for current session data' : 'Approve this request';
+        allowButton.title = uiText(revision === null ? 'Waiting for current session data' : 'Approve this request');
         allowButton.addEventListener('click', () => {
           submitDecision(question.session_id, question.id, 'allow', revision);
         });
-        const denyButton = makeElement('button', 'btn btn-secondary', 'Deny');
+        const denyButton = makeElement('button', 'btn btn-secondary', uiText('Deny'));
         denyButton.type = 'button';
         denyButton.disabled = revision === null;
-        denyButton.title = revision === null ? 'Waiting for current session data' : 'Deny this request';
+        denyButton.title = uiText(revision === null ? 'Waiting for current session data' : 'Deny this request');
         denyButton.addEventListener('click', () => {
           submitDecision(question.session_id, question.id, 'deny', revision);
         });
@@ -1531,9 +1794,10 @@ _HTML_SCRIPT = """  <script>
       const totalNodes = (hosts ? hosts.length : 0) + 1;
       const coordinatorView = coordinatorStatus(provenance);
       const hostStats = document.getElementById('hostStats');
-      hostStats.textContent = totalNodes + (totalNodes === 1 ? ' node' : ' nodes') +
-        ' \u00b7 ' + coordinatorView.label;
-      hostStats.title = coordinatorView.detail;
+      const nodeCount = formatUiCount(totalNodes);
+      hostStats.textContent = uiText(totalNodes === 1 ? '{count} node' : '{count} nodes', { count: nodeCount }) +
+        ' \u00b7 ' + uiText(coordinatorView.label);
+      hostStats.title = uiText(coordinatorView.detail);
 
       // 1. Coordinator Row
       const cRow = document.createElement('tr');
@@ -1545,22 +1809,24 @@ _HTML_SCRIPT = """  <script>
       cRow.appendChild(cNameCell);
 
       const cRoleCell = document.createElement('td');
-      cRoleCell.appendChild(makeElement('span', 'badge badge-coord', 'Coordinator'));
+      cRoleCell.appendChild(makeElement('span', 'badge badge-coord', uiText('Coordinator')));
       cRow.appendChild(cRoleCell);
 
       const cStatusCell = document.createElement('td');
+      const coordinatorLabel = uiText(coordinatorView.label);
+      const coordinatorDetail = uiText(coordinatorView.detail);
       const coordinatorBadge = makeElement(
-        'span', statusBadgeClass(coordinatorView.tone), coordinatorView.label
+        'span', statusBadgeClass(coordinatorView.tone), coordinatorLabel
       );
-      coordinatorBadge.title = coordinatorView.detail;
-      coordinatorBadge.setAttribute('aria-label', coordinatorView.label + '. ' + coordinatorView.detail);
+      coordinatorBadge.title = coordinatorDetail;
+      coordinatorBadge.setAttribute('aria-label', coordinatorLabel + '. ' + coordinatorDetail);
       cStatusCell.appendChild(coordinatorBadge);
       cRow.appendChild(cStatusCell);
 
       const cTargetCell = document.createElement('td');
-      const targetText = provenance && provenance.brokerConnected === true
+      const targetText = uiText(provenance && provenance.brokerConnected === true
         ? 'local (unix socket)'
-        : (provenance && provenance.source === 'local_db_fallback' ? 'local database (fallback)' : 'not reported');
+        : (provenance && provenance.source === 'local_db_fallback' ? 'local database (fallback)' : 'not reported'));
       cTargetCell.appendChild(makeElement('code', '', targetText));
       cRow.appendChild(cTargetCell);
 
@@ -1571,13 +1837,13 @@ _HTML_SCRIPT = """  <script>
       cNodeCell.appendChild(coordinatorNodeCode);
       cRow.appendChild(cNodeCell);
 
-      const cProjsCell = makeElement('td', 'cell-muted', 'bridge (local)');
+      const cProjsCell = makeElement('td', 'cell-muted', uiText('bridge (local)'));
       cRow.appendChild(cProjsCell);
 
-      let contactText = 'unknown';
-      if (provenance && provenance.brokerConnected === true) contactText = 'verified';
-      else if (provenance && provenance.source === 'local_db_fallback') contactText = 'not verified';
-      else if (provenance && provenance.brokerConnected === false) contactText = 'unavailable';
+      let contactText = uiText('unknown');
+      if (provenance && provenance.brokerConnected === true) contactText = uiText('verified');
+      else if (provenance && provenance.source === 'local_db_fallback') contactText = uiText('not verified');
+      else if (provenance && provenance.brokerConnected === false) contactText = uiText('unavailable');
       const cContactCell = makeElement('td', 'cell-muted', contactText);
       cRow.appendChild(cContactCell);
 
@@ -1597,14 +1863,16 @@ _HTML_SCRIPT = """  <script>
           row.appendChild(nameCell);
 
           const roleCell = document.createElement('td');
-          roleCell.appendChild(makeElement('span', 'badge badge-idle', 'Worker node'));
+          roleCell.appendChild(makeElement('span', 'badge badge-idle', uiText('Worker node')));
           row.appendChild(roleCell);
 
           const statusCell = document.createElement('td');
           const linkStatus = hostStatus(host);
-          const statusBadge = makeElement('span', statusBadgeClass(linkStatus.tone), linkStatus.label);
-          statusBadge.title = linkStatus.detail;
-          statusBadge.setAttribute('aria-label', linkStatus.label + '. ' + linkStatus.detail);
+          const linkLabel = uiText(linkStatus.label);
+          const linkDetail = uiText(linkStatus.detail);
+          const statusBadge = makeElement('span', statusBadgeClass(linkStatus.tone), linkLabel);
+          statusBadge.title = linkDetail;
+          statusBadge.setAttribute('aria-label', linkLabel + '. ' + linkDetail);
           statusCell.appendChild(statusBadge);
           row.appendChild(statusCell);
 
@@ -1626,13 +1894,13 @@ _HTML_SCRIPT = """  <script>
           projsCell.title = projs || '';
           row.appendChild(projsCell);
 
-          const contactCell = makeElement('td', 'cell-muted', host.last_contact_rel || '-');
+          const contactCell = makeElement('td', 'cell-muted', formatUiRelative(host.last_contact_rel || '-'));
           row.appendChild(contactCell);
 
           const actionCell = document.createElement('td');
-          const pingButton = makeElement('button', 'btn btn-secondary btn-sm', 'Ping');
+          const pingButton = makeElement('button', 'btn btn-secondary btn-sm', uiText('Ping'));
           pingButton.type = 'button';
-          pingButton.setAttribute('aria-label', 'Ping host ' + hostName);
+          pingButton.setAttribute('aria-label', uiText('Ping host {name}', { name: hostName }));
           pingButton.addEventListener('click', () => {
             pingHost(host.host_id, pingButton);
           });
@@ -1646,7 +1914,7 @@ _HTML_SCRIPT = """  <script>
 
     async function pingHost(hostId, button) {
       if (!hostId) return;
-      setText(button, 'Pinging...');
+      setText(button, uiText('Pinging...'));
       button.disabled = true;
       try {
         const response = await fetch('/api/host/ping', {
@@ -1661,12 +1929,12 @@ _HTML_SCRIPT = """  <script>
         if (response.ok) {
           await fetchData();
         } else {
-          setText(button, 'Failed');
-          setTimeout(() => { setText(button, 'Ping'); button.disabled = false; }, 2000);
+          setText(button, uiText('Failed'));
+          setTimeout(() => { setText(button, uiText('Ping')); button.disabled = false; }, 2000);
         }
       } catch (error) {
-        setText(button, 'Error');
-        setTimeout(() => { setText(button, 'Ping'); button.disabled = false; }, 2000);
+        setText(button, uiText('Error'));
+        setTimeout(() => { setText(button, uiText('Ping')); button.disabled = false; }, 2000);
       }
     }
 
@@ -1682,7 +1950,9 @@ _HTML_SCRIPT = """  <script>
         card.type = 'button';
         card.className = 'runtime-card' + (isSelected ? ' selected' : '');
         card.setAttribute('aria-pressed', String(isSelected));
-        card.setAttribute('aria-label', 'Filter dashboard to ' + (info.display_name || runtimeLabel(key)) + ' runtime');
+        card.setAttribute('aria-label', uiText('Filter dashboard to {name} runtime', {
+          name: info.display_name || runtimeLabel(key)
+        }));
         card.addEventListener('click', () => {
           setRuntimeFilter(isSelected ? 'all' : key);
         });
@@ -1698,22 +1968,31 @@ _HTML_SCRIPT = """  <script>
         const liveEl = makeElement(
           'span',
           'runtime-live' + (bridgeActive > 0 ? ' has-live' : ''),
-          bridgeActive + ' bridge'
+          uiText('{count} bridge', { count: formatUiCount(bridgeActive) })
         );
-        liveEl.title = 'Bridge worker processes alive or waiting';
+        liveEl.title = uiText('Bridge worker processes alive or waiting');
         top.appendChild(liveEl);
         card.appendChild(top);
 
         const meta1 = makeElement('div', 'runtime-meta');
-        let bridgeDetail = 'Bridge: ' + bridgeRunning + ' running \u00b7 ' + bridgeWaiting + ' waiting';
-        if (bridgeRecovery > 0) bridgeDetail += ' \u00b7 ' + bridgeRecovery + ' recovery';
+        let bridgeDetail = uiText('Bridge: {running} running \u00b7 {waiting} waiting', {
+          running: formatUiCount(bridgeRunning), waiting: formatUiCount(bridgeWaiting)
+        });
+        if (bridgeRecovery > 0) {
+          bridgeDetail += uiText(' \u00b7 {count} recovery', { count: formatUiCount(bridgeRecovery) });
+        }
         meta1.appendChild(makeElement('span', '', bridgeDetail));
         card.appendChild(meta1);
 
         const meta2 = makeElement('div', 'runtime-meta');
-        meta2.appendChild(makeElement('span', '', 'Native: ' + nativeActive + (nativeActive === 1 ? ' process' : ' processes')));
+        meta2.appendChild(makeElement('span', '', uiText(
+          nativeActive === 1 ? 'Native: {count} process' : 'Native: {count} processes',
+          { count: formatUiCount(nativeActive) }
+        )));
         if (info.native_daemons) {
-          meta2.appendChild(makeElement('span', '', '+' + info.native_daemons + ' daemon'));
+          meta2.appendChild(makeElement('span', '', uiText('+{count} daemon', {
+            count: formatUiCount(info.native_daemons)
+          })));
         }
         card.appendChild(meta2);
         grid.appendChild(card);
@@ -1726,13 +2005,18 @@ _HTML_SCRIPT = """  <script>
       const filtered = (sessions || []).filter(sessionMatchesFilter);
       const total = sessions ? sessions.length : 0;
       const shown = Math.min(filtered.length, 60);
-      const countText = shown + ' of ' + total + ' shown' +
-        (filtered.length > 60 ? ' (first 60)' : '') + ' \u00b7 ' + (metrics.active_sessions || 0) + ' live';
+      const countText = uiText('{shown} of {total} shown', {
+        shown: formatUiCount(shown), total: formatUiCount(total)
+      }) +
+        (filtered.length > 60 ? uiText(' (first 60)') : '') +
+        uiText(' \u00b7 {count} live', { count: formatUiCount(metrics.active_sessions || 0) });
       const sessionCount = document.getElementById('sessionCount');
       setText(sessionCount, countText);
-      sessionCount.title = 'Live includes running, idle, waiting, or alive worker processes.';
+      sessionCount.title = uiText('Live includes running, idle, waiting, or alive worker processes.');
       if (!filtered.length) {
-        const message = total ? 'No sessions match the current runtime and active filters' : 'No Bridge sessions recorded yet';
+        const message = uiText(total
+          ? 'No sessions match the current runtime and active filters'
+          : 'No Bridge sessions recorded yet');
         body.appendChild(emptyRow(6, message));
         return;
       }
@@ -1761,7 +2045,7 @@ _HTML_SCRIPT = """  <script>
         runtimeCell.appendChild(runtimeText);
 
         const statusCell = document.createElement('td');
-        const status = bridgeStatus(session);
+        const status = localizeStatus(bridgeStatus(session));
         const statusBadge = makeElement('span', statusBadgeClass(status.tone), status.label);
         statusBadge.title = status.detail;
         statusBadge.setAttribute('aria-label', status.label + '. ' + status.detail);
@@ -1772,15 +2056,15 @@ _HTML_SCRIPT = """  <script>
           : (session.error ? session.error : (session.cwd || ''));
         const goalCell = makeElement('td', 'cell-goal');
         const goalText = makeElement('span', 'cell-goal-text', goal || '\u2014');
-        goalText.title = goal || 'No task instruction recorded.';
+        goalText.title = goal || uiText('No task instruction recorded.');
         goalCell.appendChild(goalText);
 
         const costNum = (typeof session.cost_usd === 'number')
           ? session.cost_usd
           : (session.attempt && typeof session.attempt.cost_usd === 'number' ? session.attempt.cost_usd : null);
         const cost = formatCost(costNum, session.cost_complete, session.has_attempts, 3, costNum !== null ? 1 : undefined);
-        const costCell = makeElement('td', 'cell-cost' + (cost.unknown ? ' is-unknown' : (cost.text === '\u2014' ? ' is-empty' : '')), cost.text);
-        costCell.title = cost.title;
+        const costCell = makeElement('td', 'cell-cost' + (cost.unknown ? ' is-unknown' : (cost.text === '\u2014' ? ' is-empty' : '')), uiText(cost.text));
+        costCell.title = uiText(cost.title);
 
         row.appendChild(nameCell);
         row.appendChild(hostCell);
@@ -1804,11 +2088,16 @@ _HTML_SCRIPT = """  <script>
       });
       const shown = Math.min(filtered.length, 60);
       const nativeCount = document.getElementById('nativeCount');
-      nativeCount.textContent = shown + ' of ' + allNative.length + ' shown' +
-        (filtered.length > 60 ? ' (first 60)' : '') + ' \u00b7 ' + (metrics.native_sessions || 0) + ' non-daemon';
-      nativeCount.title = 'Detected native CLI processes. Presence does not prove active inference.';
+      nativeCount.textContent = uiText('{shown} of {total} shown', {
+        shown: formatUiCount(shown), total: formatUiCount(allNative.length)
+      }) +
+        (filtered.length > 60 ? uiText(' (first 60)') : '') +
+        uiText(' \u00b7 {count} non-daemon', { count: formatUiCount(metrics.native_sessions || 0) });
+      nativeCount.title = uiText('Detected native CLI processes. Presence does not prove active inference.');
       if (!filtered.length) {
-        const message = allNative.length ? 'No native processes match the current filters' : 'No native CLI processes detected';
+        const message = uiText(allNative.length
+          ? 'No native processes match the current filters'
+          : 'No native CLI processes detected');
         body.appendChild(emptyRow(6, message));
         return;
       }
@@ -1830,7 +2119,7 @@ _HTML_SCRIPT = """  <script>
         const modelCell = makeElement('td', 'cell-muted', proc.model || '\u2014');
 
         const stateCell = document.createElement('td');
-        const processStatus = nativeProcessStatus(proc);
+        const processStatus = localizeStatus(nativeProcessStatus(proc));
         const processBadge = makeElement('span', statusBadgeClass(processStatus.tone), processStatus.label);
         processBadge.title = processStatus.detail;
         processBadge.setAttribute('aria-label', processStatus.label + '. ' + processStatus.detail);
@@ -1855,10 +2144,12 @@ _HTML_SCRIPT = """  <script>
     function renderBroadcasts(broadcasts) {
       const body = document.getElementById('broadcastTable');
       body.replaceChildren();
-      document.getElementById('groupStats').textContent = broadcasts.length +
-        (broadcasts.length === 1 ? ' broadcast' : ' broadcasts');
+      document.getElementById('groupStats').textContent = uiText(
+        broadcasts.length === 1 ? '{count} broadcast' : '{count} broadcasts',
+        { count: formatUiCount(broadcasts.length) }
+      );
       if (!broadcasts.length) {
-        body.appendChild(emptyRow(5, 'No broadcast communications recorded yet'));
+        body.appendChild(emptyRow(5, uiText('No broadcast communications recorded yet')));
         return;
       }
       broadcasts.forEach((broadcast) => {
@@ -1873,26 +2164,32 @@ _HTML_SCRIPT = """  <script>
         idCell.appendChild(groupLine);
 
         const progressCell = document.createElement('td');
-        const received = makeElement('span', '', broadcast.received);
+        const received = makeElement('span', '', formatUiCount(broadcast.received));
         const total = Number(broadcast.total || 0);
         received.style.color = 'var(--green)';
         received.style.fontWeight = '700';
         progressCell.appendChild(received);
-        progressCell.appendChild(document.createTextNode(' / ' + total + ' received'));
+        progressCell.appendChild(document.createTextNode(' / ' + uiText('{total} received', {
+          total: formatUiCount(total)
+        })));
         if (broadcast.uncertain) {
-          const uncertain = makeElement('span', '', ' \u00b7 ' + broadcast.uncertain + ' uncertain');
+          const uncertain = makeElement('span', '', ' \u00b7 ' + uiText('{count} uncertain', {
+            count: formatUiCount(broadcast.uncertain)
+          }));
           uncertain.style.color = 'var(--red)';
           progressCell.appendChild(uncertain);
         }
 
-        const membersCell = makeElement('td', 'cell-muted', total + ' targets');
+        const membersCell = makeElement('td', 'cell-muted', uiText('{count} targets', {
+          count: formatUiCount(total)
+        }));
 
         const messageCell = makeElement('td', 'cell-goal');
         const messageText = makeElement('span', 'cell-goal-text', broadcast.message_preview || '\u2014');
-        messageText.title = broadcast.message_preview || 'No message preview';
+        messageText.title = broadcast.message_preview || uiText('No message preview');
         messageCell.appendChild(messageText);
 
-        const ageCell = makeElement('td', 'cell-muted', broadcast.created_rel || '-');
+        const ageCell = makeElement('td', 'cell-muted', formatUiRelative(broadcast.created_rel || '-'));
 
         row.appendChild(idCell);
         row.appendChild(progressCell);
@@ -1918,15 +2215,15 @@ _HTML_SCRIPT = """  <script>
         });
       }
       if (!list.length) {
-        const message = selectedRuntime === 'all'
+        const message = uiText(selectedRuntime === 'all'
           ? 'No Bridge events recorded yet. New activity will appear here.'
-          : 'No events for this runtime yet. Clear the runtime filter to see all activity.';
+          : 'No events for this runtime yet. Clear the runtime filter to see all activity.');
         container.appendChild(makeElement('div', 'empty-log', message));
         return;
       }
       list.slice(0, 25).forEach((event) => {
         const entry = makeElement('div', 'log-entry');
-        entry.appendChild(makeElement('span', 'log-time', event.created_rel || '-'));
+        entry.appendChild(makeElement('span', 'log-time', formatUiRelative(event.created_rel || '-')));
         entry.appendChild(makeElement('span', 'log-kind', event.kind || '-'));
         const message = makeElement('span', 'log-msg');
         const name = makeElement('b', '', event.session_name || String(event.session_id || '').substring(0, 8));
@@ -1980,6 +2277,14 @@ _HTML_SCRIPT = """  <script>
       };
     }
 
+    function topologyText(message, values) {
+      if (typeof uiText === 'function') return uiText(message, values);
+      if (!values) return message;
+      return message.replace(/\\{([a-zA-Z_][a-zA-Z0-9_]*)\\}/g, (match, key) => (
+        Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : match
+      ));
+    }
+
     function renderTopology(data) {
       const svg = document.getElementById('topoGraph');
       const layout = buildTopology(data, svg.parentElement.clientWidth || 800);
@@ -1987,8 +2292,11 @@ _HTML_SCRIPT = """  <script>
       svg.replaceChildren();
       svg.setAttribute('viewBox', '0 0 ' + layout.width + ' ' + layout.height);
       svg.style.width = layout.width + 'px';
-      document.getElementById('topoStats').textContent = layout.liveCount + ' live local' +
-        (layout.recoveryCount ? ' · ' + layout.recoveryCount + ' need recovery' : '');
+      document.getElementById('topoStats').textContent = topologyText('{count} live local', {
+        count: layout.liveCount
+      }) + (layout.recoveryCount
+        ? topologyText(' · {count} need recovery', { count: layout.recoveryCount })
+        : '');
 
       layout.hostNodes.slice(1).forEach((host) => {
         const online = host.data.state === 'online';
@@ -2005,7 +2313,9 @@ _HTML_SCRIPT = """  <script>
 
       layout.hostNodes.forEach((host) => {
         const state = host.isCoord ? 'local' : (host.data.state || 'unknown');
-        const stateLabel = { online: 'ONLINE', offline: 'OFFLINE', identity_changed: 'ID CHANGED', state_corrupted: 'CORRUPT' }[state] || 'UNKNOWN';
+        const stateLabel = topologyText(
+          { online: 'ONLINE', offline: 'OFFLINE', identity_changed: 'ID CHANGED', state_corrupted: 'CORRUPT' }[state] || 'UNKNOWN'
+        );
         const color = host.isCoord ? '#bc8cff' : (state === 'online' ? '#3fb950' : (state === 'offline' ? '#f85149' : '#d29922'));
         const circle = svgNode('circle', {
           cx: host.x, cy: host.y, r: host.isCoord ? 28 : 26,
@@ -2019,7 +2329,7 @@ _HTML_SCRIPT = """  <script>
         svg.appendChild(circle);
         svg.appendChild(svgText({
           x: host.x, y: host.y - 4, 'text-anchor': 'middle', fill: '#fff', 'font-size': 10, 'font-weight': 600
-        }, host.isCoord ? 'COORD' : hostName.substring(0, 9)));
+        }, host.isCoord ? topologyText('COORD') : hostName.substring(0, 9)));
         svg.appendChild(svgText({
           x: host.x, y: host.y + 10, 'text-anchor': 'middle', fill: color, 'font-size': 8
         }, host.isCoord ? hostName.substring(0, 10) : stateLabel));
@@ -2027,7 +2337,7 @@ _HTML_SCRIPT = """  <script>
         if (!host.sessions.length) {
           svg.appendChild(svgText({
             x: host.x, y: 170, 'text-anchor': 'middle', fill: '#8b949e', 'font-size': 10
-          }, host.isCoord ? 'No live Bridge workers' : 'Sessions not collected'));
+          }, topologyText(host.isCoord ? 'No live Bridge workers' : 'Sessions not collected')));
         }
         host.sessions.forEach((node) => {
           const session = node.session;
@@ -2065,38 +2375,50 @@ _HTML_SCRIPT = """  <script>
       const coordBadge = document.getElementById('coordBadge');
       setText(
         coordBadge,
-        coordinatorName + ' \u00b7 Node ' + coordinatorNode.substring(0, 8) + ' \u00b7 ' + provenanceView.label
+        uiText('{name} \u00b7 Node {node} \u00b7 {status}', {
+          name: coordinatorName,
+          node: coordinatorNode.substring(0, 8),
+          status: uiText(provenanceView.label)
+        })
       );
-      coordBadge.title = coordinatorName + ' \u00b7 node ' + coordinatorNode + ' \u00b7 ' + provenanceView.detail;
+      coordBadge.title = uiText('{name} \u00b7 node {node} \u00b7 {detail}', {
+        name: coordinatorName,
+        node: coordinatorNode,
+        detail: uiText(provenanceView.detail)
+      });
 
       const onlineHosts = typeof metrics.online_hosts === 'number' ? metrics.online_hosts : 0;
       const totalHosts = typeof metrics.total_hosts === 'number' ? metrics.total_hosts : 1;
       const statNodes = document.getElementById('statNodes');
       statNodes.classList.remove('is-unknown');
       if (provenance.brokerConnected === true) {
-        statNodes.textContent = onlineHosts + '/' + totalHosts;
-        statNodes.title = onlineHosts + ' of ' + totalHosts + ' configured hosts are online.';
+        statNodes.textContent = formatUiCount(onlineHosts) + '/' + formatUiCount(totalHosts);
+        statNodes.title = uiText('{online} of {total} configured hosts are online.', {
+          online: formatUiCount(onlineHosts), total: formatUiCount(totalHosts)
+        });
       } else if (provenance.brokerConnected === false) {
         const remoteHosts = Array.isArray(data.hosts) ? data.hosts : [];
         const remoteOnline = remoteHosts.filter((host) => host && host.state === 'online').length;
-        statNodes.textContent = Math.min(remoteOnline, totalHosts) + '/' + totalHosts;
-        statNodes.title = 'Local broker is unavailable; coordinator status is not verified. ' +
-          'Remote hosts online: ' + remoteOnline + ' of ' + Math.max(0, totalHosts - 1) + '.';
+        statNodes.textContent = formatUiCount(Math.min(remoteOnline, totalHosts)) + '/' + formatUiCount(totalHosts);
+        statNodes.title = uiText(
+          'Local broker is unavailable; coordinator status is not verified. Remote hosts online: {online} of {remote}.',
+          { online: formatUiCount(remoteOnline), remote: formatUiCount(Math.max(0, totalHosts - 1)) }
+        );
         statNodes.classList.add('is-unknown');
       } else if (provenance.source === 'local_db_fallback') {
         statNodes.textContent = '\u2014';
-        statNodes.title = 'The snapshot came from a local database fallback; broker and coordinator status are unknown.';
+        statNodes.title = uiText('The snapshot came from a local database fallback; broker and coordinator status are unknown.');
         statNodes.classList.add('is-unknown');
       } else {
         statNodes.textContent = '\u2014';
-        statNodes.title = 'Broker and coordinator provenance is not reported; host online status is unknown.';
+        statNodes.title = uiText('Broker and coordinator provenance is not reported; host online status is unknown.');
         statNodes.classList.add('is-unknown');
       }
-      document.getElementById('statActive').textContent = metrics.active_sessions || 0;
+      document.getElementById('statActive').textContent = formatUiCount(metrics.active_sessions || 0);
       const statNative = document.getElementById('statNative');
-      if (statNative) statNative.textContent = metrics.native_sessions || 0;
-      document.getElementById('statTasks').textContent = metrics.running_tasks || 0;
-      document.getElementById('statBroadcasts').textContent = metrics.total_broadcasts || 0;
+      if (statNative) statNative.textContent = formatUiCount(metrics.native_sessions || 0);
+      document.getElementById('statTasks').textContent = formatUiCount(metrics.running_tasks || 0);
+      document.getElementById('statBroadcasts').textContent = formatUiCount(metrics.total_broadcasts || 0);
 
       const costComplete = metrics.cost_complete !== false && !aggregateHasCostGaps(data);
       const totalCostNum = typeof metrics.total_cost_usd === 'number' ? metrics.total_cost_usd : null;
@@ -2106,8 +2428,8 @@ _HTML_SCRIPT = """  <script>
         : undefined;
       const cost = formatCost(totalCostNum, costComplete, hasAttempts, 4, knownCostAttempts);
       const statCost = document.getElementById('statCost');
-      statCost.textContent = cost.text;
-      statCost.title = cost.title;
+      statCost.textContent = uiText(cost.text);
+      statCost.title = uiText(cost.title);
       statCost.classList.toggle('is-unknown', cost.unknown);
 
       renderApprovals(data.pending_questions || []);
@@ -2143,12 +2465,21 @@ _HTML_SCRIPT = """  <script>
       btn.addEventListener('click', () => setRuntimeFilter(btn.dataset.runtime || 'all'));
     });
     const activeOnlyBtn = document.getElementById('activeOnlyBtn');
+    function onUiLanguageChanged() {
+      updateConnectionStatus();
+      retranslateConnectionBanner();
+      if (activeOnlyBtn) {
+        setText(activeOnlyBtn, uiText(activeOnly ? 'Active only: On' : 'Active only'));
+        activeOnlyBtn.title = uiText('Hide stopped sessions and daemon processes');
+      }
+      if (currentData) renderDashboard(currentData);
+    }
     if (activeOnlyBtn) {
       activeOnlyBtn.addEventListener('click', () => {
         activeOnly = !activeOnly;
         activeOnlyBtn.classList.toggle('active', activeOnly);
         activeOnlyBtn.setAttribute('aria-pressed', String(activeOnly));
-        setText(activeOnlyBtn, activeOnly ? 'Active only: On' : 'Active only');
+        setText(activeOnlyBtn, uiText(activeOnly ? 'Active only: On' : 'Active only'));
         if (currentData) renderDashboard(currentData);
       });
     }
@@ -2161,12 +2492,13 @@ _HTML_SCRIPT = """  <script>
       }
       window.location.href = '/login';
     });
+    initializeUiLanguage();
     init();
   </script>
 </body>
 </html>
 """
-HTML_PAGE = _HTML_HEAD + _HTML_BODY + _HTML_SCRIPT
+HTML_PAGE = (_HTML_HEAD + _HTML_BODY + _HTML_SCRIPT).replace("/*__WEB_I18N__*/", _WEB_I18N_SCRIPT)
 
 LOGIN_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -2174,7 +2506,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
-  <title>cli-agent-bridge | Sign in</title>
+  <title data-i18n="cli-agent-bridge | Sign in">cli-agent-bridge | Sign in</title>
   <style>
     :root {
       color-scheme: light;
@@ -2202,29 +2534,54 @@ LOGIN_PAGE = """<!DOCTYPE html>
     button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
     .error { min-height:21px; margin-top:12px; color:var(--red); overflow-wrap:anywhere; }
     .hint { margin-top:18px; color:var(--muted); font-size:12px; line-height:1.55; }
+    .language-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:18px; }
+    .language-label { margin:0; color:var(--muted); font-size:12px; font-weight:700; }
+    .language-select {
+      min-height:34px; padding:4px 8px; border-radius:7px; border:1px solid var(--border);
+      background:var(--surface); color:var(--text); font-size:12px; font-weight:600; cursor:pointer;
+    }
+    .language-select:hover { border-color:var(--accent); }
+    .language-select option { background:var(--card); color:var(--text); }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition:none !important; animation:none !important; } }
   </style>
 </head>
 <body>
   <main>
     <form class="card" id="loginForm" autocomplete="on">
-      <h1>cli-agent-bridge Monitor</h1>
-      <p>Sign in with the local admin token. The token is read from the private state directory and is never stored in the page.</p>
-      <label for="token">Admin token</label>
-      <input id="token" name="token" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" aria-describedby="loginHint" required>
-      <button type="submit">Sign in</button>
+      <div class="language-row">
+        <label class="language-label" for="languageSelect" data-i18n="Language">Language</label>
+        <select class="language-select" id="languageSelect" aria-label="Language" data-i18n-aria-label="Language">
+          <option value="auto" data-i18n="Auto">Auto</option>
+          <option value="en">English</option>
+          <option value="zh-CN">简体中文</option>
+        </select>
+      </div>
+      <h1 data-i18n="cli-agent-bridge Monitor">cli-agent-bridge Monitor</h1>
+      <p data-i18n="Sign in with the local admin token. The token is read from the private state directory and is never stored in the page.">Sign in with the local admin token. The token is read from the private state directory and is never stored in the page.</p>
+      <label for="token" data-i18n="Admin token">Admin token</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" aria-describedby="loginHint" placeholder="Enter admin token" data-i18n-placeholder="Enter admin token" required>
+      <button type="submit" data-i18n="Sign in">Sign in</button>
       <div class="error" id="loginError" role="alert" aria-live="polite"></div>
-      <div class="hint" id="loginHint">Use SSH port forwarding or an HTTPS reverse proxy on untrusted networks.</div>
+      <div class="hint" id="loginHint" data-i18n="Use SSH port forwarding or an HTTPS reverse proxy on untrusted networks.">Use SSH port forwarding or an HTTPS reverse proxy on untrusted networks.</div>
     </form>
   </main>
   <script>
     'use strict';
+/*__WEB_I18N__*/
     const form = document.getElementById('loginForm');
     const tokenInput = document.getElementById('token');
     const errorBox = document.getElementById('loginError');
+    function showLoginError(message) {
+      errorBox.dataset.i18nSource = message;
+      errorBox.textContent = translateUi(message);
+    }
+    function onUiLanguageChanged() {
+      if (errorBox.dataset.i18nSource) errorBox.textContent = translateUi(errorBox.dataset.i18nSource);
+    }
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       errorBox.textContent = '';
+      delete errorBox.dataset.i18nSource;
       try {
         const response = await fetch('/auth/login', {
           method: 'POST',
@@ -2238,15 +2595,17 @@ LOGIN_PAGE = """<!DOCTYPE html>
           window.location.href = '/';
           return;
         }
-        errorBox.textContent = payload.error || 'Sign in failed';
+        showLoginError(payload.error || 'Sign in failed');
       } catch (error) {
-        errorBox.textContent = 'Sign in failed';
+        showLoginError('Sign in failed');
       }
     });
+    initializeUiLanguage();
   </script>
 </body>
 </html>
 """
+LOGIN_PAGE = LOGIN_PAGE.replace("/*__WEB_I18N__*/", _WEB_I18N_SCRIPT)
 
 
 def _secure_equal(left: str, right: str) -> bool:

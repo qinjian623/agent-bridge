@@ -2,6 +2,10 @@
 
 # Changes
 
+## Unreleased
+
+- Add English and Simplified Chinese presentation for CLI help, setup, terminal and Web monitors, login, fixed human-facing errors, and parent notices. Add `--lang` / `--language`, `AGENT_BRIDGE_LANG`, the `language` config field, and a browser language selector. Keep protocol data and queued notice bodies unchanged.
+
 ## 0.3.0 — 2026-11-18
 
 This release publishes the reviewed open-source candidate. It is not an industrial certification.

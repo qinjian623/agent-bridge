@@ -89,6 +89,7 @@ jobs:
           uv venv "$SMOKE_ENV" --python 3.11
           uv pip install --python "$SMOKE_ENV/bin/python" dist/*.whl
           "$SMOKE_ENV/bin/agent-bridge" --help
+          "$SMOKE_ENV/bin/agent-bridge" --lang zh-CN --help
           "$SMOKE_ENV/bin/agent-bridge" --state "$SMOKE_STATE" init \
             --non-interactive --profile name=smoke,runtime=codex,provider=openai-codex,model=gpt-5
           "$SMOKE_ENV/bin/agent-bridge" --state "$SMOKE_STATE" init --non-interactive

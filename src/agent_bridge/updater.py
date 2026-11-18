@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import contextlib
 import fcntl
@@ -2139,7 +2138,10 @@ def _record_cli_failure(state: Path, result: dict[str, object]) -> None:
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    from .cli import _ArgumentParser
+    from .i18n import translate
+
+    parser = _ArgumentParser(description=translate(__doc__))
     parser.add_argument("--state", type=Path)
     parser.add_argument("--repository", default=REPOSITORY)
     parser.add_argument("--root", type=Path)

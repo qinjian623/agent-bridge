@@ -74,6 +74,22 @@ Config and environment files are private. An `env_file` is a JSON object of stri
 
 `doctor` checks configuration, executable paths, service availability, and socket presence. It does not prove that login, model inference, or a remote task works. A successful `agent_inspect` call confirms communication with the running broker.
 
+## Language
+
+English is the CLI default. Use `--lang` (or `--language`) before or after a subcommand, or set `AGENT_BRIDGE_LANG`:
+
+```bash
+agent-bridge --lang zh-CN --help
+agent-bridge monitor --lang zh-CN --once
+AGENT_BRIDGE_LANG=zh-CN agent-bridge init
+```
+
+Choices are `en`, `zh-CN`, and `auto`. `auto` reads `LC_ALL`, then `LC_MESSAGES`, then `LANG`; unsupported locales use English. For a persistent default, merge `"language": "zh-CN"` into the top-level private `config.json`, preserving its other settings. A missing or `null` value keeps the English default. The order is CLI option, `AGENT_BRIDGE_LANG`, config, then English. The configuration wizard preserves this setting; selecting a display language does not rewrite config. Parent task notices use the broker's language; notices already queued keep their original body.
+
+The dashboard and login page offer Auto, English, and 简体中文. The choice is stored in that browser; Auto follows browser language preferences and falls back to English. Switching language only changes the display and does not send, retry, or cancel tasks.
+
+Help, setup prompts, monitor labels, fixed human-facing errors, and parent notices are translated, including CLI error descriptions printed to stderr. Tool names, IDs, JSON field names, error/status codes, raw tool payloads, task text, model replies, and provider diagnostics remain unchanged. Messages without a translation fall back to English.
+
 <a id="mcp-setup"></a>
 ## MCP setup
 
