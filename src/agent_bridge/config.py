@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat as stat_module
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -223,16 +224,29 @@ def normalize_projects(value: object) -> dict[str, str]:
     return projects
 
 
-def state_directory(value: str | None = None) -> Path:
-    path = (
-        Path(value or os.environ.get("AGENT_BRIDGE_STATE", Path.home() / ".local/state/cli-agent-bridge"))
-        .expanduser()
-        .resolve()
-    )
+def resolve_state_directory(value: Path | str | None = None) -> Path:
+    """Resolve the state location without creating it or changing permissions."""
+    selected = value or os.environ.get("AGENT_BRIDGE_STATE") or Path.home() / ".local/state/cli-agent-bridge"
+    return Path(selected).expanduser().resolve()
+
+
+def state_directory(value: Path | str | None = None) -> Path:
+    path = resolve_state_directory(value)
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.stat().st_uid != os.getuid():
+    info = path.stat()
+    if info.st_uid != os.getuid():
         raise BridgeError("invalid_owner", "State directory belongs to a different user")
-    path.chmod(0o700)
+    if stat_module.S_IMODE(info.st_mode) != 0o700:
+        raise BridgeError("invalid_state_permissions", "Use a dedicated state directory with permissions 0700")
+    return path
+
+
+def broker_socket_path(state: Path) -> Path:
+    path = state / "broker.sock"
+    # sun_path includes the terminating NUL on both supported platforms.
+    limit = 103 if sys.platform == "darwin" else 107
+    if len(os.fsencode(path)) > limit:
+        raise BridgeError("socket_path_too_long", "Broker socket path is too long; choose a shorter state directory")
     return path
 
 

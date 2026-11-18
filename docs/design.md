@@ -57,10 +57,13 @@ Host entries and identity pins can [reload while the broker runs](dynamic-hosts.
 
 Bridge is intended for one operating-system user and explicitly trusted peers. Worktrees separate file edits; they do not isolate malicious programs running under the same user. See [security](../SECURITY.md) and [checks and limits](production-readiness.md).
 
-## Detailed specifications
+## Current interfaces
 
 - [Multi-machine architecture decisions](multi-machine-design.md)
 - [Current peer interface](multi-machine-interface.md)
-- [Groups, ordered delivery, workspaces, session names, and Web authentication](multi-machine-phase-c-design.md)
 - [Task checks and the external task ledger](agent-tiering.md)
+
+## Design records and proposals
+
+- [Phase C design record](multi-machine-phase-c-design.md): design decisions for groups, ordered delivery, workspaces, session names, and Web authentication. See the [current peer interface](multi-machine-interface.md) for supported methods.
 - [Future multi-machine proposal](multi-machine-future-design.md): unimplemented designs, not available features.

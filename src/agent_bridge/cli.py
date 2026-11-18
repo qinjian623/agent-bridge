@@ -9,9 +9,8 @@ import socket
 import sys
 import unicodedata
 import uuid
-from pathlib import Path
 
-from .config import Config, state_directory
+from .config import Config, broker_socket_path, resolve_state_directory, state_directory
 from .errors import BridgeError
 from .i18n import LANGUAGE_ENV, resolve_language, use_language, validate_language
 from .i18n import translate as _
@@ -242,12 +241,12 @@ def main(argv: list[str] | None = None):
             if language is None:
                 # Help must remain available even when the rest of config.json needs repair.
                 try:
-                    state_path = Path(known.state or os.environ.get("AGENT_BRIDGE_STATE", Path.home() / ".local/state/cli-agent-bridge")).expanduser()
+                    state_path = resolve_state_directory(known.state)
                     payload = json.loads((state_path / "config.json").read_text(encoding="utf-8"))
                     language = payload.get("language") if isinstance(payload, dict) else None
                     if language is not None:
                         language = validate_language(language)
-                except (OSError, ValueError):
+                except (OSError, RuntimeError, ValueError):
                     language = None
             with use_language(language or "en"):
                 _main(argv)
@@ -261,6 +260,8 @@ def _main(argv: list[str]):
         parser.parse_args(argv)
     try:
         state = state_directory(args.state)
+        if args.command in {"doctor", "serve"}:
+            broker_socket_path(state)
         if args.command == "mirrors":
             if args.mirrors_command == "prune":
                 from .store import Store

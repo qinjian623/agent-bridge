@@ -9,7 +9,7 @@ from .broker import request
 def server(state):
     mcp = FastMCP(
         "cli-agent-bridge",
-        instructions="Control independent native agent sessions. Dispatch asynchronously by default using a registered parent notification route; continue independent work instead of polling agent_wait. Completed results require agent_review before dependent tasks run. Never claim unknown costs are zero.",
+        instructions="Control independent native agent sessions. Dispatch returns before inference. Use parent notifications only after configuring and verifying the notification helper; otherwise read agent_result or use a bounded agent_wait. Completed results require agent_review before dependent tasks run. Never claim unknown costs are zero.",
     )
     read_only = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 
@@ -149,7 +149,7 @@ def server(state):
         project_id: str | None = None,
         name: str | None = None,
     ) -> dict:
-        """Queue one task locally or on a registered remote host; return after acceptance/setup, without waiting for inference. Default to asynchronous coordination: link new sessions to a registered parent for notifications, then continue independent work instead of polling. Passing parent does not reparent an existing session. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Optional profile + model selects an exact discovered model; existing sessions cannot change models. Optional name labels a session created by this dispatch (1-128 trimmed characters, no control characters) and is rejected when session_id is given. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result, task_timeout (finite positive total seconds; omitted/null uses node default, retry omitted/null retains prior override). No verified hard_budget support. Remote dispatch without session_id uses one atomic open+dispatch operation; cwd is the local source dir and project_id names the remote project. Remote retry_task_id is not supported and is rejected before dispatch."""
+        """Queue one task locally or on a registered remote host; return after acceptance/setup, without waiting for inference. Link new sessions to a registered parent if the notification helper is configured and verified. Otherwise use agent_result or a bounded agent_wait to check completion. Passing parent does not reparent an existing session. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Optional profile + model selects an exact discovered model; existing sessions cannot change models. Optional name labels a session created by this dispatch (1-128 trimmed characters, no control characters) and is rejected when session_id is given. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result, task_timeout (finite positive total seconds; omitted/null uses node default, retry omitted/null retains prior override). No verified hard_budget support. Remote dispatch without session_id uses one atomic open+dispatch operation; cwd is the local source dir and project_id names the remote project. Remote retry_task_id is not supported and is rejected before dispatch."""
         return await request(state, "agent_dispatch", locals())
 
     @mcp.tool()
@@ -198,7 +198,7 @@ def server(state):
     async def agent_wait(
         after: int = 0, timeout: float = 20, session_id: str | None = None, task_id: str | None = None
     ) -> dict:
-        """Explicit bounded synchronous wait for durable events after a cursor (up to 50 seconds); timeout is not failure. Prefer asynchronous parent notifications by default; do not repeatedly call this tool to keep the coordinator waiting."""
+        """Wait for durable events after a cursor (up to 50 seconds); timeout is not failure. Use this for a bounded check when parent notifications are unavailable. Avoid repeated waits that keep the coordinator blocked."""
         return await request(state, "agent_wait", locals())
 
     @mcp.tool(annotations=read_only)

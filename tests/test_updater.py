@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 from agent_bridge import updater
+from agent_bridge.errors import BridgeError
 from agent_bridge.store import Store
 
 
@@ -271,6 +272,31 @@ class ChildProcessTests(unittest.TestCase):
 
 
 class ReleaseValidationTests(UpdateFixture):
+    def test_source_change_preserves_settings_and_requires_explicit_mirror_removal(self):
+        path = self.state / "update.json"
+        original = {**self.settings, "interval": 1800, "release_url": "http://127.0.0.1:8088/bridge"}
+        updater._write(path, original)
+        before = path.read_bytes()
+        with patch.object(updater, "latest_release") as fetch:
+            with self.assertRaises(BridgeError) as caught:
+                updater.change_update_source(self.state, "example/public-bridge")
+            self.assertEqual("mirror_configured", caught.exception.code)
+            self.assertEqual(before, path.read_bytes())
+            with updater._acquire_update_lock(self.root), self.assertRaises(BlockingIOError):
+                updater.change_update_source(self.state, "example/public-bridge", clear_mirror=True)
+            reply = updater.change_update_source(self.state, "example/public-bridge", clear_mirror=True)
+        fetch.assert_not_called()
+        self.assertTrue(reply["mirror_removed"])
+        self.assertEqual(self.old.resolve(), self.updater.current.resolve())
+        self.assertEqual(
+            {**self.settings, "repository": "example/public-bridge", "interval": 1800},
+            updater.load_settings(self.state),
+        )
+        # A timer that loaded the old source before the migration re-reads it under the lock.
+        with patch.object(updater, "latest_release", return_value={"tag": "v0.1.0"}) as fetch:
+            self.assertEqual("up_to_date", self.updater.bootstrap()["status"])
+        fetch.assert_called_once_with("example/public-bridge")
+
     def test_legacy_mirror_settings_load_and_reconfiguration_preserve_source(self):
         for url in ("http://127.0.0.1:8088/bridge", "https://mirror.example.invalid/bridge/"):
             with self.subTest(url=url):
@@ -714,6 +740,26 @@ class ActivationTests(UpdateFixture):
 
 
 class TimerAndLauncherTests(UpdateFixture):
+    def test_scheduled_updater_can_find_uv_from_an_external_install_directory(self):
+        uv_path = self.home / "custom tools/bin/uv"
+        for kind in ("systemd", "launchd"):
+            with self.subTest(kind=kind):
+                (self.state / "update.json").unlink(missing_ok=True)
+                with (
+                    patch.object(updater.Path, "home", return_value=self.home),
+                    patch.object(updater.shutil, "which", return_value=str(uv_path)),
+                    patch.object(updater, "_run") as run,
+                ):
+                    result = updater.install(self.state, service_kind=kind, root=self.root)
+                run.assert_not_called()
+                timer = Path(result["timer"])
+                if kind == "systemd":
+                    service = timer.with_name("cli-agent-bridge-update.service").read_text()
+                    self.assertIn(f'Environment="PATH={uv_path.parent}:', service)
+                else:
+                    env = plistlib.loads(timer.read_bytes())["EnvironmentVariables"]
+                    self.assertTrue(env["PATH"].startswith(f"{uv_path.parent}:"))
+
     def test_launcher_uses_physical_release_python_and_preserves_arguments(self):
         binary = self.new / "bin"
         binary.mkdir()

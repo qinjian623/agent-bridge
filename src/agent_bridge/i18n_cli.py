@@ -1,6 +1,10 @@
 """Simplified Chinese CLI and terminal labels, keyed by English templates."""
 
 MESSAGES: dict[str, str] = {
+    "Remove the configured mirror when changing the GitHub update source": "切换到 GitHub 更新源时移除已配置的镜像",
+    "update source requires --repository OWNER/REPO": "update source 必须指定 --repository OWNER/REPO",
+    "--clear-mirror only applies to update source": "--clear-mirror 仅适用于 update source",
+    "An update mirror is configured; use --clear-mirror to switch to GitHub": "已配置更新镜像；切换到 GitHub 时请显式使用 --clear-mirror",
     "Persistent local Codex / Claude Code / Pi / Antigravity sessions": "持久运行本机 Codex / Claude Code / Pi / Antigravity 会话",
     "Display language: en, zh-CN or auto (default: English)": "显示语言：en、zh-CN 或 auto（默认：英语）",
     "Install checked release wheels; drain and hot-swap the broker while compatible workers run.": "安装已检查的发布 wheel；等待任务结束后热切换 broker，兼容的 worker 可继续运行。",

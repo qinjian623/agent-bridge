@@ -277,6 +277,8 @@ def _apply_profile_update(
         if optional_key in cleaned and cleaned[optional_key] in ("-", None):
             cleaned.pop(optional_key, None)
             to_clear.add(optional_key)
+    if "runtime" in cleaned and cleaned["runtime"] != existing.get("runtime") and "executable" not in cleaned:
+        to_clear.add("executable")
     identity_changed = bool(existing) and any(
         existing.get(key) != cleaned.get(key) for key in ("runtime", "provider", "model") if key in cleaned
     )
@@ -432,11 +434,15 @@ def _edit_profiles_menu(
             clear_fields.add("effort")
         elif effort:
             entry["effort"] = effort
+        detected_executable = env["runtimes"].get(runtime)
+        if not detected_executable or not Path(detected_executable).is_absolute():
+            detected_executable = ""
+        previous_executable = cur.get("executable") if cur.get("runtime") == runtime else None
         exe = _prompt(
             input_fn,
             output_fn,
             _("Executable path override (optional, '-' to clear)"),
-            default=cur.get("executable") or "",
+            default=previous_executable or detected_executable,
         )
         if exe == "-":
             clear_fields.add("executable")

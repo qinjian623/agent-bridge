@@ -8,7 +8,7 @@ For one user on their own computer or trusted SSH hosts. Requires Python 3.11+, 
 
 ## Install
 
-Install from this repository; no PyPI package is required:
+Install from this repository. A private checkout requires repository access. No PyPI package is required.
 
 ```bash
 uv tool install 'git+https://github.com/qinjian623/cli-agent-bridge.git'
@@ -35,6 +35,8 @@ agent-bridge call agent_inspect --json '{}'
 For background startup, see [managed services](docs/getting-started.md#managed-services).
 
 CLI help, setup prompts, the terminal monitor, Web pages, and parent task notices support English and Simplified Chinese. Try `agent-bridge --lang zh-CN --help`; the Web dashboard and login page have their own language selector. See [language settings](docs/getting-started.md#language).
+
+To open the dashboard, run `agent-bridge monitor --web` in another terminal and visit [the local login page](http://127.0.0.1:8080/login). Sign in with the token in your Bridge state's `admin.token`. See [Web setup](docs/getting-started.md#monitoring-and-http--sse-api).
 
 ## Connect MCP
 
@@ -67,6 +69,8 @@ agent-bridge monitor
 ```
 
 `queued` or `running` means work remains. `waiting_input` needs a response; `recovery_needed` needs investigation. `completed` means the model finished its reply. Check its answer, files, and any reported tests before accepting it with `agent_review` or starting dependent work. The [guide](docs/getting-started.md#results-and-review) explains review and full result retrieval.
+
+New installations use `agent_result` or the monitor to see progress. Automatic completion notices require a configured [parent notification helper](docs/getting-started.md#parent-sessions-and-telegram).
 
 ## Stop a task or session
 

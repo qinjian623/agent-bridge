@@ -5,7 +5,7 @@
 `.github/workflows/ci.yml` 在 push、pull request 和手动触发时运行：
 
 - Ubuntu / Python 3.11、3.13、3.14：按 `uv.lock` 安装，运行 Ruff 和完整离线测试。测试使用模拟 CLI，不需要模型账号或密钥。
-- 上述检查通过后，Ubuntu 和 macOS 分别构建 wheel、源码包，写入 `SHA256SUMS` 与 `latest.json`，并在新虚拟环境中安装 wheel、检查命令以及幂等 `agent-bridge init` / `doctor`。构建文件保留为 14 天的 Actions artifact。
+- 上述检查通过后，Ubuntu 和 macOS 分别构建 wheel、源码包，写入 `SHA256SUMS` 与 `latest.json`，并在新环境中安装 wheel、检查命令帮助、重复初始化和 `doctor`。随后在临时目录启动前台 broker，确认运行版本与 wheel 一致，并通过 MCP 调用 `agent_inspect`。构建文件保留 14 天。
 
 macOS 检查安装和打包；完整测试含 Linux `/proc` 检查，目前仅在 Ubuntu 运行。它不代表真实远程 AGY、模型工具或服务升级已验证。
 
@@ -19,3 +19,9 @@ latest.json
 ```
 
 Actions 的测试、构建任务只有仓库读取权限；仅 tag 发布任务具有写 Release 的权限。第三方 Action 固定到已经核对的 commit。流程不推送 PyPI、不更新终端、不重启 Bridge，也不自动覆盖已有 Release；节点自动更新程序直接通过公开 GitHub Releases HTTPS 读取 `latest.json`、`SHA256SUMS` 与 wheel，无需配置 `gh` 登录或令牌。不要把 GitHub token 写进仓库、workflow 或包文件。
+
+## 新公开仓库的首个版本
+
+用已检查的源码建立公开仓库。原有历史提交、Release 附件和 Actions 记录仍保存在私库。推送发布 tag 前，将中英文文档里的安装和克隆地址、包的 Repository 和 Issues 链接、随包 skill 的链接以及默认更新源改为已确认的新地址。tag 构建会核对包的链接和默认更新源是否指向当前发布仓库。
+
+首发版本应高于存量节点安装的版本，并保留 Python 包名及 wheel 命名规则。存量节点继续使用现有更新源，直到管理员明确切换。先用未登录的客户端验证能从公开 Release 安装、连接 MCP 并读取 OTA 清单，再让存量节点切换。见[隐私检查](privacy.md)和[切换更新源](getting-started.md#switching-update-sources)。

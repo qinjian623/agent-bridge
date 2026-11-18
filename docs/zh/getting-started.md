@@ -70,9 +70,17 @@ agent-bridge --state "$HOME/.local/state/bridge-test" init
 agent-bridge --state "$HOME/.local/state/bridge-test" serve
 ```
 
+使用当前用户拥有、权限为 `0700` 的专用目录，绝对路径尽量短。`AGENT_BRIDGE_STATE` 为空时使用默认目录。Broker 会在目录内创建 `broker.sock`，Unix socket 的路径有按字节计算的长度上限，各系统可能不同。如果 `doctor` 或 `serve` 提示 socket 路径过长，换用较短的状态目录，并给各进程使用同一路径。
+
 配置与环境文件为私有文件。`env_file` 是权限 `0600`、内容为字符串环境变量的 JSON 对象；不要在任务、提交、截图或共享日志中填写凭据。改变配置的 runtime/provider/model 会清除旧推理检查标记与价格信息；移除主机或更改 SSH 目标会同时清理配置与 `host_pins.json` 中的旧身份记录。
 
 `doctor` 检查配置、可执行文件、服务可用情况与 socket 是否存在，不证明登录、模型推理或远端任务已经可用。成功调用 `agent_inspect` 才证明当前客户端能与运行中的 broker 通信。
+
+### 备份和磁盘占用
+
+完整备份前，先让 Broker 和 worker 停止写入，再私下备份整个状态目录。SQLite 保存任务历史和文件引用，备份要包含 `artifacts/`，才能读取完整回答和工具输出。恢复到新目录时，这些 JSON 附件可从新目录读取。既有工作目录、原生会话、配置的可执行文件及环境文件仍可能需要保持原路径。
+
+SQLite 清理只影响数据库文件。`artifacts/`、保留的 worktree 或副本占用另计，即使数据库变小，这些文件也可能继续增长。分别查看各目录大小，保留尚未应用或审查的工作。见[卸载时的数据保留说明](uninstall.md#5-单独决定是否删除本地数据)。
 
 <a id="language"></a>
 ## 语言设置
@@ -140,7 +148,7 @@ agent-bridge call agent_review --json '{"task_id":"<task_id>","attempt_id":"<att
 
 依赖任务等待前项的当前已完成 attempt 被接受后才运行。被拒绝的 attempt 需要明确重试或新任务。`agent_result` 默认只显示简短回答；出现 `answer_truncated` 或结果文件时，用返回的 `artifact_id`、`offset`、`next_offset` 分页读取。每页按 UTF-8 字节计数，最多 65,536 字节，不能按字符计算。出现 `files.error`、`statistics_error` 时分别检查；有回答不证明文件记录和用量查询都成功。
 
-交互查看用 `agent-bridge monitor`；一次快照用 `agent-bridge monitor --once --format json --no-native`。登记父会话后可以异步接收通知；`agent_wait` 只是可选的有限等待，最多 50 秒，不应让协调者反复轮询。
+交互查看用 `agent-bridge monitor`，一次快照用 `agent-bridge monitor --once --format json --no-native`。新安装默认不发送父通知。保存任务 ID，通过 `agent_result` 读取状态和回答；需要等待事件时，可以调用一次 `agent_wait(task_id=..., timeout=20)`，再查看结果。最长等待 50 秒，超时不代表任务失败。
 
 ## 修改文件与停止任务
 
@@ -160,6 +168,8 @@ agent-bridge init --non-interactive --install-broker-service --enable-broker-ser
 ```
 
 这会写入并启动 Linux `systemd --user` unit 或 macOS `launchd` LaunchAgent，通过固定程序入口启动。尚未选中托管发布版时，会用安装时的 Python 启动；请保留该 uv 工具环境或源码 `.venv`。遇到不同内容的已有服务文件会拒绝覆盖；不要在没有查看文件及活动任务的情况下添加 `--force-broker-service`。
+
+后台服务的 `PATH` 可能与交互终端不同。向导会把探测到的 CLI 绝对路径作为 profile 的 `executable` 默认值。如果 CLI 是脚本，还要依赖自定义目录里的 Node.js 等解释器，就把该目录加入 profile 私有 `env_file` 的 `PATH`。定时更新会使用配置时找到的 `uv` 所在目录。如果移动了 `uv`，在能找到它的终端重新配置更新服务。在交互终端运行 `doctor` 只检查当前终端环境。
 
 Linux 默认命令：
 
@@ -185,6 +195,7 @@ launchctl print "gui/$(id -u)/com.cli-agent-bridge.broker"
 | 找不到命令 | 运行 `uv tool update-shell` 并打开新终端；源码目录内使用 `uv run` |
 | `init` 要求人工配置 | 在交互终端执行，或在首次非交互运行时明确传入 `--profile` |
 | 无法连接 broker | 启动 `serve`，检查状态目录是否一致，以及服务状态和日志 |
+| Unix socket 路径过长 | 选择较短的绝对状态路径，Broker、CLI 和 MCP 使用同一路径 |
 | 找不到 CLI 或登录失败 | 运行 `doctor`，检查目标 CLI 登录和可执行文件绝对路径；服务 PATH 可能与终端不同 |
 | 无法自动选择配置 | 首个任务明确指定未经推理检查的配置；发现模型不等于已验证推理 |
 | 任务一直排队 | 读取 `waiting_reason`：前序检查、暂停、并发、供应商额度、预算、worker 启动都可能需要处理 |
@@ -385,6 +396,8 @@ Codex 恢复时缺少本轮执行前的累计值，会将本轮用量标为不�
 
 `codex_async_python`（可选，默认 `null`）可指向已有 `codex-async` 安装的 Python，例如 `/path/to/codex-async/.venv/bin/python`；普通用户无需安装 `codex-async` 即可使用单机/多机核心功能。配置该项时，本项目直接调用其 `CodexAppServer`，保留队列、共享 daemon 和会话占用检查，不复制 Telegram 接收、发送和凭据代码。
 
+未配置该辅助程序时，即使已登记父会话，Broker 也不会发送自动通知。启用后先确认自己登记的 Codex 会话能收到一条测试通知。在此之前，用[任务结果和限时等待](#results-and-review)查看进展。
+
 通过 `agent_control(action=parent_register, session_id=父记录名, native_session_id=原生 Codex ID, cwd=主目录, expected_revision=0, request_id=...)` 登记主会话，`agent_open(parent=父记录名)` 将子会话关联到它。父会话必须已经配置本项目工具或能使用命令行，收到通知后才能检查结果。
 
 登记时提供 `usage_path=该 Codex 会话 JSONL 的绝对路径`，服务核对文件首行中的原生 ID，只保存计数和读取位置。默认从登记时的累计值开始；`usage_since=Unix时间戳` 可选择已有记录的起点，精度为原生 usage 事件。重复事件和服务重启不重复计量，文件替换或计数重置标为不完整。`usage_profile=已配置的Codex配置名` 可提供同模型价格；模型变化后不套用旧模型价格。`notify=false` 只登记统计，不发送完成通知、不唤醒父会话。用 `parent_meter_stop` 固定结束计数，再读取父记录中的 `usage`。
@@ -414,6 +427,9 @@ Telegram 仍使用原来的话题和发送记录。配置 `telegram_database` �
 ## 监控与接入接口
 
 TUI（`agent-bridge monitor`）、Web（`agent-bridge monitor --web`）和 MCP `agent_monitor` 统一覆盖 `pi`、`claude`、`antigravity`（`agy`）、`codex` 四个运行时，分别统计 Bridge 托管会话与本机原生 CLI / worker 进程（包括 `presence/*.lock`、`codex resume`、独立 `pi` 与 `claude` 终端）。Web 与 Bridge 会话列表优先展示活跃 / 运行中 / 待审批会话，避免被大量历史已停止记录淹没。
+
+启动 Broker 后，在另一个终端运行 `agent-bridge monitor --web`。如果 Broker 使用了自定义 `--state`，在 `monitor` 之前传入同一个选项。打开 [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login)，输入该状态目录内 `admin.token` 的令牌，默认文件为 `~/.local/state/cli-agent-bridge/admin.token`。保持监听在回环地址并妥善保管令牌。macOS 的原生进程列表不显示进程工作目录。
+
 
 - CLI 过滤：`agent-bridge monitor --once --format json --runtime agy --source all --active-only --session-limit 50`（也支持 `--no-native`；`--web` 不接受终端筛选参数）。
 - MCP 工具：`agent_monitor` 支持 `runtime`（含 `agy` 别名）、`source`（`all`/`bridge`/`native`）、`status`（`all`/`active`/`running`/`idle`/`waiting`/`waiting_input`/`stopped`）、`session_limit`、`include_native`、`after_seq`。
@@ -490,10 +506,31 @@ agent-bridge update --drain-workers run
 
 更新配置为 `~/.local/state/cli-agent-bridge/update.json`（0600），可配置 GitHub 仓库、独立版本目录、systemd/launchd 服务名和检查间隔。OTA 更新**默认通过公开 GitHub Releases HTTPS 直连**（若配置了 `HTTPS_PROXY` 则走代理 `CONNECT` 隧道）拉取资产并校验 `SHA256SUMS`，无需配置 `gh` CLI 或登录凭据。安装时默认不启动定时器，也不修改已有 Broker 服务；通过 `agent-bridge init`（第 5 项服务与 OTA 向导）或完成服务迁移后再启用定时器。Linux 每小时检查并随机延迟最多 5 分钟，macOS 使用 LaunchAgent 定时检查。
 
-已有私有 `release_url` 设置会继续生效：从 `<base>/latest.json` 获取发布信息，从 `<base>/releases/<tag>/` 获取附件。再次运行 `init` 或修改检查间隔会保留原来源。镜像支持 HTTPS，HTTP 仅限 loopback/Tailscale，并检查 DNS 地址；重定向必须保持原来源的协议、主机和端口。镜像请求失败不会改用 GitHub。需要切换到默认 GitHub 来源时，明确从 `update.json` 删除 `release_url`。
+已有私有 `release_url` 设置会继续生效：从 `<base>/latest.json` 获取发布信息，从 `<base>/releases/<tag>/` 获取附件。再次运行 `init` 或修改检查间隔会保留原来源。镜像支持 HTTPS，HTTP 仅限回环地址及 Tailscale，并检查 DNS 地址。重定向必须保持原来源的协议、主机和端口。镜像请求失败不会改用 GitHub。
 
 更新下载经过 SHA256 检查的 wheel，在新版本专用虚拟环境中安装，先运行配置与隔离服务检查。默认启用 OTA 热更新：不中断运行中的任务和兼容 worker，进入维护前仅排空短在途请求、通知与非 SSH helper；兼容 Worker 与 SSH relay 在当前轮次结束或空闲后自行退场由新版拉起（仅当目标版声明不兼容、或指定 `--drain-workers` 时才等待全部任务与 Worker 清空）；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录禁止新派单和发送，其他节点也不能在此时投递新工作；CLI 在维护和重启短暂窗口内对只读与带 `request_id` 的幂等请求自动重试。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。详情参见 [OTA 热更新设计](ota-updates.md)。
 
 `~/.local/share/cli-agent-bridge/bin/agent-bridge` 是固定入口，Broker、CLI、MCP、远端 relay 和 skill 应使用该入口或 `current/skill`，不能只改 Broker 而让其它入口仍指向旧 checkout。版本目录保留，源仓库及其未提交修改不被更新程序覆盖。正在运行的原生终端不被重启，MCP 配置修改在下次加载时生效。定时器只更新 Bridge，不更新 Codex、Claude、Pi 或 AGY 本身。
 
 最近结果保存在状态目录的 `update-status.json`；下载或校验失败会记录失败类型。核对实际运行版本和健康检查结果，不能将定时器已安装当作升级成功。
+
+<a id="switching-update-sources"></a>
+### 切换更新源
+
+已有托管安装时，将 `OWNER/REPO` 替换为新的 GitHub 发布仓库：
+
+```bash
+agent-bridge update source --repository OWNER/REPO
+agent-bridge update check
+```
+
+使用自定义状态目录时，两条命令都在 `update` 之前传入同一个 `--state`。切换命令在更新锁保护下编辑 `update.json`，保留安装目录、服务和定时器的设置。只有明确要放弃已配置的 `release_url` 镜像时才加 `--clear-mirror`。切换命令不会执行升级或重启服务。`update check` 查询新来源，并报告是否有比已安装版本更新的版本。
+
+如果已有入口不识别 `update source`，先下载新版 wheel，按该发布版本的 `SHA256SUMS` 校验，再从 wheel 运行该命令。替换示例中的两个绝对路径及仓库地址：
+
+```bash
+uv tool run --from /absolute/path/to/cli_agent_bridge-0.3.1-py3-none-any.whl \
+  agent-bridge --state /absolute/path/to/state update source --repository OWNER/REPO
+```
+
+为新仓库准备发布时，更新中英文 README 和安装指南的安装地址、`pyproject.toml` 的项目链接、随包 skill 的文档链接，以及 `src/agent_bridge/updater.py` 中的默认 `REPOSITORY`。既有安装继续使用已配置的来源，直到主动切换。

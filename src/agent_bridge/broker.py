@@ -20,7 +20,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__, groups, native_broadcast, peer_api, update_guard
-from .config import Config, Profile, read_admin_token, safe_error
+from .config import Config, Profile, broker_socket_path, read_admin_token, safe_error
 from .discovery import ModelDirectory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
@@ -3051,12 +3051,12 @@ class Broker:
             await writer.wait_closed()
 
     async def serve(self):
+        path = broker_socket_path(self.state)
         lock = (self.state / "broker.lock").open("a")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise BridgeError("already_running", "A broker already owns this state directory") from error
-        path = self.state / "broker.sock"
         path.unlink(missing_ok=True)
         server = await asyncio.start_unix_server(self.connection, str(path), limit=2 * 1024 * 1024)
         path.chmod(0o600)

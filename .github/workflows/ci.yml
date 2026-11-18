@@ -101,6 +101,7 @@ jobs:
           config = Config.load(Path(os.environ["SMOKE_STATE"]) / "config.json")
           assert config.profiles and not any(p.verified for p in config.profiles.values())
           PY
+          "$SMOKE_ENV/bin/python" -I scripts/check_installed_package.py
       - name: Write SHA256SUMS and latest.json
         run: |
           "$SMOKE_ENV/bin/python" - <<'PY'

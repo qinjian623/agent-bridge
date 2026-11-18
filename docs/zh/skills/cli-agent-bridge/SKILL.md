@@ -10,13 +10,13 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 自动更新用 `agent-bridge update check/run`，最近结果在状态目录 `update-status.json`。维护期间的 `update_busy` 表示暂缓，不能换 request_id 重跑；`uncertain` 先核对实际进程与版本。更新不重启原生终端、不升级其他 CLI，也不清除旧版本或还原数据库。MCP/relay 和 skill 必须使用固定入口或 `current/skill`，不要继续引用旧 checkout。OTA 直接通过公开 GitHub Releases HTTPS 拉取并校验 SHA256，无需配置 `gh` 登录凭据。
 
 - 先读 `agent_catalog`。程序、供应商和模型分别核对（以 `agent_catalog` 中配置的实际供应商和模型为准）。指定的模型不得自动替换。
-- Antigravity 需要 `runtime=antigravity`、`provider=google-antigravity` 和完整 `agy models` ID，即使选 Claude 也不能填 anthropic。仅支持文本与 workspace-write，read-only 明确拒绝。headless 无逐次审批，原生工具被拒绝不能当作执行成功；不要加跳过权限参数。消费套餐目前不支持封装进第三方编码代理，使用前查项目 README 的账号限制。原生累计 token 在进程恢复后缺少可靠基数时只报观察到的步骤量并标不完整；不能当实际账单。新增接口的离线测试和真实 CLI 握手已验证，真实推理/工具/中断仍需单独验证。
+- Antigravity 需要 `runtime=antigravity`、`provider=google-antigravity` 和完整 `agy models` ID，选 Claude 模型时也一样。仅支持文本和 `workspace-write`。headless 没有逐次工具审批，原生工具被拒绝时如实报告，保留原权限限制。使用前核实账号条款，见 [Antigravity 设置和账号限制](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#antigravity)。原生用量缺少可靠基数时，只报告观察到的用量并标为不完整。真实推理、工具调用和中断需要在当前环境单独验证。
 - `agent_catalog` 会自主查询已配置供应商的模型，缓存 5 分钟；需要最新结果时传 `refresh=true`，也可用 `profile` 只查一个配置。读 `discovery` 中的准确 `model`、来源、时间和错误；目录可见不代表推理成功。查询失败或 `stale=true` 时，不能选择其中的新模型。
 - 主 agent 可按任务选择目录中的模型，通过 `agent_open/agent_dispatch(profile=已有配置名, model=准确ID)` 执行，无需先改配置。原认证、供应商、权限、并发组和推理强度继续生效；已有 session 不能换模型。新模型不会继承旧模型的价格或验证标记。省略目标时，服务的均衡打分仍只使用已验证配置；不会自动付费测试整个目录。
-- 默认异步派单：派单前配置当前父会话的通知，保存返回的任务和会话 ID，随后继续独立工作；没有其他工作时，报告哪些任务仍在进行并结束当前轮次。不循环调用 `agent_wait`、sleep 或状态查询；只有用户要求同步等待时才使用有限等待。无法自动通知时明确说明，不承诺自动继续。登记父会话、复用子会话和处理完成通知见 [异步派单](resources/router-prompt.md#默认异步派单)。
+- 异步派单后保存返回的任务和会话 ID。新安装默认不发送父通知，用 `agent_result` 查看任务，需要先等事件时可用一次限时 `agent_wait`。配置并验证辅助程序和当前父会话后，再使用[自动父通知](resources/router-prompt.md#默认异步派单)。超时后不循环查询或再次派单。
 - 简单任务、前后强依赖的串行任务在主会话直接完成；单个模块由同一执行会话端到端完成“修改 + 自测”闭环，仅对互不依赖的正交子任务并行派单（由 `lead` 统一协调，子会话不私自转包或复制整段聊天）。跨角色分工（lead/developer/worker/writer/editor/operator/evaluator/visualizer/architect）、模型路由与派单/审查协议详见 [resources/router-prompt.md](resources/router-prompt.md)。
   * 派单协议：提供 `goal`, `inputs`, `allowed_files`, `out_of_scope`, `deliverable`, `acceptance`, `stop_if`（并行任务先锁定 `shared_decisions` 并两两消歧；长任务/副作用操作必填 `operation_id`，超时凭 ID 先查原作业防重复执行）。完工回报须区分 `evidence` 与 `deviations`、`assumptions`、`unverified`，触发 `stop_if` 立即报 `blocked`。
-  * 预算与返工红线：每个子任务最多定点修正 1 次（仅修审查列出的 `FIX_ITEMS`，需新证据，换会话或换模型不重置次数），专家会诊（Opus/Sonnet/Gemini）全流程限 1 次；本地模型离线时按路由表自动降级。
+  * 预算与返工次数：每个子任务最多定点修正一次，全流程最多请专家核查一次。配置不可用时，从 `agent_catalog` 中查看符合任务要求的其他已验证配置。保留用户明确指定的模型。
 - 分组用 `agent_group(action=create/add/remove/delete)`，`session_ids` 填已有 bridge ID；`native_members` 可登记原生会话 `{runtime,native_id,cwd,label}`，不创建替代会话或 worker，移除时只需 runtime/native_id。用 `agent_groups(group_id=...)` 读成员和 revision，省略 group_id 只列出分组。分组不改变原有 parent 通知。
 - `agent_broadcast(group_id, message, expected_revision, request_id, reservation)` 只向指定组的成员各派发一条任务，可能产生推理费用；reservation 按每个成员计算。不要把全部会话加入临时组来代替明确选择目标。暂停、关闭、正在排空和等待恢复的成员会跳过，检查每个 recipient 的任务 ID 或原因。
 - 广播重试保留相同 request_id 和参数，返回原收件人和任务 ID；组成员后来改变不会补发。入队不等于执行成功，按 task_id 查看结果。移除成员或删除组不撤回已排队任务，需用 agent_cancel；删除的组 ID 不复用。
@@ -34,7 +34,7 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - `recovery_needed` 表示不能确认外部执行结果。检查原生记录、worktree 和可能仍运行的外部命令后，使用 resolve 写入检查记录，再决定是否恢复；不要换 request_id 盲目重跑。
 - 会话因启动或中断请求失败而需要恢复时，尚未执行的任务仍是 `queued`；检查会话错误后明确 resume，这些排队任务不需要 resolve。
 - 需要输入或批准时从 `agent_inspect` 读取 question_id 和 expires，使用 respond 回答仍有效的请求；不自动扩大用户授权。
-- 普通 Flash 任务先运行本 skill 的 [scripts/provider_windows.py](../../../../skills/cli-agent-bridge/scripts/provider_windows.py)，按已核对的低峰窗口优先选 `claude-ollama`（Ollama Cloud）；官方 `pi-deepseek` / `claude-deepseek` 使用 DeepSeek 官方低峰窗口。只影响新任务，须先满足模型验证、工具及质量要求；供应商认证与配额分别保留，已有 session 不迁移。详细时段及节假日用法见 [分工表](resources/router-prompt.md#flash-按供应商低峰时间分配)。
+- 已配置示例中的 Flash 配置并核对账号当前价格时，可用 [scripts/provider_windows.py](../../../../skills/cli-agent-bridge/scripts/provider_windows.py) 辅助选择新任务的模型。见 [Flash 低峰示例](resources/router-prompt.md#flash-按供应商低峰时间分配)。
 - 默认使用均衡策略。单个任务可传 `requirements.strategy=cost/speed/balanced`；指定模型不被自动替换。遇到配额等待先读 `quota_cooldowns`，确认恢复后再用 `quota_resume`；失败任务不会自动重跑。
 - 用量与计费：子任务统计含每次 attempt；需汇总父会话时在 `parent_register` 传原生 Codex 的 `usage_path`（可选 `usage_since`，`notify=false` 仅统计，`parent_meter_stop` 停止计数）。缺少执行前基数或未登记父用量时只报不完整/部分统计，不把历史总量当本轮新增；换模型重试的质量归各自 attempt、费用计全部执行；未知价格不按零算，CLI 估算不作实际账单。详见 [使用指南：均衡选择与费用](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#均衡选择与费用)。
 - 异步任务的父会话通知与可选 Telegram（详见 [使用指南：父会话与 Telegram](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#父会话与-telegram)）：不默认登记无关主会话；Telegram 任务须配置可读的 `telegram_database` 并保留默认 `external_child_filter` 子会话登记（不支持时更新现有 bot，严禁设为 `null` 绕过）。父会话若用临时 MCP 启动，登记时须传私有 `resume_config_file`（不改父模型或审批策略）。收到通知后仅 `completed` 可调 `agent_review`，结果不明先核查再 `resolve`，处理后用 `parent_ack` 确认（不重发结果不明的通知，也不重启共享 Codex daemon）。

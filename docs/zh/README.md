@@ -8,7 +8,7 @@
 
 ## 安装
 
-直接从仓库安装，无需 PyPI 包：
+直接从仓库安装。私有仓库需要访问权限，无需 PyPI 包。
 
 ```bash
 uv tool install 'git+https://github.com/qinjian623/cli-agent-bridge.git'
@@ -35,6 +35,8 @@ agent-bridge call agent_inspect --json '{}'
 需要后台启动时，见[托管服务](getting-started.md#managed-services)。
 
 CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英文与简体中文。运行 `agent-bridge --lang zh-CN --help` 查看中文帮助；Web 仪表盘和登录页可单独选择语言，见[语言设置](getting-started.md#language)。
+
+需要查看 Web 仪表盘时，在另一个终端运行 `agent-bridge monitor --web`，打开[本机登录页](http://127.0.0.1:8080/login)，使用 Bridge 状态目录下 `admin.token` 中的令牌登录。见 [Web 设置](getting-started.md#监控与接入接口)。
 
 ## 接入 MCP
 
@@ -67,6 +69,8 @@ agent-bridge monitor
 ```
 
 `queued`、`running` 表示任务尚未结束；`waiting_input` 需要答复；`recovery_needed` 需要检查实际情况。`completed` 表示模型已结束回答。检查回答、文件与测试结果后，才能用 `agent_review` 接受任务或开始依赖它的工作。[详细说明](getting-started.md#results-and-review)介绍了检查步骤和完整结果读取。
+
+新安装可用 `agent_result` 或监控页面查看进展。自动发送完成消息需要配置[父会话通知辅助程序](getting-started.md#parent-sessions-and-telegram)。
 
 ## 停止任务或会话
 

@@ -13,28 +13,30 @@
 3. **一任务一负责人与边界消歧**：谁接单谁对交付物和自测负责；任务依赖必须无环。并行派单前 `lead` 必须两两核对子任务重叠区，锁定公共约定（`shared_decisions`）并划清禁改边界（`out_of_scope`）。
 4. **共享资源预算（整项任务）**：
    - 每个子任务最多尝试 2 次（初次 + 1 次带新证据的定点修正，换会话或换模型不重置次数），失败直接升级或报错，禁止轮流穷举模型。
-   - 专家稀缺会诊（Opus/Sonnet/Gemini）全流程限 1 次，仅用于重大架构分歧或疑难根因。
+   - 全流程最多请专家核查一次，用于重大设计分歧或疑难问题。
    - 最大并行 Worker：3 个。
 
 ---
 
 ## 二、 角色分工与模型路由
 
-| 角色 (`role`) | 首选模型 | 职责范围 | 常用备用 | 交付要求 |
-| :--- | :--- | :--- | :--- | :--- |
-| **统筹 `lead`** | Codex Sol | 拆分目标、协调依赖、最终整合验收 | DeepSeek Pro | 最终整合产物、验收结论 |
-| **开发 `developer`** | Codex Sol | 核心编码、模块设计、日常 Debug、补丁整合 | DeepSeek Pro / Astra | 代码补丁、测试验证证据 |
-| **批量辅助 `worker`** | 本地 Qwen3.8 | 规格明确的小修改、样板代码、格式转换、日志提取 | Luna / DeepSeek Flash | 指定范围的补丁或结构化数据 |
-| **文档与产品 `writer`** | DeepSeek Pro | 需求流程、设计说明、API 文档、实验报告 | Codex Terra / Sol | 完整正文，技术细节向 Dev 核对 |
-| **文案校验 `editor`** | DeepSeek Flash | 核对事实/数字/代码一致性，删废话、去 AI 味 | Codex Luna | 修正后正文 + 关键疑点说明 |
-| **运行 `operator`** | Codex Luna + 本地工具 | 跑训练/评测、执行命令、数据同步 | DeepSeek Flash + 工具 | 命令、退出码、job_id、日志路径 |
-| **评测分析 `evaluator`** | Codex Sol | 固定对比口径、分析指标与异常、验证 Bug 修复 | DeepSeek Pro | 同条件对比数据、结论边界 |
-| **可视化 `visualizer`** | Codex Terra | 绘制图表、前端界面、核对坐标图例 | Codex Sol | 图表/页面、数据对应关系 |
-| **疑难架构 `architect`** | Codex Astra | 复杂架构设计、跨模块约束、深层根因分析 | Codex Sol (高推理) | 决策依据、接口约束、迁移方案 |
+先查 `agent_catalog`，选择符合权限、工具和输入类型要求的已验证配置。保留用户明确指定的程序、供应商或模型。自动选择时，Broker 按 `requirements.strategy`（`balanced`、`cost` 或 `speed`）从已验证的配置中选择。首次测试新配置时可明确指定其名称。没有适合的候选时，说明缺少的条件。
+
+| 角色 (`role`) | 负责的工作和交付内容 |
+| :--- | :--- |
+| `lead` | 拆分工作、处理依赖、核对合并结果 |
+| `developer` | 编写补丁并测试 |
+| `worker` | 完成范围明确的任务，交付小补丁或结构化结果 |
+| `writer` | 编写或更新文档，核对实际实现 |
+| `editor` | 核对事实、修订文字 |
+| `operator` | 执行指定命令，报告退出码、作业 ID 和日志路径 |
+| `evaluator` | 验证修复，或在相同条件下比较结果 |
+| `visualizer` | 制作图表或界面，核对数据 |
+| `architect` | 说明设计选择、接口和迁移步骤 |
 
 ### Flash 按供应商低峰时间分配
 
-普通 Flash 任务先运行本 skill 的 [scripts/provider_windows.py](../../../../../skills/cli-agent-bridge/scripts/provider_windows.py)，按 `preferred_flash_profiles` 顺序选择已验证、当前可用且符合任务权限/质量要求的配置：
+以下为已配置这些名称时可选的示例。核对当前价格和账号条款后，可运行 [scripts/provider_windows.py](../../../../../skills/cli-agent-bridge/scripts/provider_windows.py)，在同等合适的已验证配置中按 `preferred_flash_profiles` 选择新任务：
 
 | 配置 | 程序与实际供应商 | 模型 | 低峰时段 |
 | :--- | :--- | :--- | :--- |
@@ -43,16 +45,13 @@
 | `claude-deepseek` | Claude Code → DeepSeek 官方 | 当前已验证的 Flash ID（兼容旧名 `deepseek-v4-flash`） | 与官方 Pi 相同，二者共享官方账号配额 |
 
 - Ollama 低峰时优先 `claude-ollama`；两家同时低峰也先选 Ollama。Ollama 高峰（UTC 工作日 12:00–18:00）时，选处于官方低峰的 Pi 或 Claude，按工具和任务要求决定程序。
-- Ollama 不可用或尚未验证时，只将官方低峰配置作为 Flash 候选；仍不可用则沿用上面的模型分工，不盲目重试。明确指定的配置、模型和已有会话保持原样；跨时段只影响新派任务，不迁移或重跑已有工作。
+- 这些示例配置都不适合时，根据任务要求从目录里找其他候选。低峰时间只用于选择新任务。
 - 脚本按 UTC 与北京时间分别判断周末。默认使用普通周规则；已核实为中国法定节假日时传 `--china-public-holiday`，不猜节假日日历。
 - 这是主 agent 的分配规则。脚本只报告时间窗口，不发任务、不验证供应商、不保证整个长任务都按低峰价格计费。价格不明仍记未知。
 
 核对日期：2026-11-09。来源：[Ollama 定价](https://ollama.com/pricing)、[DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。供应商调整时间或价格后重新核对。
 
-> **专家会诊（按需，限 1 次）**：
-> - 复杂架构/深层死锁：`Opus`
-> - 高危核心代码审查：`Sonnet`
-> - 疑难图像/界面异常排查：`Gemini` (需确认图像输入支持)
+需要专家核查时，选择可使用所需权限和工具的已验证模型。任务带图片时，先核对模型能否接收图片。
 
 ---
 
@@ -60,9 +59,11 @@
 
 ### 默认异步派单
 
-- 原生 Codex 主会话在派单前，先检查并复用已有父记录；记录不存在时才用 `agent_control(action="parent_register", session_id=父记录ID, native_session_id=已核实的当前原生ID, cwd=..., expected_revision=..., request_id=..., notify=true)` 登记自己的通知。新记录用 revision `0`；`parent_register` 不能更新已有记录，须确认原记录已启用通知并保留 Telegram 过滤、用量设置及私有恢复配置。原设置无法通知时直接说明，不悄悄替换记录。自动通知目前还要求配置 `codex_async_python`，且已有共享 Codex daemon；仅登记父记录不代表可发送，也不支持其他原生程序作为通知目标。Bridge 管理的主会话保留已有父会话关系；不编造原生 ID，不登记其他用户的会话。
+派单入队后就会返回，不等推理结束。新安装默认不发送父通知。保存任务 ID，使用 `agent_result` 查结果，需要先等事件时可调用一次限时 `agent_wait`。超时不代表任务失败。
+
+- 已配置通知时，检查并复用当前原生 Codex 主会话的父记录。记录不存在时才用 `agent_control(action="parent_register", session_id=父记录ID, native_session_id=已核实的当前原生ID, cwd=..., expected_revision=0, request_id=..., notify=true)` 登记自己的通知。`parent_register` 不能更新已有记录，须确认原记录已启用通知并保留 Telegram 过滤、用量设置及私有恢复配置。自动通知要求配置 `codex_async_python`，且已有共享 Codex daemon。确认能收到通知后再依赖它。Bridge 管理的主会话保留已有父会话关系，只登记自己核实过的原生会话 ID。
 - 创建子会话时，在 `agent_open` 或 `agent_dispatch` 传 `parent=父记录ID`。复用已有子会话前，检查它保存的 parent；向已有会话派单时传 parent 不会修改原关系。没有可用的自动通知方式时直接说明；通知结果不明时不盲目重发。
-- `agent_dispatch` 完成必要的建会话、工作目录或远程准备后，入队即返回任务和会话 ID，不等待模型执行完成。保存这些 ID 及实际作业的 `operation_id`，继续独立工作；没有其他工作且通知已配置时，报告待完成事项并结束本轮。不循环调用 `agent_wait`、sleep、`agent_operation(wait=...)` 或状态查询。用户要求同步等待时才有限等待，超时不重新派单。
+- 保存任务和会话 ID 及实际作业的 `operation_id`，继续能独立推进的工作。没有其他工作时，报告待完成事项。已验证的通知可以唤醒父会话。避免循环调用 `agent_wait`、sleep、`agent_operation(wait=...)` 或状态查询，超时不重新派单。
 - 收到通知后读取对应任务和事件，分别处理完成、失败、取消、中断或等待恢复。仅 `completed` 进入独立审查，依赖任务仍须等 `agent_review(accepted)`。处理事件后用 `agent_control(action="parent_ack", event_seq=..., ...)` 确认。入队、原生会话收到及主会话确认处理是三种状态；暂停或关闭的父会话不会自动唤醒。提问或审批请求会向已登记的父会话发送 `input_required` 通知；检查问题及有效期后通过 `agent_control(action="respond", ...)` 回答，再确认处理该事件。任务仍在等待输入，不能按已完成任务审核。
 - 子会话另行启动后台编译、训练或远程作业时，完成通知必须跟踪实际作业，不能只报告启动成功。保留作业 ID，并使用已获授权的完成回调或监测程序；只写 `completion.json` 不会通知主会话。复用已有监测程序，不重复建立定时任务，也不让模型循环查询。
 
@@ -138,9 +139,8 @@ unresolved: ["触发 stop_if 的阻塞原因或遗留问题（无则为空列表
 1. **超时与未知状态（防重复执行）**：
    - 网络超时或未收到回执时，**严禁立即重跑命令**！
    - 凭 `operation_id` 或 `job_id` 先查原进程/作业；确认未执行或已终结且允许重试后，才可重跑。
-2. **Qwen 下线处理**：
-   - 本地 Qwen 随时可能离线或显存被占。一旦不可用，直接降级走备用：小代码改动交 `Luna`，文本整理交 `DeepSeek Flash`，重要任务交 `Sol`。
-   - 不在离线模型上硬等或循环重试；换 Agent 接手时，已跑作业凭 `operation_id` 查询，不从头重跑。
+2. **配置不可用**：
+   - 用户未指定模型时，从 `agent_catalog` 选择其他符合要求的已验证配置。更换执行者前，用 `operation_id` 查已有作业。
 3. **文案校验与去 AI 味**：
    - 先核对技术事实、参数、接口；无依据的性能提升或功能不得胡编。
    - 坚决删除“深入贯彻”、“全链路闭环”、“赋能”等空话套话，用“接收 X、输出 Y、耗时 Z”等具体事实说话。

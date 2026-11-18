@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Prepare version 0.3.1. Check installed wheel and broker versions and exercise MCP on both package runners. Reconfigure an existing installation's GitHub update source explicitly, with confirmation before clearing a configured mirror.
+- Treat an empty state directory setting as unset. Reject non-private state directories without changing their permissions, and report Unix socket paths that are too long.
+- Read managed task artifacts by ID after restoring a complete state directory to a new path. Document the remaining absolute paths and storage retention.
+- Preserve detected CLI paths during interactive setup and include the detected uv directory in scheduled updater environments. Clarify how to check task results before enabling parent notifications.
+
 - Add English and Simplified Chinese presentation for CLI help, setup, terminal and Web monitors, login, fixed human-facing errors, and parent notices. Add `--lang` / `--language`, `AGENT_BRIDGE_LANG`, the `language` config field, and a browser language selector. Keep protocol data and queued notice bodies unchanged.
 
 ## 0.3.0 — 2026-11-18

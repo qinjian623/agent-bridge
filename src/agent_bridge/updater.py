@@ -776,6 +776,24 @@ def _acquire_update_lock(root: Path):
         os.close(descriptor)
 
 
+def change_update_source(state: Path, repository: str, *, clear_mirror: bool = False):
+    """Change only the persisted update source for an existing managed installation."""
+    _validate_repository(repository)
+    root = Path(load_settings(state)["root"])
+    with _acquire_update_lock(root):
+        settings = load_settings(state)
+        if Path(settings["root"]) != root:
+            raise ValueError("Managed release root changed; check the current update settings")
+        if "release_url" in settings and not clear_mirror:
+            raise BridgeError("mirror_configured", "An update mirror is configured; use --clear-mirror to switch to GitHub")
+        previous = settings["repository"]
+        removed = settings.pop("release_url", None) is not None
+        if previous != repository or removed:
+            settings["repository"] = repository
+            _write(state / "update.json", settings)
+        return {"status": "configured", "repository": repository, "mirror_removed": removed}
+
+
 class Updater:
     def __init__(self, state: Path):
         self.state = state
@@ -850,6 +868,10 @@ class Updater:
     @contextlib.contextmanager
     def _locked(self):
         with _acquire_update_lock(self.root):
+            settings = load_settings(self.state)
+            if Path(settings["root"]) != self.root:
+                raise ValueError("Managed release root changed; check the current update settings")
+            self.settings = settings
             yield
 
     def stage(self, release):
@@ -1182,9 +1204,10 @@ def _systemd_exec_start(args: list[str]) -> str:
     return " ".join('"' + a.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"' for a in args)
 
 
-def _launchd_path_env() -> str:
+def _launchd_path_env(uv_directory: str = "") -> str:
     return escape(
-        str(Path.home() / ".local/bin")
+        uv_directory
+        + str(Path.home() / ".local/bin")
         + ":"
         + str(Path.home() / ".local/share/mise/shims")
         + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
@@ -1398,6 +1421,12 @@ def install(
     )
     if enable and not _probe_broker_service_state(kind, name, str(resolved_root / "bin/agent-bridge"))[2]:
         raise ValueError("Migrate the broker service to its managed launcher before enabling updates")
+    uv = shutil.which("uv")
+    if enable and not uv:
+        raise ValueError("Install uv before enabling scheduled updates")
+    uv_directory = str(Path(uv).absolute().parent) + ":" if uv else ""
+    if uv_directory and any(char in uv_directory[:-1] for char in ":\n\r"):
+        raise ValueError("Choose a uv installation directory without colons or line breaks")
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     _private(state, directory=True)
     resolved_root.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -1415,9 +1444,10 @@ def install(
         service = directory / "cli-agent-bridge-update.service"
         timer = directory / "cli-agent-bridge-update.timer"
         exec_start = _systemd_exec_start(args)
+        service_path = uv_directory.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
         _write(
             service,
-            f"[Unit]\nDescription=Check Bridge GitHub releases\n[Service]\nType=oneshot\nExecStart={exec_start}\nUMask=0077\nEnvironment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\n",
+            f'[Unit]\nDescription=Check Bridge GitHub releases\n[Service]\nType=oneshot\nExecStart={exec_start}\nUMask=0077\nEnvironment="PATH={service_path}%h/.local/bin:%h/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"\n',
         )
         _write(
             timer,
@@ -1437,7 +1467,7 @@ def install(
         _write(
             timer_path,
             '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-            + f'<plist version="1.0"><dict><key>Label</key><string>com.cli-agent-bridge.update</string><key>ProgramArguments</key><array>{arguments}</array><key>StartInterval</key><integer>{interval}</integer><key>EnvironmentVariables</key><dict><key>PATH</key><string>{_launchd_path_env()}</string></dict></dict></plist>\n',
+            + f'<plist version="1.0"><dict><key>Label</key><string>com.cli-agent-bridge.update</string><key>ProgramArguments</key><array>{arguments}</array><key>StartInterval</key><integer>{interval}</integer><key>EnvironmentVariables</key><dict><key>PATH</key><string>{_launchd_path_env(uv_directory)}</string></dict></dict></plist>\n',
         )
         if on_write is not None:
             on_write("updater")
@@ -2143,7 +2173,8 @@ def main(argv=None):
 
     parser = _ArgumentParser(description=translate(__doc__))
     parser.add_argument("--state", type=Path)
-    parser.add_argument("--repository", default=REPOSITORY)
+    parser.add_argument("--repository")
+    parser.add_argument("--clear-mirror", action="store_true", help="Remove the configured mirror when changing the GitHub update source")
     parser.add_argument("--root", type=Path)
     parser.add_argument("--service-kind", choices=["systemd", "launchd"])
     parser.add_argument("--service-name")
@@ -2155,8 +2186,12 @@ def main(argv=None):
         action="store_true",
         help="Wait until all live workers and active tasks stop before switching versions",
     )
-    parser.add_argument("action", choices=["check", "run", "install", "bootstrap"])
+    parser.add_argument("action", choices=["check", "run", "install", "bootstrap", "source"])
     args = parser.parse_args(argv)
+    if args.action == "source" and not args.repository:
+        parser.error(translate("update source requires --repository OWNER/REPO"))
+    if args.clear_mirror and args.action != "source":
+        parser.error(translate("--clear-mirror only applies to update source"))
     from .config import state_directory
 
     record_cli_failure = False
@@ -2170,13 +2205,15 @@ def main(argv=None):
             record_cli_failure = True
             result = install(
                 state,
-                args.repository,
+                REPOSITORY if args.repository is None else args.repository,
                 args.service_kind,
                 args.service_name,
                 args.root,
                 args.interval,
                 args.enable,
             )
+        elif args.action == "source":
+            result = change_update_source(state, args.repository, clear_mirror=args.clear_mirror)
         elif args.action == "run":
             record_cli_failure = True
             result = Updater(state).run(drain_workers=args.drain_workers)
@@ -2187,6 +2224,8 @@ def main(argv=None):
     except (OSError, ValueError, RuntimeError, BridgeError, http.client.HTTPException) as error:
         # Error class is sufficient for logs; never echo credential or URL diagnostics.
         result = {"status": "failed", "error_type": type(error).__name__}
+        if args.action == "source" and isinstance(error, BridgeError):
+            result.update(error_code=error.code, message=translate(str(error)))
         if record_cli_failure and "state" in locals() and not isinstance(error, BlockingIOError):
             _record_cli_failure(state, result)
     print(json.dumps(result, ensure_ascii=False))

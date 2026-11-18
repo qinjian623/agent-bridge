@@ -41,6 +41,8 @@ MESSAGES: dict[str, str] = {
     "projects must map non-empty project ids to directory paths": "projects 必须将非空项目 ID 对应到目录路径",
     "Project root cannot be resolved": "无法解析项目根目录",
     "State directory belongs to a different user": "状态目录属于其他用户",
+    "Use a dedicated state directory with permissions 0700": "请使用权限为 0700 的专用状态目录",
+    "Broker socket path is too long; choose a shorter state directory": "Broker 套接字路径过长，请选择路径更短的状态目录",
     "Admin token is missing; run init or start the Broker first": "缺少管理员令牌；请运行 init 或启动 Broker",
     "Admin token cannot be opened safely": "无法安全打开管理员令牌文件",
     "Admin token must be a regular file": "管理员令牌必须为普通文件",

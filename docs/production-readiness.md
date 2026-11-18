@@ -11,7 +11,7 @@ The [CI workflow](../.github/workflows/ci.yml) runs on pushes, pull requests, an
 | Job | What it checks |
 | --- | --- |
 | Linux / Python 3.11, 3.13, 3.14 | Locked dependencies, Ruff, publishable-content patterns, and the complete offline test suite. |
-| Linux and macOS packaging | Wheel and source archive builds, package installation in a fresh environment, CLI entrypoints, idempotent initialization, and `doctor`. |
+| Linux and macOS packaging | Wheel and source archive builds, fresh installation, CLI and initialization checks, a temporary broker version check, and a real MCP request over its Unix socket. |
 
 Tests use temporary state, mock CLIs, real stdio/Unix sockets, and isolated processes. They cover request retries, cancellation, persistence, permissions, workspace transfers, peer delivery, monitoring, and updater failure paths without calling a model provider.
 

@@ -8,7 +8,7 @@ Start with the [short walkthrough](../README.md). This guide covers configuratio
 
 Use Linux or macOS with Python 3.11+ and `uv`. On Windows, run the broker, model CLIs, projects, and MCP client inside WSL2; native Windows is unsupported. Install and log in to at least one target CLI (`codex`, `claude`, `pi`, or `agy`) separately. Bridge does not install or authenticate those programs. Use a single user account and only trusted remote hosts; do not publish the broker or monitor as a multi-user service.
 
-For a standalone installation:
+For a standalone installation, use a repository you can access:
 
 ```bash
 uv tool install 'git+https://github.com/qinjian623/cli-agent-bridge.git'
@@ -70,9 +70,17 @@ agent-bridge --state "$HOME/.local/state/bridge-test" init
 agent-bridge --state "$HOME/.local/state/bridge-test" serve
 ```
 
+Use a dedicated directory owned by your account with mode `0700` and a short absolute path. An empty `AGENT_BRIDGE_STATE` uses the default. The broker opens `broker.sock` inside it, and Unix sockets have a platform-specific path length limit in bytes. If `doctor` or `serve` reports a long socket path, choose a shorter state directory and keep it consistent across processes.
+
 Config and environment files are private. An `env_file` is a JSON object of string environment variables with mode `0600`; never put credentials into tasks, commits, screenshots, or shared logs. Changing a profile's runtime/provider/model clears old verification and price information. Removing a host or changing its SSH target clears stale identity pins in both config and `host_pins.json`.
 
 `doctor` checks configuration, executable paths, service availability, and socket presence. It does not prove that login, model inference, or a remote task works. A successful `agent_inspect` call confirms communication with the running broker.
+
+### Backups and disk usage
+
+For a consistent full backup, stop writes from the broker and its workers first. Back up the entire state directory privately. The SQLite database records task history and references to files. Keep `artifacts/` with it so full answers and tool outputs remain readable. If restoring to another state directory, those JSON artifacts can be read from the restored directory. Existing workspace locations, native session paths, and configured executable or environment file paths may still need the original locations.
+
+SQLite maintenance affects database files. Stored outputs in `artifacts/` and retained worktrees or copies take separate space and can grow even if the database shrinks. Check directory sizes separately. Keep work that has yet to be applied or reviewed. See [state retained after uninstall](uninstall.md#5-keep-or-remove-local-data-deliberately).
 
 ## Language
 
@@ -139,7 +147,7 @@ agent-bridge call agent_review --json '{"task_id":"<task_id>","attempt_id":"<att
 
 Dependent tasks do not run until the prerequisite's current completed attempt has an accepted review. A rejected attempt needs an explicit retry or new work. `agent_result` defaults to a short answer; when `answer_truncated` or an artifact is returned, pass its `artifact_id`, `offset`, and `next_offset` to retrieve all pages. Artifact limits are UTF-8 byte limits (up to 65,536), not character counts. Read `files.error` and `statistics_error` if present; an answer alone does not prove that file capture or usage collection succeeded.
 
-Use `agent-bridge monitor` for interactive status or `agent-bridge monitor --once --format json --no-native` for one snapshot. Registered parent notifications support asynchronous coordination; `agent_wait` is an optional bounded wait (maximum 50 seconds), not a reason to keep the coordinator repeatedly polling.
+Use `agent-bridge monitor` for interactive status or `agent-bridge monitor --once --format json --no-native` for one snapshot. Automatic parent notifications are off in a fresh installation. Keep the task ID and use `agent_result` to fetch its status and answer. To wait for an event, call `agent_wait(task_id=..., timeout=20)` once and check the result afterward. The wait is limited to 50 seconds and a timeout does not mean the task failed.
 
 ## Editing files and stopping work
 
@@ -162,6 +170,8 @@ agent-bridge init --non-interactive --install-broker-service --enable-broker-ser
 ```
 
 This writes and starts a Linux `systemd --user` unit or macOS `launchd` LaunchAgent using a stable managed launcher. It keeps the installation's Python as a bootstrap fallback until a managed release is selected; keep that uv tool environment or source `.venv` available. Existing conflicting service files are refused; do not add `--force-broker-service` without checking their contents and active work.
+
+Background services may have a different `PATH` than your shell. The wizard offers the detected absolute path for the profile's `executable` field. If the executable is a script that needs an interpreter such as Node.js from a custom directory, include that directory in the `PATH` value of the profile's private `env_file`. The scheduled updater includes the directory of the `uv` found during setup. If you move `uv`, refresh the updater configuration from a shell that can find it. A successful `doctor` in your interactive shell only checks that shell's environment.
 
 Default Linux commands:
 
@@ -187,6 +197,7 @@ The older `uv run python scripts/install_local.py` helper is **Linux/systemd-onl
 | Command not found | Run `uv tool update-shell`, open a new shell, or use `uv run` in a source checkout |
 | `init` requires manual configuration | Run in an interactive terminal, or pass an explicit `--profile` for a fresh non-interactive setup |
 | Broker connection fails | Start `serve`; compare state directories and inspect the service's status/logs |
+| Unix socket path is too long | Use a shorter absolute state path for the broker, CLI and MCP |
 | Executable missing or authentication failure | Run `doctor`, then check the target CLI's own login and absolute executable path; service PATH may differ from your terminal |
 | No profile selected | Explicitly name an unverified profile for its first task; catalog discovery does not verify inference |
 | Task remains queued | Read `waiting_reason`: dependencies, paused session, concurrency, quota cooldown, budget, or worker startup may require action |
@@ -355,6 +366,8 @@ A profile price can use `price={"currency":"USD","source":"pricing reference","a
 
 Optional `codex_async_python` (default `null`) may point to an existing `codex-async` virtualenv Python (e.g. `/path/to/codex-async/.venv/bin/python`) to reuse its `CodexAppServer` queue and shared daemon lock checks; standard standalone and multi-machine deployments require neither `codex-async` nor Telegram.
 
+Without this helper the broker does not deliver automatic parent notices, even if a parent is registered. Verify that a test notice reaches your own registered Codex session before relying on delivery. Until then, use [task results and bounded waits](#results-and-review).
+
 Register a coordinator record with `agent_control(action=parent_register, session_id=..., native_session_id=..., cwd=..., expected_revision=0, request_id=...)`, optionally passing `usage_path` (plus `usage_since`, `usage_profile`, `notify=false`, and later `parent_meter_stop`) to meter parent session usage accurately without copying raw transcripts. Child sessions link via `agent_open(parent=...)`. When a coordinator uses temporary MCP settings, pass an owner-only `0600` `resume_config_file` (restricted to `mcp_servers`, `plugins`, `apps`, `features.multi_agent`—see [Codex MCP docs](https://learn.chatgpt.com/docs/extend/mcp)) so cold `thread/resume` restores tools without altering model, reasoning effort, or approval policy.
 
 Deliveries distinguish queue acceptance (`enqueued`), native turn admission (`received` via `userMessage.clientId`), and coordinator acknowledgment (`parent_ack` -> `processed`). `parent_ack` triggers exact item-only queue retraction (`queue_cleanup=removed|already_started|uncertain`) without disturbing unrelated messages or paused state. Optional `telegram_database` (default `null`) reads existing bot `telegram.sqlite` topic pause/deletion markers read-only and registers child sessions in `external_children` so workers never emit unintended Telegram bot replies.
@@ -372,6 +385,8 @@ Successful events require review; unknown outcomes require inspection and resolv
 ## Monitoring and HTTP / SSE API
 
 Terminal UI (`agent-bridge monitor`), web UI (`agent-bridge monitor --web`), and MCP `agent_monitor` unify `pi`, `claude`, `antigravity` (`agy`), and `codex` across both bridge-managed sessions and local native processes, prioritizing active, running, and approval-waiting sessions.
+
+After starting the broker, run `agent-bridge monitor --web` in another terminal. If you supplied a custom `--state`, use that same option before `monitor`. Open [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login) and enter the token from `admin.token` in that state directory. The default location is `~/.local/state/cli-agent-bridge/admin.token`. Keep the listener on loopback and the token private. The macOS native process list does not report the process working directory.
 
 - CLI filters: `agent-bridge monitor --once --format json --runtime agy --source all --active-only --session-limit 50` (supports `--no-native`).
 - MCP tool: `agent_monitor` supports `runtime` (including `agy`), `source` (`all`/`bridge`/`native`), `status` (`all`/`active`/`running`/`idle`/`waiting`/`waiting_input`/`stopped`), `session_limit`, `include_native`, and `after_seq`.
@@ -448,10 +463,30 @@ agent-bridge update --drain-workers run
 
 Settings live in `~/.local/state/cli-agent-bridge/update.json` (mode `0600`) specifying the GitHub repository, managed releases directory, `systemd`/`launchd` service name, and check interval. OTA updates pull release assets **from public GitHub Releases over HTTPS by default** (honoring `HTTPS_PROXY` via `CONNECT` if configured) and verify `SHA256SUMS`, requiring no `gh` CLI login or API credentials. Installation does not auto-enable the timer or disturb an unmanaged broker service; configure and enable managed services via `agent-bridge init` (item 5: Services & OTA) or migrate explicitly before enabling periodic checks. Linux checks hourly with up to 5 minutes of jitter; macOS uses a `LaunchAgent` timer.
 
-Existing private `release_url` settings remain in use: manifests come from `<base>/latest.json` and assets from `<base>/releases/<tag>/`. Re-running `init` or changing its interval preserves the source. Mirrors use HTTPS, or HTTP restricted to loopback/Tailscale with DNS and same-origin redirect checks; a mirror failure does not fall back to GitHub. Remove `release_url` explicitly from `update.json` to switch to the default GitHub source.
+Existing private `release_url` settings remain in use: manifests come from `<base>/latest.json` and assets from `<base>/releases/<tag>/`. Re-running `init` or changing its interval preserves the source. Mirrors use HTTPS, or HTTP restricted to loopback/Tailscale with DNS and same-origin redirect checks. A mirror failure does not fall back to GitHub.
 
 Updates download the SHA-256-verified wheel, install into a dedicated versioned virtual environment, and run configuration + isolated smoke broker health checks before switching. Hot OTA updates are enabled by default: live tasks and compatible workers keep running untouched while the broker drains short in-flight API requests, notifications, and non-SSH helpers before briefly entering maintenance; compatible workers and SSH relays finish their current turn cleanly and retire on idle so new sessions spawn on the updated launcher (full worker/task drain happens only when `REQUIRES_WORKER_DRAIN` is set or `--drain-workers` is passed); paused queues stay preserved. Before switching symlinks, the short maintenance lease blocks new dispatches/broadcasts and coordinator polls; the CLI transparently retries read-only requests and idempotent `request_id` writes across the brief restart gap. After restarting, the updater checks actual version and PID, rolling back the symlink automatically on confirmed startup failure (without rolling back SQLite or replaying tasks); ambiguous restarts enter `uncertain` and halt further auto-retries. See [OTA Hot Update Design](ota-updates.md).
 
 `~/.local/share/cli-agent-bridge/bin/agent-bridge` is the stable managed launcher path. Broker services, CLI invocations, MCP registrations, remote host `relay` paths, and skills should point to that launcher (or `current/skill`) rather than stale source checkouts. Versioned directories preserve uncommitted edits in source repos, never restart live interactive terminals, and never upgrade external CLIs (`codex`, `claude`, `pi`, `agy`).
 
 The latest updater outcome is recorded in `<state>/update-status.json` along with failure classifications. Never equate installing an update timer with a completed upgrade.
+
+### Switching update sources
+
+For an existing managed installation, replace `OWNER/REPO` with the new GitHub release repository:
+
+```bash
+agent-bridge update source --repository OWNER/REPO
+agent-bridge update check
+```
+
+Use the same `--state` before `update` on both commands when using a custom state directory. The source command locks and edits `update.json` while keeping the managed installation directory, service and timer settings. Add `--clear-mirror` only when deliberately leaving a configured `release_url` mirror. Changing the source does not run an update or restart the service. `update check` queries the source and reports whether it offers a version newer than the installed release.
+
+If the installed launcher does not recognize `update source`, first download and verify a newer release wheel against its published `SHA256SUMS`. Run the command from that wheel, replacing both absolute paths and the repository:
+
+```bash
+uv tool run --from /absolute/path/to/cli_agent_bridge-0.3.1-py3-none-any.whl \
+  agent-bridge --state /absolute/path/to/state update source --repository OWNER/REPO
+```
+
+When preparing a new release repository, update the README and guide installation URLs, `pyproject.toml` project URLs, the companion skill's documentation links, and the default `REPOSITORY` in `src/agent_bridge/updater.py`. Existing installations retain their configured source until explicitly switched.

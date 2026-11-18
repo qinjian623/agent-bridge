@@ -57,10 +57,13 @@ flowchart LR
 
 Bridge 面向单个操作系统用户及明确受信任的节点。worktree 只分开文件修改，不能隔离同一用户身份下的恶意程序。见[安全说明](SECURITY.md)和[检查及限制](production-readiness.md)。
 
-## 详细说明
+## 当前接口
 
 - [多机架构决策](multi-machine-design.md)
 - [当前节点接口](multi-machine-interface.md)
-- [分组、消息顺序、工作目录、会话名称与 Web 登录](multi-machine-phase-c-design.md)
 - [任务检查和独立记录脚本](agent-tiering.md)
+
+## 设计记录和提案
+
+- [Phase C 设计记录](multi-machine-phase-c-design.md)：分组、消息顺序、工作目录、会话名称与 Web 登录的设计决策。已支持的方法以[当前节点接口](multi-machine-interface.md)为准。
 - [后续多机设计提案](multi-machine-future-design.md)：尚未实现，不代表当前可用功能。

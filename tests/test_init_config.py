@@ -123,6 +123,16 @@ class InitConfigTests(unittest.TestCase):
         self.assertNotIn("verified_at", reset["profiles"]["work-codex"])
         self.assertNotIn("pinned", reset["hosts"]["worker1"])
 
+    def test_wizard_does_not_reuse_executable_from_previous_runtime(self):
+        for detected in (None, "/usr/bin/claude"):
+            with self.subTest(detected=detected):
+                config = {"profiles": {"local": {"runtime": "codex", "model": "old", "executable": "/usr/bin/codex"}}}
+                answers = iter(["a", "local", "claude", "", "new-model", "", "", "", "", "b"])
+                init_config._edit_profiles_menu(
+                    config, {"runtimes": {"claude": detected}}, lambda _, answers=answers: next(answers), lambda _: None,
+                )
+                self.assertEqual(detected, config["profiles"]["local"].get("executable"))
+
     def test_interactive_init_reloads_edits_aborts_and_configures_services(self):
         fake_env = {
             "platform": "linux",
@@ -193,6 +203,8 @@ class InitConfigTests(unittest.TestCase):
             )
         self.assertEqual("configured", res1["status"])
         self.assertTrue((self.state / "config.json").is_file())
+        profile = json.loads((self.state / "config.json").read_text())["profiles"]["my-codex"]
+        self.assertEqual("/usr/bin/codex", profile["executable"])
         self.assertTrue((self.state / "update.json").is_file())
         self.assertNotIn("release_url", json.loads((self.state / "update.json").read_text()))
         self.assertIn("broker_service", res1)

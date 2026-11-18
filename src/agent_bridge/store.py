@@ -1671,7 +1671,7 @@ class Store:
             ).fetchone()
             if not row:
                 raise BridgeError("not_found", "Artifact does not belong to this task")
-            return artifacts.read(json.loads(row[0]), offset, limit)
+            return artifacts.read(self.state, artifact_id, json.loads(row[0]), offset, limit)
 
     def public_task(self, task_id, attempt_id=None):
         task = self.get_task(task_id)

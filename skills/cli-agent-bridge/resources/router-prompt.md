@@ -11,28 +11,30 @@
 3. **Single owner per task & boundary disambiguation**: Each owner is accountable for deliverable quality and self-testing; task dependencies must stay acyclic. Before parallel dispatch, `lead` inspects pairwise overlap, locks `shared_decisions`, and records explicit `out_of_scope` boundaries.
 4. **Shared resource budget (per logical task)**:
    - At most 2 attempts per subtask (initial attempt + at most 1 targeted fix with fresh evidence; changing session or model does not reset this cap). Escalate or report failure rather than brute-forcing models.
-   - At most 1 specialist consultation (`Opus`/`Sonnet`/`Gemini`) per workflow, reserved for major architectural disagreements or deep root causes.
+   - At most one specialist consultation per workflow, reserved for major architectural disagreements or deep root causes.
    - Maximum parallel workers: 3.
 
 ---
 
 ## 2. Roles and Model Routing
 
-| Role (`role`) | Preferred Model | Responsibilities | Common Fallback | Deliverable Expectation |
-| :--- | :--- | :--- | :--- | :--- |
-| **`lead`** | Codex Sol | Decompose goals, coordinate boundaries, final integration & review | DeepSeek Pro | Integrated artifact & acceptance verdict |
-| **`developer`** | Codex Sol | Core coding, module design, debugging, patch integration | DeepSeek Pro / Astra | Patch + test verification evidence |
-| **`worker`** | Local Qwen3.8 | Well-specified minor edits, boilerplate, formatting, log extraction | Luna / DeepSeek Flash | Scoped patch or structured output |
-| **`writer`** | DeepSeek Pro | Specs, design docs, API reference, experiment reports | Codex Terra / Sol | Full draft verified against implementation |
-| **`editor`** | DeepSeek Flash | Fact/number/code-consistency check, concise prose | Codex Luna | Revised text + discrepancy notes |
-| **`operator`** | Codex Luna + tools | Training/eval runs, commands, data sync | DeepSeek Flash + tools | Commands, exit codes, `job_id`, log paths |
-| **`evaluator`** | Codex Sol | Fixed benchmark baselines, anomaly analysis, verify bug fixes | DeepSeek Pro | Controlled comparison data & caveats |
-| **`visualizer`** | Codex Terra | Charts, frontend UI, axis/legend verification | Codex Sol | Plots/UI + data mapping |
-| **`architect`** | Codex Astra | Complex architecture, cross-module constraints, deep root cause | Codex Sol (high effort) | Design rationale, interfaces, migration plan |
+Start with `agent_catalog`. Use a verified, available profile with the access mode, tools, and input types required by the task. Keep the user's explicit runtime, provider, or model choice. For an unattended choice, the broker can select among verified profiles using `requirements.strategy` (`balanced`, `cost`, or `speed`). A new unverified profile can be named explicitly for a first test. If no candidate fits the task, report which requirement is missing.
+
+| Role (`role`) | Responsibilities and deliverable |
+| :--- | :--- |
+| `lead` | Split work, resolve dependencies, and verify the combined result |
+| `developer` | Implement and test a patch |
+| `worker` | Return a small patch or structured result for a specified task |
+| `writer` | Draft or update documentation and check it against implementation |
+| `editor` | Verify facts and revise prose |
+| `operator` | Run scoped commands and report exit codes, job IDs, and log paths |
+| `evaluator` | Verify a fix or compare results with controlled inputs |
+| `visualizer` | Produce a chart or UI and check it against the data |
+| `architect` | Explain design choices, interfaces, and migration steps |
 
 ### Flash Off-Peak Provider Allocation
 
-For standard Flash tasks, run `scripts/provider_windows.py` first and select a verified, available profile matching tool/permission/quality constraints in `preferred_flash_profiles` order:
+Optional example for installations that already use these profile names. After verifying current prices and account terms, run `scripts/provider_windows.py` and use `preferred_flash_profiles` to break ties among equally suitable verified profiles for new tasks:
 
 | Profile | Runtime & Provider | Model | Off-Peak Window |
 | :--- | :--- | :--- | :--- |
@@ -41,16 +43,13 @@ For standard Flash tasks, run `scripts/provider_windows.py` first and select a v
 | `claude-deepseek` | Claude Code -> DeepSeek Official | Current verified Flash ID (compat alias `deepseek-v4-flash`) | Same as official Pi (shares official account quota) |
 
 - Prefer `claude-ollama` whenever Ollama is off-peak (including when both are off-peak). During Ollama peak hours (UTC weekdays 12:00-18:00), pick off-peak official Pi or Claude based on tool/task needs.
-- When Ollama is unavailable or unverified, select among off-peak official profiles; if unavailable, fall back to the role table rather than retry-looping. Explicitly specified profiles, models, and live sessions remain untouched; window transitions only affect new dispatches.
+- If none of these example profiles fit, use the available catalog entries and the normal task requirements. Time windows apply to new dispatches only.
 - Weekend checks use UTC and Asia/Shanghai separately. Weekdays follow the normal calendar unless `--china-public-holiday` is explicitly passed after verifying an official holiday.
 - This is a coordinator routing heuristic: `provider_windows.py` only reports windows without dispatching tasks, validating accounts, or guaranteeing off-peak pricing across multi-hour runs (unknown pricing remains unknown).
 
 Checked 2026-11-09 against [Ollama Pricing](https://ollama.com/pricing) and [DeepSeek Pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/). Re-verify whenever provider windows or pricing change.
 
-> **Specialist Consultation (as needed, max 1)**:
-> - Complex architecture / deep deadlocks: `Opus`
-> - High-risk core code audit: `Sonnet`
-> - Tricky visual / UI defects: `Gemini` (verify image input support)
+For specialist consultation, choose a verified model with the required access and tools. For visual work, verify image input support if the task includes images.
 
 ---
 
@@ -58,9 +57,11 @@ Checked 2026-11-09 against [Ollama Pricing](https://ollama.com/pricing) and [Dee
 
 ### Asynchronous Coordination (Default)
 
-- Before dispatch, inspect and reuse an existing registration for the current supported native Codex coordinator; only create a missing registration with `agent_control(action="parent_register", session_id=<coordinator-id>, native_session_id=<verified-current-thread>, cwd=..., expected_revision=..., request_id=..., notify=true)`; a new record uses revision `0`. An existing record cannot be updated with `parent_register`; check that its notifications are enabled and retain its Telegram filtering, usage settings, and private resume configuration. If its settings prevent delivery, report the limitation rather than silently replacing it. Automatic parent notifications currently require `codex_async_python` and an existing shared Codex daemon; registration alone does not enable delivery, and other native coordinator runtimes are unsupported. Bridge-managed coordinators keep their existing parent route; never invent a native thread ID or register another user's session.
+Dispatch returns before inference finishes. A new installation has no automatic parent notices. Keep the task ID and use `agent_result`, or make one bounded `agent_wait` if you need an event before proceeding. A timeout is not a task failure.
+
+- If parent notices are set up, inspect and reuse an existing registration for the current supported native Codex coordinator. Create a missing registration with `agent_control(action="parent_register", session_id=<coordinator-id>, native_session_id=<verified-current-thread>, cwd=..., expected_revision=0, request_id=..., notify=true)`. An existing record cannot be updated with `parent_register`; check that notifications are enabled and retain its Telegram filtering, usage settings, and private resume configuration. Automatic notices require `codex_async_python` and an existing shared Codex daemon. Verify delivery before relying on the route. Bridge-managed coordinators keep their existing parent route. Register only your own verified native thread ID.
 - Link a new child with `parent=<coordinator-id>` in `agent_open` or `agent_dispatch`. When reusing a child, inspect its stored parent first: supplying `parent` to dispatch does not reparent an existing session. Do not promise automatic continuation without a supported notification route; report unavailable or uncertain delivery and never resend blindly.
-- `agent_dispatch` returns task/session IDs after queue acceptance and any session/workspace/remote setup; it does not wait for inference to finish. Retain those IDs and any `operation_id`, then continue independent work. If nothing independent remains, report what is pending and end the turn once notifications are configured. Do not keep the model active with repeated `agent_wait`, sleeps, `agent_operation(wait=...)`, or status queries. Use a bounded wait only when the user explicitly requests synchronous waiting; timeout does not authorize redispatch.
+- Retain task and session IDs and any `operation_id`, then continue independent work. If nothing independent remains, report what is pending. When a verified notice route is available, it can wake the coordinator. Avoid repeated `agent_wait`, sleeps, `agent_operation(wait=...)`, or status queries. Timeout does not authorize redispatch.
 - On notification, read the matching task/event and handle completion, failure, cancellation, interruption, or recovery according to their actual state. Only a completed result enters the independent review process below; dependent tasks still require `agent_review(accepted)`. Acknowledge the handled event with `agent_control(action="parent_ack", event_seq=..., ...)`. Queue acceptance, native receipt, and acknowledgment are separate states; paused/closed parents are not automatically woken. Input/approval requests emit an `input_required` notification for a registered parent. Inspect the question and expiry, respond through `agent_control(action="respond", ...)`, then acknowledge that event; the task is still waiting for input and must not be reviewed as completed.
 - If a worker starts a detached build, training run, or remote job, the notification must cover that actual job's terminal result, not merely successful launch. Keep its durable job ID and an authorized completion watcher/callback; writing `completion.json` alone does not notify the coordinator. Reuse an existing watcher rather than adding duplicate or recurring model polls.
 
@@ -136,8 +137,8 @@ Constraints:
 1. **Timeouts & unknown state (prevent duplicate side effects)**:
    - Never blindly rerun commands on network timeout or lost receipts.
    - Inspect by `operation_id` or `job_id` first; retry only after confirming execution never started or safely terminated.
-2. **Offline local model fallback**:
-   - Local Qwen may be offline or out of VRAM; immediately fall back per the routing table (small code edits -> `Luna`, prose cleanup -> `DeepSeek Flash`, critical work -> `Sol`) instead of retry-looping. Query existing jobs by `operation_id` when switching agents.
+2. **Unavailable profile**:
+   - Look for another suitable verified profile in `agent_catalog` when no model was explicitly requested. Query existing jobs by `operation_id` before switching agents.
 3. **Prose accuracy & anti-fluff**:
    - Check facts, numbers, parameters, and APIs against real files/outputs; never invent unverified speedups or capabilities.
    - Cut empty buzzwords and write concrete "inputs X, outputs Y, duration Z" statements.
