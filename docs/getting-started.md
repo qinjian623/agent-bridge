@@ -303,17 +303,22 @@ For systemd workers, `owned_processes` lists host PIDs in the worker cgroup, inc
 | Claude Code / Anthropic | SDK `get_server_info().models` (`resolvedModel`) |
 | Claude Code / DeepSeek | DeepSeek `GET /models` supporting Anthropic Messages |
 | Claude Code / Ollama Cloud | Ollama `GET /api/tags` |
+| Antigravity / Google | `agy models`, including separate IDs for each advertised effort variant |
 
-Coordinators can target cataloged models on demand via `profile` + `model` (`agent_open` / `agent_dispatch`) while inheriting credentials, provider, permissions, `quota_group`, and effort (validated against discovered model capabilities). Discovered models never inherit old prices or verification flags; omit `profile/model` to keep balanced selection scoped to verified profiles.
+Use `profile` for the named account and runtime configuration, then pass `model` with an exact ID to `agent_open` or to `agent_dispatch` when it creates a session. Credentials, provider, permissions, and `quota_group` belong to the profile. One profile can select multiple models from its catalog.
 
-For example, after verifying the requested ID is present in the discovered catalog:
+Each catalog model reports the provider's exact level names in `reasoning_efforts` when known. An empty list means no selectable levels; a missing or null value means the directory does not report them. `default_reasoning_effort` is included when the runtime identifies a default. Neither the order nor the spelling implies a common scale across agents.
+
+Set `effort` on a new session to one of that model's reported levels. Unsupported or unconfirmed levels are rejected before dispatch. Omitting effort keeps the configured default on the same model and uses the runtime's default when switching to a different model. If a directory is unavailable, the profile's configured model and effort can still be used without an override. A session keeps its selected model and effort for later turns. Remote explicit overrides require support on both nodes.
+
+For example, for the `agy` profile shown below, after confirming Neon XHigh is listed:
 
 ```bash
-agent-bridge call agent_catalog --json '{"profile":"codex-sol","refresh":true}'
-agent-bridge call agent_dispatch --json '{"profile":"codex-sol","model":"gpt-6-luna","cwd":"/absolute/project","instruction":"Check the specified file and report the result","request_id":"check-discovered-model-1"}'
+agent-bridge call agent_catalog --json '{"profile":"agy","refresh":true}'
+agent-bridge call agent_dispatch --json '{"profile":"agy","model":"gemini-4-neon-xhigh","effort":"xhigh","cwd":"/absolute/project","access":"workspace-write","instruction":"Check the specified file and report the result","request_id":"check-discovered-model-1"}'
 ```
 
-The selected model inherits service tier as well as effort; unsupported declared settings are rejected. Its context limit and verification timestamp are not copied from the old model. Sessions save the resolved configuration and cannot change models later. Discovery errors are reported per profile; previous catalogs remain marked `stale` and cannot authorize newly selected models. A configured model remains usable if a catalog fails or removes its alias. Discovery adds no new accounts/providers; unknown Claude-compatible providers and non-OpenAI Codex catalogs are unsupported, though existing explicit profiles can still run.
+The selected model inherits service tier if supported. A new model does not inherit old prices or verification flags. Discovery errors are reported per profile; stale catalogs cannot authorize model or effort overrides. Discovery adds no new accounts or providers. Unknown Claude-compatible providers and non-OpenAI Codex catalogs are unsupported, though existing explicit profiles can still run.
 
 Discovery performs no inference or automatic model tests. Task input currently supports text only; a catalog listing image support does not enable binary/image delivery. Missing prices remain unknown.
 
@@ -418,7 +423,7 @@ Add a profile entry to private `config.json` alongside existing profiles:
 
 ```json
 {
-  "agy-sonnet": {
+  "agy": {
     "runtime": "antigravity",
     "provider": "google-antigravity",
     "model": "claude-sonnet-5-5-medium",
@@ -429,13 +434,13 @@ Add a profile entry to private `config.json` alongside existing profiles:
 }
 ```
 
-The default executable is `agy` (overridable via `executable`). Even when selecting a Claude model, `provider` must remain `google-antigravity` rather than `anthropic`. Use the exact full model ID returned by `agy models`; if setting `effort`, it must match the ID suffix tier (`low`/`medium`/`high`). Unverified profiles are excluded from automatic balanced selection unless targeted explicitly.
+The default executable is `agy` (overridable via `executable`). Even when selecting a Claude model, `provider` must remain `google-antigravity`. Use the full model ID returned by `agy models`. For a tiered ID such as `gemini-4-neon-xhigh`, the ID selects the tier by itself. An explicit `effort` must match the chosen model's tier. Unverified profiles are excluded from automatic balanced selection unless targeted explicitly.
 
 The broker loads profiles from `config.json` on startup. After editing profiles, stop and start the foreground broker, or restart your managed service after checking active work (see [managed services](#managed-services)). Existing sessions keep their original runtime and model.
 
 ```bash
-agent-bridge call agent_catalog --json '{"profile":"agy-sonnet","refresh":true}'
-agent-bridge call agent_open --json '{"profile":"agy-sonnet","cwd":"/absolute/project","access":"workspace-write","request_id":"agy-open-1"}'
+agent-bridge call agent_catalog --json '{"profile":"agy","refresh":true}'
+agent-bridge call agent_open --json '{"profile":"agy","cwd":"/absolute/project","access":"workspace-write","request_id":"agy-open-1"}'
 # Use session_id with agent_dispatch/agent_control; use task_id with agent_cancel.
 ```
 

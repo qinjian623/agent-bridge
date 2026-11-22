@@ -111,7 +111,7 @@ MESSAGES: dict[str, str] = {
     "Provider (required for pi/antigravity, e.g. openai-codex/deepseek/google-antigravity)": "服务提供方（pi/antigravity 必填，例如 openai-codex/deepseek/google-antigravity）",
     "Exact model ID": "完整模型 ID",
     "Quota group": "配额组",
-    "Effort (optional low/medium/high/xhigh, '-' to clear)": "思考强度（可选 low/medium/high/xhigh，'-' 清除）",
+    "Reasoning effort (provider-specific, '-' to clear)": "推理档位（由供应商决定，'-' 清除）",
     "Executable path override (optional, '-' to clear)": "自定义可执行文件位置（可选，'-' 清除）",
     "Private env JSON file path (optional, '-' to clear)": "私有环境变量 JSON 文件位置（可选，'-' 清除）",
     "Staged profile {pname!r}.": "运行配置 {pname!r} 已暂存。",

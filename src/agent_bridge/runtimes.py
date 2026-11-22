@@ -376,6 +376,9 @@ class PiRuntime:
         model = state.get("model") or {}
         if model.get("id") != self.profile.model or model.get("provider") != self.profile.provider:
             raise BridgeError("model_mismatch", "Pi did not select the requested provider and model")
+        actual_effort = state.get("thinkingLevel")
+        if self.profile.effort is not None and actual_effort is not None and actual_effort != self.profile.effort:
+            raise BridgeError("effort_mismatch", "Pi did not select the requested reasoning effort")
 
     async def run(self, instruction, on_started, on_event):
         while not self.client.events.empty():

@@ -11,14 +11,17 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from .config import Profile
+from .config import Profile, agy_model_effort, validate_reasoning_effort
 from .errors import BridgeError
 from .runtimes import JsonProcess, claude_environment
 
 CACHE_SECONDS = 300
 
 
-def model_record(model, display_name=None, input_types=None, context_window=None, **metadata):
+def model_record(
+    model, display_name=None, input_types=None, context_window=None,
+    *, reasoning_efforts=None, default_reasoning_effort=None, **metadata,
+):
     if (
         not isinstance(model, str)
         or not model
@@ -33,7 +36,7 @@ def model_record(model, display_name=None, input_types=None, context_window=None
         raise BridgeError("invalid_catalog", "Invalid model input types")
     if context_window is not None and (type(context_window) is not int or context_window <= 0):
         raise BridgeError("invalid_catalog", "Invalid model context window")
-    for key, value in metadata.items():
+    for key, value in {"reasoning_efforts": reasoning_efforts, **metadata}.items():
         if value is not None and (not isinstance(value, list) or any(not isinstance(v, str) for v in value)):
             raise BridgeError("invalid_catalog", f"Invalid model {key}")
     return {
@@ -41,8 +44,23 @@ def model_record(model, display_name=None, input_types=None, context_window=None
         "display_name": display_name if isinstance(display_name, str) else model,
         "input_types": input_types,
         "context_window": context_window,
+        "reasoning_efforts": reasoning_efforts,
+        "default_reasoning_effort": default_reasoning_effort if isinstance(default_reasoning_effort, str) else None,
         **metadata,
     }
+
+
+def _pi_efforts(model):
+    if model.get("reasoning") is False:
+        return ["off"]
+    mapping = model.get("thinkingLevelMap")
+    if model.get("reasoning") is not True or not isinstance(mapping, dict):
+        return None
+    # Pi's model registry inherits its base levels for unmapped keys; null disables a level.
+    baseline = ("off", "minimal", "low", "medium", "high")
+    return [level for level in baseline if level not in mapping or isinstance(mapping[level], str)] + [
+        level for level in ("xhigh", "max") if isinstance(mapping.get(level), str)
+    ]
 
 
 async def reject_question(_):
@@ -77,9 +95,11 @@ async def native_models(profile: Profile, cwd):
                 if not line.strip() or line.startswith("Fetching "):
                     continue
                 slug, *label = line.split("\t", 1)
-                tier = slug.rsplit("-", 1)[-1]
-                rows.append(model_record(slug, label[0] if label else slug, ["text"],
-                                         reasoning_efforts=[tier] if tier in {"low", "medium", "high"} else []))
+                tier = agy_model_effort(slug)
+                rows.append(model_record(
+                    slug, label[0] if label else slug, ["text"],
+                    reasoning_efforts=[tier] if tier else None, default_reasoning_effort=tier,
+                ))
             return rows, "Antigravity CLI agy models"
         finally:
             with contextlib.suppress(ProcessLookupError):
@@ -140,7 +160,10 @@ async def native_models(profile: Profile, cwd):
         if profile.runtime == "pi":
             result = await client.request({"type": "get_available_models"})
             return [
-                model_record(m["id"], m.get("name"), m.get("input"), m.get("contextWindow"))
+                model_record(
+                    m["id"], m.get("name"), m.get("input"), m.get("contextWindow"),
+                    reasoning_efforts=_pi_efforts(m),
+                )
                 for m in result["models"]
                 if m.get("provider") == profile.provider
             ], "Pi RPC get_available_models (configured provider only)"
@@ -157,16 +180,16 @@ async def native_models(profile: Profile, cwd):
         rows, cursors, cursor = [], set(), None
         for _ in range(50):
             page = await client.request({"method": "model/list", "params": {"limit": 100, "cursor": cursor}})
-            rows.extend(
-                model_record(
+            for m in page["data"]:
+                efforts = m.get("supportedReasoningEfforts")
+                rows.append(model_record(
                     m["model"],
                     m.get("displayName"),
                     m.get("inputModalities"),
-                    reasoning_efforts=[e["reasoningEffort"] for e in m.get("supportedReasoningEfforts", [])],
+                    reasoning_efforts=[e["reasoningEffort"] for e in efforts] if efforts is not None else None,
+                    default_reasoning_effort=m.get("defaultReasoningEffort"),
                     service_tiers=[t["id"] for t in m.get("serviceTiers", [])],
-                )
-                for m in page["data"]
-            )
+                ))
             cursor = page.get("nextCursor")
             if not cursor:
                 return rows, "Codex App Server model/list"
@@ -308,27 +331,36 @@ class ModelDirectory:
             self.cache[profile.name] = fingerprint, result
             return result
 
-    async def resolve(self, profile, model):
-        if model is None or model == profile.model:
+    async def resolve(self, profile, model, effort=None):
+        model = profile.model if model is None else model
+        if model == profile.model and effort is None:
             return profile
         model_record(model)
+        effort = validate_reasoning_effort(effort)
         result = await self.get(profile)
         if result["error"] or result["stale"]:
-            raise BridgeError("discovery_unavailable", "Cannot select a new model until its directory refresh succeeds")
+            raise BridgeError("discovery_unavailable", "Cannot select a new model or effort until its directory refresh succeeds")
         record = next((m for m in result["models"] if m["model"] == model), None)
         if not record:
             raise BridgeError("unknown_model", "Exact model ID is absent from this profile's current directory")
         efforts = record.get("reasoning_efforts")
-        if profile.effort and efforts is not None and profile.effort not in efforts:
+        if effort is not None and efforts is None:
+            raise BridgeError("unsupported_model_settings", "This model does not report its supported reasoning efforts")
+        if effort is not None and effort not in efforts:
             raise BridgeError(
-                "unsupported_model_settings", "This model does not support the profile's reasoning effort"
+                "unsupported_model_settings", "This model does not support the requested reasoning effort"
             )
+        if model == profile.model:
+            if effort == profile.effort:
+                return profile
+            return replace(profile, effort=effort, verified=False, verified_at=None).validate()
         tier = "priority" if profile.service_tier == "fast" else profile.service_tier
         if tier and "service_tiers" in record and tier not in ["default", *record["service_tiers"]]:
             raise BridgeError("unsupported_model_settings", "This model does not support the profile's service tier")
         return replace(
             profile,
             model=model,
+            effort=effort,
             verified=False,
             verified_at=None,
             price=None,

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 from . import __version__, groups, update_guard
-from .config import Config, Profile
+from .config import Config, Profile, validate_reasoning_effort
 from .errors import BridgeError
 from .node_identity import NodeIdentityStore
 from .peer_protocol import (
@@ -29,6 +29,7 @@ from .peer_protocol import (
     MAX_PAGE_LIMIT,
     MAX_WORKSPACE_CHUNK_BYTES,
     PROTOCOL_VERSION,
+    SESSION_EFFORT_CAPABILITY,
     AckRequestResult,
     ArtifactRef,
     DeliverySource,
@@ -288,9 +289,19 @@ class DirectPeerService:
             params = request.get("params", {})
             if not isinstance(params, dict):
                 raise peer_error(PeerErrorCode.INVALID_PARAMS, "Peer params must be a JSON object")
-            if spec.name == "peer.deliver" and validate_task_timeout(params.get("task_timeout")) is not None:
-                if not await self._supports_task_timeout():
+            if spec.name == "peer.deliver":
+                open_spec = params.get("open")
+                effort = validate_reasoning_effort(open_spec.get("effort")) if isinstance(open_spec, dict) else None
+                if isinstance(open_spec, dict) and effort is None and "effort" in open_spec:
+                    params = {**params, "open": {key: value for key, value in open_spec.items() if key != "effort"}}
+                timeout = validate_task_timeout(params.get("task_timeout"))
+                features = await self._broker_features() if effort is not None or timeout is not None else []
+                if timeout is not None and "task_timeout_v1" not in features:
                     raise BridgeError("unsupported_task_timeout", "The running Broker does not support per-task timeouts; this request performed no delivery")
+                if effort is not None and SESSION_EFFORT_CAPABILITY not in features:
+                    raise BridgeError(
+                        "unsupported_session_effort", "The running Broker does not support selecting reasoning effort for new sessions"
+                    )
             if spec.mutating and self._store is not None:
                 self._ready_identity()
             if spec.name == "peer.hello":
@@ -337,14 +348,15 @@ class DirectPeerService:
 
     # ---------------------------------------------------------------- handlers
 
-    async def _supports_task_timeout(self):
+    async def _broker_features(self) -> list:
         if self._capability_probe is None:
-            return False
+            return []
         try:
             result = await asyncio.wait_for(self._capability_probe(), 5)
         except Exception:
-            return False
-        return isinstance(result, dict) and isinstance(result.get("features"), list) and "task_timeout_v1" in result["features"]
+            return []
+        features = result.get("features") if isinstance(result, dict) else None
+        return features if isinstance(features, list) else []
 
     async def _hello(self, params: dict[str, Any]) -> HelloResult:
         versions = params.get("protocol_versions")
@@ -365,8 +377,10 @@ class DirectPeerService:
             state_generation=identity.state_generation,
         )
         capabilities = list(IMPLEMENTED_PEER_METHODS) + list(CAPABILITIES)
-        if not await self._supports_task_timeout():
-            capabilities.remove("task_timeout_v1")
+        broker_features = await self._broker_features()
+        for feature in ("task_timeout_v1", SESSION_EFFORT_CAPABILITY):
+            if feature not in broker_features:
+                capabilities.remove(feature)
         return {
             "protocol_version": protocol_version,
             "node": node.as_dict(),
@@ -1472,9 +1486,12 @@ class DirectPeerService:
     async def _profile_from_open(self, spec: dict[str, Any]) -> Profile:
         raw = spec.get("profile")
         model = spec.get("model")
+        effort = validate_reasoning_effort(spec.get("effort"))
         if model is not None and (not isinstance(model, str) or not model):
             raise BridgeError("invalid_catalog", "Model directory returned an invalid exact model ID")
         if isinstance(raw, dict):
+            if effort is not None:
+                raise BridgeError("invalid_request", "Reasoning effort requires an explicit profile")
             data = dict(raw)
             name = data.pop("name", None) or data.pop("profile", None)
             if not isinstance(name, str) or not name:
@@ -1488,13 +1505,13 @@ class DirectPeerService:
                 raise BridgeError("unknown_profile", raw)
         else:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "A bridge delivery without a session_id requires open.profile")
-        if model is not None and model != profile.model:
+        if effort is not None or model is not None and model != profile.model:
             if self._models is None:
                 raise BridgeError(
                     "discovery_unavailable",
                     "Cannot select a new model until its directory refresh succeeds",
                 )
-            profile = await self._models.resolve(profile, model)
+            profile = await self._models.resolve(profile, model, effort)
         return profile
 
     def _workspace_ref_metadata(self, db: Any, value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1565,6 +1582,11 @@ class DirectPeerService:
         seq_kind = params.get("seq_kind", "delivery")
         if seq_kind not in {"message", "tombstone", "delivery"}:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "seq_kind must be message, tombstone or delivery")
+        open_spec = params.get("open")
+        if isinstance(open_spec, dict) and open_spec.get("effort") is not None and (
+            target_id or kind != "bridge" or seq_kind == "tombstone"
+        ):
+            raise BridgeError("effort_mismatch", "Reasoning effort can only be set when opening a new session")
         message = params.get("message", "")
         if message is None:
             message = ""

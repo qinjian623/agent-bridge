@@ -73,7 +73,7 @@ class PeerProtocolContract(unittest.TestCase):
             self.assertEqual(getattr(PeerDeliveryStatus, name).value, name.lower())
         self.assertEqual(CAPABILITIES, (
             "groups_v1", "ordered_delivery_v1", "member_outbox_v1", "event_mirror_v1",
-            "workspace_v1", "session_name_v1", "prune_guard_v1", "task_timeout_v1",
+            "workspace_v1", "session_name_v1", "prune_guard_v1", "task_timeout_v1", "session_effort_v1",
         ))
 
     def test_workspace_method_is_implemented_and_validates_its_operation(self):

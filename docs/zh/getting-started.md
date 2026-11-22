@@ -321,15 +321,22 @@ worker 启动或连接失败也会通知已登记父会话。尚未执行的任�
 | Claude Code / Anthropic | SDK `get_server_info().models` 的 `resolvedModel`，不用界面别名 |
 | Claude Code / DeepSeek | DeepSeek `GET /models`，只列声明支持 Anthropic 消息接口的模型 |
 | Claude Code / Ollama Cloud | Ollama `GET /api/tags`，保留目录返回的准确模型 ID |
+| Antigravity / Google | `agy models`，各推理档位分别使用目录返回的模型 ID |
 
-主 agent 查询后，可以用 `profile + model` 明确选模型并分配任务。例如，先在目录中确认下例 ID 仍然存在：
+`profile` 是账号和运行配置的名字。打开或派发新会话时，用 `model` 指定完整模型 ID。同一个 profile 可选择目录里的多个模型，认证、供应商、权限和并发组继续使用该配置。
+
+`reasoning_efforts` 返回该模型支持的原始档位名。空数组表示没有可选档位，缺少该字段或为 `null` 表示目录没有提供信息。运行程序报告默认档位时，目录也会返回 `default_reasoning_effort`。不同 agent 的档位名称和顺序各自独立。
+
+新会话的 `effort` 可填写该模型报告的一个档位。不支持或无法确认的档位会在派发前报错。省略 `effort` 时，同一模型使用 profile 原配置，换模型时采用新模型的原生默认值。目录暂时不可用时，仍可直接使用已经配置的模型和档位。会话建立后会保留所选模型与档位；跨节点显式设置需要两端支持。
+
+例如，使用下方的 `agy` 配置，在目录确认 Neon XHigh 后运行：
 
 ```bash
-agent-bridge call agent_catalog --json '{"profile":"codex-sol","refresh":true}'
-agent-bridge call agent_dispatch --json '{"profile":"codex-sol","model":"gpt-6-luna","cwd":"/absolute/project","instruction":"检查指定文件并给出结果","request_id":"check-discovered-model-1"}'
+agent-bridge call agent_catalog --json '{"profile":"agy","refresh":true}'
+agent-bridge call agent_dispatch --json '{"profile":"agy","model":"gemini-4-neon-xhigh","effort":"xhigh","cwd":"/absolute/project","access":"workspace-write","instruction":"检查指定文件并给出结果","request_id":"check-discovered-model-1"}'
 ```
 
-`agent_open` 同样接受 `model`。选中新模型时保留认证、供应商、工具限制、推理强度、服务档位和并发组；若目录明确不支持原来的推理强度或档位，拒绝执行。新模型的价格、上下文长度、验证时间不会照搬旧模型。会话保存最终配置，重复请求返回原结果，已有会话不能换模型。
+`agent_open` 也接受 `model` 和 `effort`。新模型仍须支持已有的服务档位，并使用自己的上下文长度、价格和验证记录。重复请求返回原结果。
 
 查询失败按配置返回 `error`；旧目录保留并标记 `stale`，不能用它创建新的模型配置。原先配置的模型仍可使用，不因目录中断或移除旧别名而失效。模型信息只来自现有配置允许的供应商，不自动添加账户或供应商。当前不支持未知 Claude 兼容服务和非 OpenAI 的 Codex 目录；原有明确配置仍能执行。
 
@@ -461,7 +468,7 @@ uv run python -m unittest discover -s tests -v
 
 ```json
 {
-  "agy-sonnet": {
+  "agy": {
     "runtime": "antigravity",
     "provider": "google-antigravity",
     "model": "claude-sonnet-5-5-medium",
@@ -472,13 +479,13 @@ uv run python -m unittest discover -s tests -v
 }
 ```
 
-默认可执行文件为 `agy`，可用 `executable` 覆盖。即使选择 Claude 模型，供应商仍为 `google-antigravity`，不能填写 `anthropic`。模型使用 `agy models` 返回的完整 ID；若设置 `effort`，必须与 ID 的 low/medium/high 档一致。未验证配置不参与自动选择，但可以显式指定。
+默认可执行文件为 `agy`，可用 `executable` 覆盖。即使选择 Claude 模型，供应商仍为 `google-antigravity`。模型使用 `agy models` 返回的完整 ID，例如 `gemini-4-neon-xhigh` 本身就选定了 XHigh。若显式传入 `effort`，须与模型的档位一致。未验证配置不参与自动选择，但可以显式指定。
 
 broker 在启动时读取 profiles。修改后停止并重新启动前台 broker；托管服务用户检查活动任务后重启对应服务，见[托管服务](#managed-services)。已有会话保留原来的程序与模型。
 
 ```bash
-agent-bridge call agent_catalog --json '{"profile":"agy-sonnet","refresh":true}'
-agent-bridge call agent_open --json '{"profile":"agy-sonnet","cwd":"/absolute/project","access":"workspace-write","request_id":"agy-open-1"}'
+agent-bridge call agent_catalog --json '{"profile":"agy","refresh":true}'
+agent-bridge call agent_open --json '{"profile":"agy","cwd":"/absolute/project","access":"workspace-write","request_id":"agy-open-1"}'
 # session_id 用于 agent_dispatch/agent_control；取消任务用 task_id 调用 agent_cancel。
 ```
 

@@ -59,6 +59,7 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.profile.provider, new.provider)
             self.assertEqual(self.profile.quota_group, new.quota_group)
             self.assertEqual(self.profile.tools, new.tools)
+            self.assertIsNone(new.effort)
             self.assertEqual(["text"], new.input_types)
             self.assertFalse(new.verified)
             self.assertIsNone(new.verified_at)
@@ -78,9 +79,12 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_id_provider_configuration_and_settings_are_not_substituted(self):
         rows = [model_record("different", reasoning_efforts=["high"], service_tiers=[])]
         with patch("agent_bridge.discovery.native_models", new_callable=AsyncMock, return_value=(rows, "test")):
-            for model in ("missing", "different", "--bad", " "):
+            for model in ("missing", "--bad", " "):
                 with self.assertRaises(BridgeError):
                     await self.directory.resolve(self.profile, model)
+            with self.assertRaisesRegex(BridgeError, "requested reasoning effort"):
+                await self.directory.resolve(self.profile, "different", "low")
+            self.assertIsNone((await self.directory.resolve(self.profile, "different")).effort)
             tier = replace(self.profile, effort=None, service_tier="fast")
             with self.assertRaisesRegex(BridgeError, "service tier"):
                 await self.directory.resolve(tier, "different")
@@ -91,6 +95,63 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
             result = await self.directory.get(changed)
             self.assertFalse(result["models"])
             self.assertFalse(result["stale"])
+
+    async def test_explicit_effort_is_checked_even_when_using_the_configured_model(self):
+        profile = replace(self.profile, price={
+            "currency": "USD",
+            "source": "fixture",
+            "as_of": "2026-11-22",
+            "per_million": {"input_tokens": 1, "output_tokens": 2},
+        })
+        rows = [model_record(
+            profile.model, reasoning_efforts=["low", "high"], default_reasoning_effort="low",
+        )]
+        with patch("agent_bridge.discovery.native_models", new_callable=AsyncMock, return_value=(rows, "test")) as probe:
+            self.assertEqual(profile, await self.directory.resolve(profile, None))
+            probe.assert_not_awaited()
+            self.assertEqual(profile, await self.directory.resolve(profile, None, "low"))
+            self.assertEqual(
+                replace(profile, effort="high", verified=False, verified_at=None),
+                await self.directory.resolve(profile, None, "high"),
+            )
+            with self.assertRaisesRegex(BridgeError, "requested reasoning effort"):
+                await self.directory.resolve(profile, None, "max")
+            with self.assertRaisesRegex(BridgeError, "without whitespace"):
+                await self.directory.resolve(profile, None, " high")
+            probe.return_value = self.rows, "test"
+            await self.directory.get(profile, refresh=True)
+            with self.assertRaisesRegex(BridgeError, "does not report"):
+                await self.directory.resolve(profile, None, "high")
+            probe.side_effect = BridgeError("discovery_failed", "fixture")
+            await self.directory.get(profile, refresh=True)
+            with self.assertRaisesRegex(BridgeError, "directory refresh succeeds"):
+                await self.directory.resolve(profile, None, "high")
+            self.assertEqual(profile, await self.directory.resolve(profile, None))
+
+    async def test_agy_tiers_are_discovered_and_do_not_inherit_the_previous_model_effort(self):
+        fixture = self.root / "agy-models"
+        fixture.write_text(
+            "#!/bin/sh\n"
+            "test \"$1\" = models || exit 2\n"
+            "printf 'gemini-4-neon-xhigh\\tNeon (XHigh)\\nfixture-max\\tFixture Max\\nopaque-model\\n'\n"
+        )
+        fixture.chmod(0o700)
+        base = replace(
+            self.profile, runtime="antigravity", provider="google-antigravity",
+            model="claude-sonnet-5-5-medium", effort="medium", executable=str(fixture),
+        )
+        record = (await self.directory.get(base))["models"]
+        self.assertEqual([["xhigh"], ["max"], None], [m["reasoning_efforts"] for m in record])
+        self.assertEqual(["xhigh", "max", None], [m["default_reasoning_effort"] for m in record])
+        self.assertIsNone((await self.directory.resolve(base, "gemini-4-neon-xhigh")).effort)
+        self.assertEqual("xhigh", (await self.directory.resolve(base, "gemini-4-neon-xhigh", "xhigh")).effort)
+        self.assertEqual("max", (await self.directory.resolve(base, "fixture-max", "max")).effort)
+        with self.assertRaisesRegex(BridgeError, "requested reasoning effort"):
+            await self.directory.resolve(base, "gemini-4-neon-xhigh", "medium")
+        with self.assertRaisesRegex(BridgeError, "does not report"):
+            await self.directory.resolve(base, "opaque-model", "high")
+        with self.assertRaisesRegex(BridgeError, "match the tier"):
+            replace(base, model="gemini-4-neon-xhigh", effort="max").validate()
 
     async def test_concurrent_refreshes_share_one_query(self):
         async def probe(*_):
@@ -116,7 +177,11 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                             "headers": {"Authorization": "private-key"},
                             "input": ["text", "image"],
                             "contextWindow": 1000,
+                            "reasoning": True,
+                            "thinkingLevelMap": {"minimal": None, "low": "low", "medium": None, "xhigh": None, "max": "max"},
                         },
+                        {"id": "plain", "provider": "deepseek", "reasoning": False},
+                        {"id": "old", "provider": "deepseek", "reasoning": True},
                         {"id": "other", "provider": "other"},
                     ]
                 }
@@ -124,7 +189,8 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch("agent_bridge.discovery.JsonProcess", return_value=client) as process:
             rows, _ = await native_models(profile, self.root)
-        self.assertEqual(["deepseek-new"], [m["model"] for m in rows])
+        self.assertEqual(["deepseek-new", "plain", "old"], [m["model"] for m in rows])
+        self.assertEqual([["off", "low", "high", "max"], ["off"], None], [m["reasoning_efforts"] for m in rows])
         self.assertNotIn("private-key", json.dumps(rows))
         self.assertIn("--no-session", process.call_args.args[0])
         client.close.assert_awaited_once()

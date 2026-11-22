@@ -20,6 +20,7 @@ PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 1 << 20  # one JSONL frame; larger payloads must be Artifact references (ADR-15)
 MAX_PAGE_LIMIT = 100
 INLINE_RESULT_BYTES = 16 * 1024  # results above this are returned as ArtifactRef only
+SESSION_EFFORT_CAPABILITY = "session_effort_v1"
 CAPABILITIES = (
     "groups_v1",
     "ordered_delivery_v1",
@@ -29,6 +30,7 @@ CAPABILITIES = (
     "session_name_v1",
     "prune_guard_v1",
     "task_timeout_v1",
+    SESSION_EFFORT_CAPABILITY,
 )
 
 
@@ -416,6 +418,7 @@ class DeliverOpenSpec(TypedDict):
     access: NotRequired[str]
     cwd: NotRequired[str]
     model: NotRequired[str]
+    effort: NotRequired[str]
     workspace_mode: NotRequired[str]
     base: NotRequired[str]
     snapshot_files: NotRequired[list[str]]

@@ -12,7 +12,7 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - 先读 `agent_catalog`。程序、供应商和模型分别核对（以 `agent_catalog` 中配置的实际供应商和模型为准）。指定的模型不得自动替换。
 - Antigravity 需要 `runtime=antigravity`、`provider=google-antigravity` 和完整 `agy models` ID，选 Claude 模型时也一样。仅支持文本和 `workspace-write`。headless 没有逐次工具审批，原生工具被拒绝时如实报告，保留原权限限制。使用前核实账号条款，见 [Antigravity 设置和账号限制](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#antigravity)。原生用量缺少可靠基数时，只报告观察到的用量并标为不完整。真实推理、工具调用和中断需要在当前环境单独验证。
 - `agent_catalog` 会自主查询已配置供应商的模型，缓存 5 分钟；需要最新结果时传 `refresh=true`，也可用 `profile` 只查一个配置。读 `discovery` 中的准确 `model`、来源、时间和错误；目录可见不代表推理成功。查询失败或 `stale=true` 时，不能选择其中的新模型。
-- 主 agent 可按任务选择目录中的模型，通过 `agent_open/agent_dispatch(profile=已有配置名, model=准确ID)` 执行，无需先改配置。原认证、供应商、权限、并发组和推理强度继续生效；已有 session 不能换模型。新模型不会继承旧模型的价格或验证标记。省略目标时，服务的均衡打分仍只使用已验证配置；不会自动付费测试整个目录。
+- 新会话可用 `agent_open/agent_dispatch(profile=已有配置名, model=准确ID, effort=档位)`。档位按 `agent_catalog` 中模型的 `reasoning_efforts` 原样填写，无法确认时不能显式设置。省略 `effort` 时，同一模型沿用 profile 设置，换模型时采用原生默认值。Antigravity 可以用完整模型 ID 选档。已有会话保留模型和档位。
 - 异步派单后保存返回的任务和会话 ID。新安装默认不发送父通知，用 `agent_result` 查看任务，需要先等事件时可用一次限时 `agent_wait`。配置并验证辅助程序和当前父会话后，再使用[自动父通知](resources/router-prompt.md#默认异步派单)。超时后不循环查询或再次派单。
 - 简单任务、前后强依赖的串行任务在主会话直接完成；单个模块由同一执行会话端到端完成“修改 + 自测”闭环，仅对互不依赖的正交子任务并行派单（由 `lead` 统一协调，子会话不私自转包或复制整段聊天）。跨角色分工（lead/developer/worker/writer/editor/operator/evaluator/visualizer/architect）、模型路由与派单/审查协议详见 [resources/router-prompt.md](resources/router-prompt.md)。
   * 派单协议：提供 `goal`, `inputs`, `allowed_files`, `out_of_scope`, `deliverable`, `acceptance`, `stop_if`（并行任务先锁定 `shared_decisions` 并两两消歧；长任务/副作用操作必填 `operation_id`，超时凭 ID 先查原作业防重复执行）。完工回报须区分 `evidence` 与 `deviations`、`assumptions`、`unverified`，触发 `stop_if` 立即报 `blocked`。

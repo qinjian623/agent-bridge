@@ -174,6 +174,23 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
                         self.assertFalse(usage["complete"])
                     self.assertEqual(total, result["native_usage_total"]["totalTokens"])
 
+    async def test_pi_rejects_a_different_reported_reasoning_effort_before_a_turn(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runtime = PiRuntime(
+                Profile("test", "pi", "fixed", provider="provider", executable=sys.executable, effort="xhigh"),
+                {"id": "session", "cwd": folder, "access": "read-only"}, Path(folder), self.no_op,
+            )
+            self.assertEqual(["--thinking", "xhigh"], runtime.client.argv[-2:])
+            state = {"model": {"id": "fixed", "provider": "provider"}, "thinkingLevel": "max"}
+            runtime.client = Protocol({"get_state": state})
+            runtime.client.start = self.no_op
+            with self.assertRaises(BridgeError) as caught:
+                await runtime.connect()
+            self.assertEqual("effort_mismatch", caught.exception.code)
+            self.assertEqual([{"type": "get_state"}], runtime.client.calls)
+            state["thinkingLevel"] = "xhigh"
+            await runtime.connect()
+
     async def test_pi_tool_start_and_end_pass_through_the_actual_filter(self):
         with tempfile.TemporaryDirectory() as folder:
             runtime = PiRuntime(Profile("test", "pi", "fixed", provider="provider", executable=sys.executable),

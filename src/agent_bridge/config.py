@@ -15,6 +15,22 @@ from .hosts import HostConfig, parse_hosts
 from .i18n import validate_language
 from .usage import validate_price
 
+AGY_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def agy_model_effort(model: str) -> str | None:
+    base, _, tier = model.rpartition("-")
+    return tier if base and tier in AGY_EFFORTS else None
+
+
+def validate_reasoning_effort(value: object) -> str | None:
+    if value is not None and (
+        not isinstance(value, str) or not 1 <= len(value) <= 64 or value.startswith("-")
+        or any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)
+    ):
+        raise BridgeError("invalid_request", "Reasoning effort must be a non-empty level without whitespace or control characters")
+    return value
+
 
 @dataclass(frozen=True)
 class Profile:
@@ -50,12 +66,12 @@ class Profile:
                 raise BridgeError("invalid_profile", "Antigravity uses the native CLI's authentication and endpoint settings")
             if self.input_types != ["text"]:
                 raise BridgeError("invalid_profile", "Antigravity streaming input supports text only")
-            if self.effort is not None and (
-                not isinstance(self.effort, str) or self.effort not in {"low", "medium", "high"}
-                or self.model.rsplit("-", 1)[-1] in {"low", "medium", "high"}
-                and self.model.rsplit("-", 1)[-1] != self.effort
-            ):
-                raise BridgeError("invalid_profile", "Antigravity effort must match the exact model slug's low/medium/high tier")
+            if self.effort is not None:
+                # Preserve the legacy settings for explicitly configured, unsuffixed IDs.
+                tier = agy_model_effort(self.model)
+                allowed = {tier} if tier else {"low", "medium", "high"}
+                if not isinstance(self.effort, str) or self.effort not in allowed:
+                    raise BridgeError("invalid_profile", "Antigravity effort must match the tier in the exact model ID")
         if self.context_window is not None and self.context_window <= 0:
             raise BridgeError("invalid_profile", "context_window must be positive")
         if self.service_tier is not None and (

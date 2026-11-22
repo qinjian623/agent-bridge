@@ -17,6 +17,7 @@ from .hosts import HostConfig, HostRegistry
 from .peer_protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
+    SESSION_EFFORT_CAPABILITY,
     AckRequestParams,
     AckRequestResult,
     CancelParams,
@@ -463,10 +464,19 @@ class DirectPeerClient:
                     self._hello_params = cast(HelloParams, dict(params))
                     return hello
                 verifying = False
-                if name == "deliver" and params.get("task_timeout") is not None:
+                if name == "deliver":
                     capabilities = hello.get("capabilities")
-                    if not isinstance(capabilities, list) or "task_timeout_v1" not in capabilities:
+                    capabilities = capabilities if isinstance(capabilities, list) else []
+                    if params.get("task_timeout") is not None and "task_timeout_v1" not in capabilities:
                         raise BridgeError("unsupported_task_timeout", "The remote node does not support per-task timeouts; no task was dispatched")
+                    open_spec = params.get("open")
+                    if (
+                        isinstance(open_spec, dict) and open_spec.get("effort") is not None
+                        and SESSION_EFFORT_CAPABILITY not in capabilities
+                    ):
+                        raise BridgeError(
+                            "unsupported_session_effort", "The remote node does not support selecting reasoning effort for new sessions"
+                        )
                 generation = (
                     self._transport.connection_generation if isinstance(self._transport, SshPeerTransport) else None
                 )

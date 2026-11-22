@@ -20,13 +20,14 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__, groups, native_broadcast, peer_api, update_guard
-from .config import Config, Profile, broker_socket_path, read_admin_token, safe_error
+from .config import Config, Profile, broker_socket_path, read_admin_token, safe_error, validate_reasoning_effort
 from .discovery import ModelDirectory
 from .errors import BridgeError
 from .hosts import ConfigHostRegistry
 from .peer_protocol import (
     MAX_WORKSPACE_CHUNK_BYTES,
     PROTOCOL_VERSION,
+    SESSION_EFFORT_CAPABILITY,
     NodeRef,
     PeerDeliveryStatus,
     PeerErrorCode,
@@ -64,6 +65,8 @@ _HOST_BLOCKING_CODES = {
     str(PeerErrorCode.IDENTITY_MISMATCH), str(PeerErrorCode.STATE_CORRUPTED),
     "host_busy",
 }
+_SESSION_EFFORT_METHODS = {"agent_open", "agent_dispatch"}
+_SESSION_EFFORT_WIRE_SUFFIX = "_with_effort"
 
 
 async def _wait_host_interval(
@@ -1710,7 +1713,7 @@ class Broker:
         spec = {}
         for key in (
             "profile", "cwd", "access", "project_id", "model", "workspace_mode", "base",
-            "snapshot_files", "name", "workspace_ref",
+            "snapshot_files", "name", "workspace_ref", "effort",
         ):
             value = args.get(key)
             if value is not None:
@@ -2047,10 +2050,16 @@ class Broker:
         return None, None
 
     async def _remote_deliver(self, host_id, method, args, *, instruction=None, open_only=False):
-        # Omitted and explicit name=None must produce the same stable operation id (pre-upgrade retries).
-        if args.get("name") is None:
-            args = {key: value for key, value in args.items() if key != "name"}
+        # Opt-in fields omitted or null must preserve the fingerprints of older calls.
+        args = {key: value for key, value in args.items() if key not in {"name", "effort"} or value is not None}
         client = self.peer_factory.client(host_id)
+        if args.get("effort") is not None:
+            hello = await client.hello({"protocol_versions": [PROTOCOL_VERSION]})
+            capabilities = hello.get("capabilities") if isinstance(hello, dict) else None
+            if not isinstance(capabilities, list) or SESSION_EFFORT_CAPABILITY not in capabilities:
+                raise BridgeError(
+                    "unsupported_session_effort", "The remote node does not support selecting reasoning effort for new sessions"
+                )
         node = await self._peer_node(host_id, client)
         target_id = args.get("session_id") or ""
         if self._remote_workspace_requested(method, args, target_id):
@@ -2425,10 +2434,15 @@ class Broker:
             return await self._call(method, args)
 
     async def _call(self, method, args):
+        if method in _SESSION_EFFORT_METHODS and validate_reasoning_effort(args.get("effort")) is not None:
+            if args.get("session_id") or args.get("retry_task_id"):
+                raise BridgeError("effort_mismatch", "Reasoning effort can only be set when opening a new session")
+            if not isinstance(args.get("profile"), str) or not args["profile"]:
+                raise BridgeError("invalid_request", "Reasoning effort requires an explicit profile")
         if method == "agent_capabilities":
             if args:
                 raise BridgeError("invalid_request", "agent_capabilities accepts no parameters")
-            return {"features": ["task_timeout_v1"], "version": __version__}
+            return {"features": ["task_timeout_v1", SESSION_EFFORT_CAPABILITY], "version": __version__}
         if method == "agent_monitor":
             from .monitor import MonitorCollector
 
@@ -2614,7 +2628,7 @@ class Broker:
             name = args["profile"]
             if name not in self.config.profiles:
                 raise BridgeError("unknown_profile", name)
-            profile = await self.models.resolve(self.config.profiles[name], args.get("model"))
+            profile = await self.models.resolve(self.config.profiles[name], args.get("model"), args.get("effort"))
             profile.command()
             cwd = args["cwd"]
             metadata = None
@@ -2680,13 +2694,13 @@ class Broker:
             session_id = args.get("session_id")
             if not session_id:
                 config = self.config
-                if args.get("model") is not None:
+                if args.get("model") is not None or args.get("effort") is not None:
                     name = args.get("profile")
                     if name not in self.config.profiles:
                         raise BridgeError(
                             "unknown_profile", "Select a configured profile together with an exact model ID"
                         )
-                    selected = await self.models.resolve(self.config.profiles[name], args["model"])
+                    selected = await self.models.resolve(self.config.profiles[name], args.get("model"), args.get("effort"))
                     config = replace(config, profiles={name: selected})
                 selection = choose(
                     config, self.store, requirements, args.get("profile"), access or "read-only"
@@ -2706,6 +2720,8 @@ class Broker:
                 }
                 if session_name is not None:
                     open_request["name"] = session_name
+                if args.get("effort") is not None:
+                    open_request["effort"] = args["effort"]
                 opened = await self.call("agent_open", open_request)
                 session_id = opened["session_id"]
                 selection.update(
@@ -2970,6 +2986,8 @@ class Broker:
             args = {field: value for field, value in args.items() if field != "name"}
             if name is not None:
                 args["name"] = name
+        if method in _SESSION_EFFORT_METHODS and "effort" in args and args["effort"] is None:
+            args = {field: value for field, value in args.items() if field != "effort"}
         key = args.get("request_id")
         if not isinstance(key, str) or not key or len(key) > 200:
             raise BridgeError("invalid_request_id", "A request_id of at most 200 characters is required")
@@ -3036,7 +3054,12 @@ class Broker:
             request = json.loads(await asyncio.wait_for(reader.readline(), 5))
             if request.get("version") != 1 or not secrets.compare_digest(str(request.get("token", "")), self.token):
                 raise BridgeError("forbidden", "Protocol version or management token is invalid")
-            response = await self.api_call(request["method"], request.get("params", {}))
+            method = request["method"]
+            if isinstance(method, str):
+                base_method = method.removesuffix(_SESSION_EFFORT_WIRE_SUFFIX)
+                if base_method in _SESSION_EFFORT_METHODS:
+                    method = base_method
+            response = await self.api_call(method, request.get("params", {}))
         except BridgeError as error:
             response = {"error": error.as_dict()}
         except (ValueError, TypeError, KeyError, TimeoutError) as error:
@@ -3182,6 +3205,13 @@ async def request(state: Path, method, params, *, retry_timeout: float = 10.0):
     """Send a local broker request, retrying transparently across hot-update restarts."""
     if os.environ.get("AGENT_BRIDGE_ROLE") == "child":
         raise BridgeError("forbidden", "Child runtimes may not administer parent or sibling sessions")
+    wire_method = method
+    if method in _SESSION_EFFORT_METHODS and isinstance(params, dict) and "effort" in params:
+        if params["effort"] is None:
+            params = {field: value for field, value in params.items() if field != "effort"}
+        else:
+            # Old brokers reject an unknown method instead of silently using their default effort.
+            wire_method = method + _SESSION_EFFORT_WIRE_SUFFIX
     is_update_rpc = method.startswith("agent_update_")
     retry_on_eof = (
         not is_update_rpc
@@ -3190,7 +3220,7 @@ async def request(state: Path, method, params, *, retry_timeout: float = 10.0):
     deadline = asyncio.get_running_loop().time() + retry_timeout
     while True:
         try:
-            return await _single_request(state, method, params)
+            return await _single_request(state, wire_method, params)
         except (
             FileNotFoundError,
             ConnectionRefusedError,
@@ -3201,6 +3231,10 @@ async def request(state: Path, method, params, *, retry_timeout: float = 10.0):
             BridgeError,
         ) as error:
             if isinstance(error, BridgeError):
+                if wire_method != method and error.code == "unknown_method":
+                    raise BridgeError(
+                        "unsupported_session_effort", "The running Broker does not support selecting reasoning effort for new sessions"
+                    ) from error
                 retryable = error.code == "update_busy" and not is_update_rpc
             elif isinstance(error, (FileNotFoundError, ConnectionRefusedError)):
                 retryable = not is_update_rpc and _update_in_progress(state)

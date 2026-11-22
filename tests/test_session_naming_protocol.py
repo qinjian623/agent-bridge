@@ -28,7 +28,7 @@ class SessionNamingProtocolTests(unittest.TestCase):
         spec = {key: text(value) for key, value in DeliverOpenSpec.__annotations__.items()}
         self.assertEqual(
             {"profile", "project_id", "access", "cwd", "model", "workspace_mode", "base", "snapshot_files", "name",
-             "workspace_ref"},
+             "workspace_ref", "effort"},
             set(spec),
         )
         self.assertEqual("str", spec["profile"])
@@ -36,6 +36,7 @@ class SessionNamingProtocolTests(unittest.TestCase):
             set(spec) - {"profile"}, {key for key, value in spec.items() if value.startswith("NotRequired[")}
         )
         self.assertEqual("NotRequired[str]", spec["name"])
+        self.assertEqual("NotRequired[str]", spec["effort"])
         self.assertEqual("NotRequired[str]", text(DeliverResult.__annotations__["name"]))
         self.assertEqual("NotRequired[DeliverOpenSpec]", text(DeliverParams.__annotations__["open"]))
 

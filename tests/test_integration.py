@@ -80,18 +80,22 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                               "agent_groups", "agent_group", "agent_group_prune", "agent_broadcast", "agent_broadcast_status",
                               "agent_group_inbox", "agent_delivery_resolve"}, {t.name for t in tools.tools})
             for name in ("agent_open", "agent_dispatch"):
-                self.assertIn("model", next(t for t in tools.tools if t.name == name).inputSchema["properties"])
+                properties = next(t for t in tools.tools if t.name == name).inputSchema["properties"]
+                self.assertIn("model", properties)
+                self.assertIsNone(properties["effort"]["default"])
             schema = next(t for t in tools.tools if t.name == "agent_dispatch").inputSchema["properties"]
             self.assertIsNone(schema["access"]["default"])
             self.assertIsNone(schema["reservation"]["default"])
             with patch(
                 "agent_bridge.discovery.native_models",
                 new_callable=AsyncMock,
-                return_value=([model_record("new-model")], "test-directory"),
+                return_value=([model_record("new-model", reasoning_efforts=["xhigh"])], "test-directory"),
             ):
                 catalog = await session.call_tool("agent_catalog", {"profile": "fixed", "refresh": True})
                 self.assertFalse(catalog.isError, catalog)
-                self.assertEqual("new-model", json.loads(catalog.content[0].text)["discovery"][0]["models"][0]["model"])
+                model = json.loads(catalog.content[0].text)["discovery"][0]["models"][0]
+                self.assertEqual("new-model", model["model"])
+                self.assertEqual(["xhigh"], model["reasoning_efforts"])
             result = await session.call_tool(
                 "agent_open", {"profile": "fixed", "cwd": str(self.state), "request_id": "mcp-open"}
             )
@@ -100,7 +104,64 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             inspected = await session.call_tool("agent_inspect", {"session_id": opened["session_id"]})
             self.assertFalse(inspected.isError, inspected)
             self.assertEqual("fixed-model", json.loads(inspected.content[0].text)["profile"]["model"])
+            dispatched = await session.call_tool("agent_dispatch", {
+                "profile": "fixed", "model": "new-model", "effort": "xhigh", "cwd": str(self.state),
+                "instruction": "fixture", "request_id": "mcp-effort",
+            })
+            self.assertFalse(dispatched.isError, dispatched)
+            dispatched = json.loads(dispatched.content[0].text)
+            session_id = dispatched["session_id"]
+            inspected = await session.call_tool("agent_inspect", {"session_id": session_id})
+            self.assertFalse(inspected.isError, inspected)
+            profile = json.loads(inspected.content[0].text)["profile"]
+            self.assertEqual(("new-model", "xhigh"), (profile["model"], profile["effort"]))
+            changed = await session.call_tool("agent_dispatch", {
+                "session_id": session_id, "effort": "xhigh", "instruction": "fixture",
+                "request_id": "mcp-effort-existing",
+            })
+            self.assertTrue(changed.isError, changed)
+            self.assertIn("Reasoning effort can only be set", changed.content[0].text)
+        self.assertEqual(2, len(self.broker.store.sessions()))
+        self.assertEqual("queued", self.broker.store.get_task(dispatched["task_id"])["status"])
+        with self.broker.store.connection() as db:
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+
+    async def test_null_effort_replays_without_a_new_session(self):
+        args = {"profile": "fixed", "cwd": str(self.state), "request_id": "omit-effort"}
+        opened = await request(self.state, "agent_open", args)
+        with_null = {**args, "effort": None}
+        self.assertEqual(opened, await request(self.state, "agent_open", with_null))
+        self.assertEqual({"result": opened}, await self.broker.api_call("agent_open", with_null))
         self.assertEqual(1, len(self.broker.store.sessions()))
+
+    async def test_legacy_broker_cannot_silently_drop_requested_effort(self):
+        args = {"profile": "fixed", "cwd": str(self.state), "request_id": "legacy-effort", "effort": "xhigh"}
+        methods = []
+
+        async def serve(reader, writer):
+            payload = json.loads(await reader.readline())
+            method = payload["method"]
+            methods.append(method)
+            if method == "agent_open":
+                params = {key: value for key, value in payload["params"].items() if key != "effort"}
+                response = await self.broker.api_call(method, params)
+            else:
+                response = {"error": BridgeError("unknown_method", method).as_dict()}
+            writer.write(json.dumps(response).encode() + b"\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        self.server.close()
+        await self.server.wait_closed()
+        socket_path = self.state / "broker.sock"
+        socket_path.unlink(missing_ok=True)
+        self.server = await asyncio.start_unix_server(serve, str(socket_path))
+        with self.assertRaises(BridgeError) as caught:
+            await request(self.state, "agent_open", args)
+        self.assertEqual(["agent_open_with_effort"], methods)
+        self.assertEqual("unsupported_session_effort", caught.exception.code)
+        self.assertEqual([], self.broker.store.sessions())
 
     async def test_agent_hosts_tool_lists_registered_hosts_without_network(self):
         params = StdioServerParameters(

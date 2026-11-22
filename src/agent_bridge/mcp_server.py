@@ -124,9 +124,10 @@ def server(state):
         host_id: str | None = None,
         project_id: str | None = None,
         name: str | None = None,
+        effort: str | None = None,
     ) -> dict:
-        """Create a persistent native session locally or on a registered remote host. Optional model selects an exact discovered ID under this profile's provider/auth/quota. Optional name labels a newly created session (1-128 trimmed characters, no control characters); it is rejected for an existing session. Writes use a Git worktree; snapshot_files selects current file contents. Non-Git workspace_mode=copy requires snapshot_files. For remote hosts, cwd stays the local source directory and project_id names the managed remote project; open+dispatch is one atomic operation there (ADR-13)."""
-        return await request(state, "agent_open", locals())
+        """Create a persistent native session locally or on a registered remote host. Optional model selects an exact discovered ID under this profile's provider/auth/quota. Optional effort selects an exact level advertised by agent_catalog for that model. Omitted effort keeps the configured model's settings, and a different model uses its own default. Optional name labels a newly created session (1-128 trimmed characters, no control characters); it is rejected for an existing session. Writes use a Git worktree; snapshot_files selects current file contents. Non-Git workspace_mode=copy requires snapshot_files. For remote hosts, cwd stays the local source directory and project_id names the managed remote project; open+dispatch is one atomic operation there (ADR-13)."""
+        return await request(state, "agent_open", {key: value for key, value in locals().items() if key != "effort" or value is not None})
 
     @mcp.tool()
     async def agent_dispatch(
@@ -148,9 +149,10 @@ def server(state):
         host_id: str | None = None,
         project_id: str | None = None,
         name: str | None = None,
+        effort: str | None = None,
     ) -> dict:
-        """Queue one task locally or on a registered remote host; return after acceptance/setup, without waiting for inference. Link new sessions to a registered parent if the notification helper is configured and verified. Otherwise use agent_result or a bounded agent_wait to check completion. Passing parent does not reparent an existing session. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Optional profile + model selects an exact discovered model; existing sessions cannot change models. Optional name labels a session created by this dispatch (1-128 trimmed characters, no control characters) and is rejected when session_id is given. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result, task_timeout (finite positive total seconds; omitted/null uses node default, retry omitted/null retains prior override). No verified hard_budget support. Remote dispatch without session_id uses one atomic open+dispatch operation; cwd is the local source dir and project_id names the remote project. Remote retry_task_id is not supported and is rejected before dispatch."""
-        return await request(state, "agent_dispatch", locals())
+        """Queue one task locally or on a registered remote host; return after acceptance/setup, without waiting for inference. Link new sessions to a registered parent if the notification helper is configured and verified. Otherwise use agent_result or a bounded agent_wait to check completion. Passing parent does not reparent an existing session. Omitted access inherits an existing session or defaults to read-only for a new one; explicit access must match. Omitted reservation preserves retry's prior value; an explicit value changes only the next attempt. Explicit profile with optional model and effort selects an exact model and reasoning level from agent_catalog for a new session. Existing sessions and retries retain their model and effort. Optional name labels a session created by this dispatch (1-128 trimmed characters, no control characters) and is rejected when session_id is given. Dependencies require accepted reviews. requirements: kind, tools, input_types, input_tokens, providers, minimum_quality, execute_locally, strategy (balanced/cost/speed), learn_from_result, task_timeout (finite positive total seconds; omitted/null uses node default, retry omitted/null retains prior override). No verified hard_budget support. Remote dispatch without session_id uses one atomic open+dispatch operation; cwd is the local source dir and project_id names the remote project. Remote retry_task_id is not supported and is rejected before dispatch."""
+        return await request(state, "agent_dispatch", {key: value for key, value in locals().items() if key != "effort" or value is not None})
 
     @mcp.tool()
     async def agent_control(

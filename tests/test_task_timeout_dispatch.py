@@ -7,10 +7,11 @@ from unittest.mock import AsyncMock, patch
 
 from agent_bridge.broker import Broker
 from agent_bridge.config import Config, Profile
+from agent_bridge.discovery import ModelDirectory, model_record
 from agent_bridge.errors import BridgeError
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.peer_api import DirectPeerService
-from agent_bridge.peer_protocol import PeerErrorCode, ok
+from agent_bridge.peer_protocol import SESSION_EFFORT_CAPABILITY, PeerErrorCode, ok
 from agent_bridge.peer_transport import DirectPeerClient
 from agent_bridge.store import Store, validate_task_timeout
 
@@ -184,6 +185,44 @@ class TaskTimeoutDispatchTests(unittest.IsolatedAsyncioTestCase):
         with self.remote.connection() as db:
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
 
+    async def test_remote_reasoning_effort_is_validated_and_persisted_by_target(self):
+        self.service._models = ModelDirectory(self.root)
+        self.capability_probe.return_value["features"].append(SESSION_EFFORT_CAPABILITY)
+        args = self.remote_args("remote-effort", model="next-model", effort="xhigh")
+        with patch(
+            "agent_bridge.discovery.native_models", new_callable=AsyncMock,
+            return_value=([model_record("next-model", reasoning_efforts=["xhigh"])], "target-directory"),
+        ):
+            first = await self.broker.api_call("agent_dispatch", args)
+            self.assertEqual(first, await self.broker.api_call("agent_dispatch", args))
+            rejected = await self.broker.api_call(
+                "agent_dispatch", {**args, "request_id": "remote-invalid", "effort": "max"},
+            )
+            self.assertEqual("unsupported_model_settings", rejected["error"]["code"])
+        self.assertEqual("xhigh", self.client.requests[0]["open"]["effort"])
+        self.assertEqual(2, len(self.client.requests))
+        result = first["result"]
+        profile = self.remote.get_session(result["session_id"])["profile"]
+        self.assertEqual(("next-model", "xhigh"), (profile["model"], profile["effort"]))
+        self.assertEqual("queued", self.remote.get_task(result["task_id"])["status"])
+        with self.remote.connection() as db:
+            for table in ("sessions", "tasks", "peer_inbox"):
+                self.assertEqual(1, db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+    async def test_older_remote_node_rejects_effort_before_workspace_transfer(self):
+        with patch.object(self.broker, "_prepare_remote_workspace", new_callable=AsyncMock) as prepare:
+            with self.assertRaises(BridgeError) as caught:
+                await self.broker.call("agent_dispatch", self.remote_args(
+                    "old-effort", effort="xhigh", access="workspace-write",
+                ))
+        self.assertEqual("unsupported_session_effort", caught.exception.code)
+        prepare.assert_not_awaited()
+        self.assertEqual([], self.client.requests)
+        with self.local.connection() as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM peer_operations").fetchone()[0])
+        with self.remote.connection() as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+
     async def test_old_worker_rejects_override_but_accepts_default_work(self):
         self.local.worker_ready(self.sid, "old", 123, "fixture", "native")
         with self.assertRaises(BridgeError) as caught:
@@ -195,6 +234,16 @@ class TaskTimeoutDispatchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
 
     async def test_capability_is_checked_again_on_the_final_business_connection(self):
+        await self.assert_final_business_connection_rejects_downgrade(
+            "task_timeout_v1", {"requirements": {"task_timeout": 21600}}, "unsupported_task_timeout",
+        )
+
+    async def test_effort_capability_is_checked_again_on_the_final_business_connection(self):
+        await self.assert_final_business_connection_rejects_downgrade(
+            SESSION_EFFORT_CAPABILITY, {"effort": "xhigh"}, "unsupported_session_effort",
+        )
+
+    async def assert_final_business_connection_rejects_downgrade(self, capability, options, error_code):
         calls = []
         node = {"host_id": "peer", "node_id": self.node.node_id, "state_generation": self.node.state_generation}
         async def call(request, timeout, **kwargs):
@@ -202,15 +251,15 @@ class TaskTimeoutDispatchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("peer.hello", request["method"], "An unsupported node must never receive the delivery")
             return ok(request["id"], {
                 "protocol_version": 1, "node": node, "node_state": "ready", "max_confirmed_seq": 0,
-                "capabilities": ["task_timeout_v1"] if len(calls) == 1 else [], "broker_version": "fixture",
+                "capabilities": [capability] if len(calls) == 1 else [], "broker_version": "fixture",
             })
         transport = AsyncMock()
         transport.call.side_effect = call
         client = DirectPeerClient(transport, registry=self.broker.host_registry, host_id="peer")
         self.factory.peer = client
         with self.assertRaises(BridgeError) as caught:
-            await self.broker.call("agent_dispatch", self.remote_args("downgraded", requirements={"task_timeout": 21600}))
-        self.assertEqual("unsupported_task_timeout", caught.exception.code)
+            await self.broker.call("agent_dispatch", self.remote_args("downgraded", **options))
+        self.assertEqual(error_code, caught.exception.code)
         self.assertEqual(["peer.hello", "peer.hello"], calls)
         with self.remote.connection() as db:
             self.assertEqual(0, db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
@@ -309,7 +358,7 @@ class TaskTimeoutDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_running_broker_exposes_internal_read_only_capabilities(self):
         with patch("agent_bridge.update_guard.maintenance", return_value={"fixture": True}):
             response = await self.broker.api_call("agent_capabilities", {})
-        self.assertEqual(["task_timeout_v1"], response["result"]["features"])
+        self.assertEqual(["task_timeout_v1", SESSION_EFFORT_CAPABILITY], response["result"]["features"])
         self.assertIsInstance(response["result"]["version"], str)
         with self.assertRaises(BridgeError) as caught:
             await self.broker.api_call("agent_capabilities", {"change": True})

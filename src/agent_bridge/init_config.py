@@ -427,7 +427,7 @@ def _edit_profiles_menu(
         effort = _prompt(
             input_fn,
             output_fn,
-            _("Effort (optional low/medium/high/xhigh, '-' to clear)"),
+            _("Reasoning effort (provider-specific, '-' to clear)"),
             default=cur.get("effort") or "",
         )
         if effort == "-":
