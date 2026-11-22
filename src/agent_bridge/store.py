@@ -818,10 +818,11 @@ class Store:
             own.execute(sql, args)
 
     @contextmanager
-    def connection(self, *, write=False, timeout=10):
-        db = sqlite3.connect(self.path, timeout=timeout)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
+    def connection(self, *, write=False, timeout=10, reuse=None):
+        db = reuse if reuse is not None else sqlite3.connect(self.path, timeout=timeout)
+        if reuse is None:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
         try:
             if write:
                 db.execute("BEGIN IMMEDIATE")
@@ -831,7 +832,8 @@ class Store:
             db.rollback()
             raise
         finally:
-            db.close()
+            if reuse is None:
+                db.close()
 
     @staticmethod
     def required(db, table, key):
@@ -1063,8 +1065,8 @@ class Store:
                 attempt[key] = json.loads(attempt[key]) if attempt[key] else None
         return row
 
-    def sessions(self):
-        with self.connection() as db:
+    def sessions(self, *, reuse=None):
+        with self.connection(reuse=reuse) as db:
             rows = db.execute(
                 "SELECT s.id,s.desired,s.observed,s.revision,s.worker_pid,s.worker_start,s.generation,s.error,s.profile,sn.name "
                 "FROM sessions s LEFT JOIN session_names sn ON sn.session_id=s.id ORDER BY s.created"
@@ -1237,9 +1239,9 @@ class Store:
                 return None
             return self.queue_reason(db, task, config, *self.queue_context(db)) or {"code": "ready"}
 
-    def claim(self, config: Config):
+    def claim(self, config: Config, *, reuse=None):
         """Reserve capacity and claim one task atomically across competing schedulers."""
-        with self.connection(write=True) as db:
+        with self.connection(write=True, reuse=reuse) as db:
             active, accounting = self.queue_context(db)
             for task in db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created,id").fetchall():
                 if self.queue_reason(db, task, config, active, accounting):

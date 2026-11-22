@@ -22,6 +22,34 @@ class StoreTests(unittest.TestCase):
         self.store.worker_ready(sid, "generation", 123, "start", "native-" + sid)
         return sid
 
+    def test_reused_scheduler_connection_sees_changes_and_rolls_back(self):
+        with self.store.connection() as connection:
+            self.assertEqual([], self.store.sessions(reuse=connection))
+            sid = self.session("reused-connection")
+            self.assertEqual([sid], [row["id"] for row in self.store.sessions(reuse=connection)])
+            self.store.dispatch(sid, "one", "reuse-task")
+            self.assertIsNotNone(self.store.claim(self.config, reuse=connection))
+            self.assertIsNone(self.store.claim(self.config, reuse=connection))
+            with self.assertRaises(RuntimeError):
+                with self.store.connection(write=True, reuse=connection) as db:
+                    db.execute("UPDATE sessions SET desired='closed' WHERE id=?", (sid,))
+                    raise RuntimeError("rollback")
+            self.assertEqual("open", self.store.get_session(sid)["desired"])
+
+    def test_reused_scheduler_connections_claim_atomically(self):
+        sessions = [self.session("scheduler" + str(i)) for i in range(4)]
+        for i, sid in enumerate(sessions):
+            self.store.dispatch(sid, "task", "scheduler-task" + str(i))
+
+        def claim(_):
+            with self.store.connection() as connection:
+                return self.store.claim(self.config, reuse=connection)
+
+        with ThreadPoolExecutor(8) as pool:
+            claims = list(pool.map(claim, range(8)))
+        self.assertEqual(2, sum(claim is not None for claim in claims))
+        self.assertEqual(2, len({claim["task_id"] for claim in claims if claim}))
+
     def run_task(self, sid, instruction="task", **kwargs):
         task = self.store.dispatch(sid, instruction, instruction, **kwargs)
         self.store.claim(self.config)

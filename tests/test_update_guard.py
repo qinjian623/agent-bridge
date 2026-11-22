@@ -113,6 +113,33 @@ class BrokerUpdateGuardTests(unittest.IsolatedAsyncioTestCase):
         (self.state / "config.json").write_text(json.dumps({"profiles": {}, "worker_launcher": "detached"}))
         self.broker = Broker(self.state)
 
+    async def test_scheduler_reuses_connection_and_waits_half_second(self):
+        connections = []
+        delays = []
+
+        def sessions(*, reuse):
+            connections.append(reuse)
+            return []
+
+        def claim(_config, *, reuse):
+            connections.append(reuse)
+            return None
+
+        async def wait(delay):
+            delays.append(delay)
+            if len(delays) == 2:
+                self.broker.stopping.set()
+
+        with (patch.object(self.broker.store, "sessions", side_effect=sessions),
+              patch.object(self.broker.store, "claim", side_effect=claim),
+              patch.object(self.broker, "_loop_wait", side_effect=wait)):
+            await self.broker.scheduler()
+        self.assertEqual([0.5, 0.5], delays)
+        self.assertEqual(4, len(connections))
+        self.assertTrue(all(db is connections[0] for db in connections))
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connections[0].execute("SELECT 1")
+
     async def test_mutating_api_is_rejected_but_health_remains_available(self):
         lease = update_guard.prepare(self.state, idle)
         with patch.object(self.broker, "_api_call", new_callable=AsyncMock, return_value={"result": {}}) as call:
@@ -197,7 +224,7 @@ class BrokerUpdateGuardTests(unittest.IsolatedAsyncioTestCase):
         self.broker.stopping.clear()
         sched_calls = 0
 
-        def flaky_sessions():
+        def flaky_sessions(*, reuse=None):
             nonlocal sched_calls
             sched_calls += 1
             if sched_calls == 1:

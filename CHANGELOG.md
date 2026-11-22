@@ -2,6 +2,10 @@
 
 # Changes
 
+## 0.3.4 — 2026-11-22
+
+- Reduce idle broker CPU by checking for tasks every 500 ms and reusing the scheduler's SQLite connection.
+
 ## 0.3.3 — 2026-11-22
 
 - Use a short temporary socket for OTA self-tests so a long managed release path does not prevent installation.

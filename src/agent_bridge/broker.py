@@ -1364,37 +1364,38 @@ class Broker:
     async def scheduler(self):
         pending = set()
         try:
-            while not self.stopping.is_set():
-                if self.update_draining.is_set():
-                    await self._loop_wait(0.15)
-                    continue
-                delay = 0.15
-                try:
-                    with update_guard.operation(self.state):
-                        for session in self.store.sessions():
-                            if session["worker_pid"] and not alive(session):
-                                self.store.worker_stopped(session["id"], session["generation"], "Worker process disappeared")
-                            elif (
-                                session["desired"] == "open"
-                                and session["observed"] == "stopped"
-                                and session["id"] not in self.launching
-                            ):
-                                self.launching.add(session["id"])
-                                task = asyncio.create_task(self.ensure_worker(session["id"]))
-                                pending.add(task)
-                                task.add_done_callback(pending.discard)
-                        while self.store.claim(self.config):
-                            pass
-                    getattr(self, "_loop_errors", {}).pop("scheduler", None)
-                except BridgeError as error:
-                    if error.code != "update_busy":
-                        self._log_loop_error("scheduler", error)
-                except sqlite3.OperationalError as error:
-                    self._log_loop_error("scheduler", error)
+            with self.store.connection() as scheduler_db:
+                while not self.stopping.is_set():
+                    if self.update_draining.is_set():
+                        await self._loop_wait(0.15)
+                        continue
                     delay = 0.5
-                except Exception as error:
-                    self._log_loop_error("scheduler", error)
-                await self._loop_wait(delay)
+                    try:
+                        with update_guard.operation(self.state):
+                            for session in self.store.sessions(reuse=scheduler_db):
+                                if session["worker_pid"] and not alive(session):
+                                    self.store.worker_stopped(session["id"], session["generation"], "Worker process disappeared")
+                                elif (
+                                    session["desired"] == "open"
+                                    and session["observed"] == "stopped"
+                                    and session["id"] not in self.launching
+                                ):
+                                    self.launching.add(session["id"])
+                                    task = asyncio.create_task(self.ensure_worker(session["id"]))
+                                    pending.add(task)
+                                    task.add_done_callback(pending.discard)
+                            while self.store.claim(self.config, reuse=scheduler_db):
+                                pass
+                        getattr(self, "_loop_errors", {}).pop("scheduler", None)
+                    except BridgeError as error:
+                        if error.code != "update_busy":
+                            self._log_loop_error("scheduler", error)
+                    except sqlite3.OperationalError as error:
+                        self._log_loop_error("scheduler", error)
+                        delay = 0.5
+                    except Exception as error:
+                        self._log_loop_error("scheduler", error)
+                    await self._loop_wait(delay)
         finally:
             await asyncio.gather(*pending, return_exceptions=True)
 
