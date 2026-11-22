@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
-from agent_bridge import updater
+from agent_bridge import __version__, updater
 from agent_bridge.errors import BridgeError
 from agent_bridge.store import Store
 
@@ -58,6 +58,19 @@ class UpdateFixture(unittest.TestCase):
 
     def database(self):
         return Store(self.state)
+
+
+class PreflightTests(UpdateFixture):
+    def test_self_test_socket_is_independent_of_the_release_root_length(self):
+        long_root = self.root / ("nested-" * 18)
+        long_root.mkdir(mode=0o700)
+        self.settings["root"] = str(long_root)
+        updater._write(self.state / "update.json", self.settings)
+        candidate = Path(sys.executable).parent.parent
+
+        self.assertGreater(len(os.fsencode(long_root / "selftest-12345678/broker.sock")), 107)
+        result = updater.Updater(self.state).preflight(candidate, f"v{__version__}")
+        self.assertIn("requires_worker_drain", result)
 
 
 class BusySnapshotTests(UpdateFixture):

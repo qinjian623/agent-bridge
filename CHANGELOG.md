@@ -2,6 +2,10 @@
 
 # Changes
 
+## 0.3.3 — 2026-11-22
+
+- Use a short temporary socket for OTA self-tests so a long managed release path does not prevent installation.
+
 ## 0.3.2 — 2026-11-22
 
 - Publish the first stable Release in the public repository. The curl installer checks the release wheel, installs it into the managed version directory, and enables scheduled OTA updates.

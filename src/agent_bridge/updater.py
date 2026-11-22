@@ -956,9 +956,9 @@ class Updater:
         raw = _run([python, "-c", code, tag[1:]], timeout=15).strip()
         compatibility = json.loads(raw) if raw else {}
         _run([python, "-m", "agent_bridge.cli", "--state", str(self.state), "doctor"], timeout=30)
-        # No production database copy and no real hosts, credentials, sessions or inference.
-        with tempfile.TemporaryDirectory(prefix="selftest-", dir=self.root) as name:
-            test = Path(name)
+        # Keep the temporary socket short even when the managed release root is deeply nested.
+        with tempfile.TemporaryDirectory(prefix="bridge-selftest-", dir="/tmp") as name:
+            test = Path(name).resolve()
             _write(test / "config.json", {"profiles": {}, "hosts": {}, "telegram_database": None})
             process = subprocess.Popen(
                 [python, "-m", "agent_bridge.cli", "--state", str(test), "serve"],
