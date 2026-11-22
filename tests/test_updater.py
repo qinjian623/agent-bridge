@@ -2180,6 +2180,22 @@ class BrokerServiceRollbackTests(UpdateFixture):
                 updater.install(self.state, root=self.root, service_kind="systemd", enable=True)
             self.assertEqual(before, {p.relative_to(self.home): p.read_bytes() for p in self.home.rglob("*") if p.is_file()})
 
+    def test_launchd_probe_reads_job_fields_above_nested_service_fields(self):
+        launcher = str(self.root / "bin/agent-bridge")
+        output = (
+            "gui/502/local.cli-agent-bridge = {\n"
+            "\tstate = running\n"
+            f"\tprogram = {launcher}\n"
+            "\tpid = 59784\n"
+            "\tproperties = {\n"
+            "\t\tstate = active\n"
+            "\t\tpid = 123\n"
+            "\t}\n"
+            "}\n"
+        )
+        with patch.object(updater, "_run", return_value=output):
+            self.assertEqual((True, 59784, True), updater._probe_broker_service_state("launchd", "local.cli-agent-bridge", launcher))
+
     def test_launchd_unknown_or_conflicting_states_are_not_inactive(self):
         for output in ("state = novel-unknown\n", "state = running\nstate = waiting\n", "pid = 42\n"):
             with self.subTest(output=output), patch.object(updater, "_run", return_value=output):

@@ -1612,11 +1612,11 @@ def _probe_broker_service_state(kind: str, name: str, launcher: str) -> tuple[bo
     lowered = output.lower()
     if "could not find service" in lowered or "no such process" in lowered:
         return _ServiceProbeResult(_SERVICE_ABSENT, None, False)
-    states = [
-        line.split("=", 1)[1].strip()
-        for line in output.splitlines()
-        if line.strip().startswith("state =") and "=" in line
-    ]
+    # launchctl prints nested service objects with their own state fields.
+    fields = re.findall(r"^([ \t]*)(state|program|pid)[ \t]*=[ \t]*([^\n]+)$", output, re.MULTILINE)
+    job_indent = min((len(indent) for indent, _, _ in fields), default=0)
+    job_fields = [(key, value.strip()) for indent, key, value in fields if len(indent) == job_indent]
+    states = [value for key, value in job_fields if key == "state"]
     if states == ["running"]:
         status = _SERVICE_ACTIVE
     elif len(states) == 1 and states[0] in {"not running", "waiting", "exited"}:
@@ -1625,13 +1625,9 @@ def _probe_broker_service_state(kind: str, name: str, launcher: str) -> tuple[bo
         raise _unknown_service_state(kind, name) from RuntimeError(
             "launchctl returned no recognized job state"
         )
-    pid: int | None = None
-    for line in output.splitlines():
-        m = re.match(r"^\s*pid\s*=\s*(\d+)\s*$", line)
-        if m and int(m.group(1)) > 0:
-            pid = int(m.group(1))
-            break
-    managed = any(line.strip() == "program = " + launcher for line in output.splitlines())
+    raw_pid = next((value for key, value in job_fields if key == "pid"), "")
+    pid = int(raw_pid) if raw_pid.isascii() and raw_pid.isdecimal() and int(raw_pid) > 0 else None
+    managed = ("program", launcher) in job_fields
     return _ServiceProbeResult(status, pid, managed)
 
 
