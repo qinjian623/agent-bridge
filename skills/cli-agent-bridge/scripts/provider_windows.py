@@ -1,4 +1,4 @@
-"""Report off-peak choices for new tasks; never dispatch or change existing sessions."""
+"""Legacy standalone Flash time-window example. The broker uses config.json routing rules."""
 
 from __future__ import annotations
 

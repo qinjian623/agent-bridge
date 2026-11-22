@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import UTC, datetime
 from statistics import median
 
 from .errors import BridgeError
@@ -72,7 +73,31 @@ def task_samples(store, profile, kind):
     return samples
 
 
-def choose(config, store, requirements, profile_name=None, access="read-only"):
+def _prefer_off_peak(config, rule, candidates, chosen):
+    moment = datetime.now(UTC)
+    active = [target for target in rule.prefer if target.window.is_off_peak(moment)]
+    decision = {
+        "rule_id": rule.id,
+        "applied": False,
+        "evaluated_at_utc": moment.isoformat(),
+        "active_windows": list(dict.fromkeys(target.window_name for target in active)),
+    }
+    if "score" in chosen:
+        ceiling = chosen["score"] * (1 + rule.score_tolerance)
+        candidates = [candidate for candidate in candidates if candidate["score"] <= ceiling]
+    for target in active:
+        matches = [
+            candidate for candidate in candidates
+            if all(getattr(config.profiles[candidate["profile"]], key) == val for key, val in target.match)
+        ]
+        if matches:
+            decision.update(applied=True, window=target.window_name)
+            return min(matches, key=lambda candidate: candidate.get("score", 0)), decision
+    decision["skip_reason"] = "no_preferred_candidate" if active else "no_off_peak_window"
+    return chosen, decision
+
+
+def choose(config, store, requirements, profile_name=None, access="read-only", *, prefer_off_peak=True):
     supported = {
         "kind",
         "input_types",
@@ -199,6 +224,16 @@ def choose(config, store, requirements, profile_name=None, access="read-only"):
     else:
         chosen = candidates[0]
         reason = "Unmeasured: fixed verified profile order; no quality or savings claim"
+    preference = None
+    if prefer_off_peak:
+        kind = requirements.get("kind", "general")
+        rule = next((rule for rule in config.routing if kind in rule.kinds and strategy in rule.strategies), None)
+        if rule is not None:
+            chosen, preference = _prefer_off_peak(config, rule, efficient if measured else candidates, chosen)
+            if preference["applied"]:
+                reason = f"{strategy}: off-peak preference after measured scoring" if measured else (
+                    "Unmeasured: off-peak preference among eligible profiles; no quality or savings claim"
+                )
     return {
         "profile": chosen["profile"],
         "reason": reason,
@@ -206,4 +241,5 @@ def choose(config, store, requirements, profile_name=None, access="read-only"):
         "cost_unit": cost,
         "candidates": candidates,
         "excluded": rejected,
+        **({"preference": preference} if preference is not None else {}),
     }

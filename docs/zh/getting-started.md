@@ -365,12 +365,12 @@ agent-bridge call agent_dispatch --json '{"profile":"agy","model":"gemini-4-neon
 
 `env_file` 是权限为 `0600` 的 JSON 字符串表，至少设置 `ANTHROPIC_BASE_URL=https://ollama.com`；可在其中单独设置 `HTTPS_PROXY`（代理变量可选，保留继承值和明确的空值，Bridge 不指定本机代理端口）。认证使用 `OLLAMA_API_KEY`，未设置时读取当前用户已有的 `~/.config/claude-ollama/api-key`（属主必须为当前用户，普通文件、权限 `0600`），不借用官方 DeepSeek 的凭据。
 
-新配置和供应商代码需要 broker 重新启动后读取。目录查询成功仍保持 `verified: false`，真实调用核对返回模型后再标为已验证。Flash 低峰优先规则由 [分工 skill](skills/cli-agent-bridge/resources/router-prompt.md#flash-按供应商低峰时间分配) 执行，时间脚本不修改 broker 的均衡打分，也不迁移已有会话。
+新配置和供应商代码需要 Broker 重新启动后读取。目录查询成功仍保持 `verified: false`，真实调用核对返回模型后再标为已验证。
 
 <a id="balanced-selection-and-costs"></a>
 ## 均衡选择与费用
 
-明确指定的配置从不自动替换。自动选择检查输入类型、工具、上下文大小、供应商许可、账户等待状态、推理验证状态和已有质量记录。默认配置 `default_strategy=balanced`：质量达标后，费用和耗时各赋 0.5 权重。单任务可传 `requirements.strategy=cost/speed/balanced`。没有可比价格时统一采用 token；数据不足时按已验证配置顺序选择并返回 `Unmeasured`，不编造分数。
+明确指定的配置从不自动替换。自动选择检查输入类型、工具、上下文大小、供应商许可、账户等待状态、推理验证状态和已有质量记录。默认 `default_strategy=balanced`，质量达标后，费用和耗时各赋 0.5 权重。单任务可传 `requirements.strategy=cost/speed/balanced`。没有可比价格时统一采用 token。数据不足时默认按配置顺序选择并返回 `Unmeasured`。[低峰时段规则](#off-peak-routing)可以调整符合要求的配置之间的优先顺序。
 
 选择依据是任务的全部 attempt 加主会话开销，不使用只有子会话用量的部分样本。目前只有一个父记录对应一个任务、其计数已停止且结果已检查时，才能作为完整费用/耗时样本；并行任务共享父会话时不猜测如何分摊。`requirements.learn_from_result=false` 可以保留测试结果而不用于后续选择，固定比较中的验证任务采用此设置。
 
@@ -397,6 +397,53 @@ Codex 恢复时缺少本轮执行前的累计值，会将本轮用量标为不�
 可在 profile 中配置 `price={"currency":"USD","source":"价格来源","as_of":"2026-10-22","per_million":{"input_tokens":2,"output_tokens":10,"cache_read_tokens":0.5}}`，上述数字仅为格式示例。缓存缺少价格时不按零处理。结果分别返回 `catalog_estimate` 和始终待账单确认的 `actual_billed_usd`；预算中的 `charged_tokens` 包含未知用量保留的预留，不能当作实际用量。
 
 供应商返回 429 时，同一个 `quota_group` 的后续任务共同等待，优先遵守返回的等待秒数；缺失时使用 60 秒起、最多 15 分钟的递增等待。配额耗尽且没有恢复时间时等待明确处理。查看 `agent_catalog.quota_cooldowns`，确认账户恢复后用 `agent_control(action=quota_resume, session_id=配额组名, expected_revision=..., evidence=..., request_id=...)` 解除等待。失败任务始终需要明确重试，不会因等待结束而自动再执行。
+
+<a id="off-peak-routing"></a>
+## 低峰时段规则
+
+本机新任务可以按低峰时段自动选择配置。在 `config.json` 顶层加入可选的 `routing`，保留已有的 `profiles` 和其他设置。下面的示例优先使用处于低峰的 Ollama Cloud（通过 Claude Code），再考虑处于低峰的 DeepSeek（通过 Pi 或 Claude Code）。启用前核对账号适用的时段和价格。[Ollama 定价](https://ollama.com/pricing) · [DeepSeek 定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+
+```json
+{
+  "routing": {
+    "calendars": {
+      "china": {"holidays": []}
+    },
+    "windows": {
+      "ollama": {
+        "timezone": "UTC",
+        "ranges": [{"days": ["mon", "tue", "wed", "thu", "fri"], "start": "12:00", "end": "18:00"}]
+      },
+      "deepseek": {
+        "timezone": "Asia/Shanghai",
+        "calendar": "china",
+        "ranges": [
+          {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "12:00"},
+          {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "14:00", "end": "18:00"}
+        ]
+      }
+    },
+    "preferences": [
+      {
+        "id": "flash-off-peak",
+        "when": {"kinds": ["flash"]},
+        "prefer": [
+          {"match": {"runtime": "claude", "provider": "ollama-anthropic", "model": "deepseek-v4.1-flash"}, "window": "ollama"},
+          {"match": {"runtime": "pi", "provider": "deepseek", "model": "deepseek-flash"}, "window": "deepseek"},
+          {"match": {"runtime": "claude", "provider": "deepseek-anthropic", "model": "deepseek-v4-flash"}, "window": "deepseek"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+- 每个时段使用 IANA 时区。`ranges` 填写高峰时段，包含开始时间，结束时间起进入低峰。`days` 用 `mon` 到 `sun` 表示星期。`24:00` 可用于结束时间。跨午夜的时段按起始日期判断星期和节假日。向 `holidays` 填入核实过的 `YYYY-MM-DD` 日期，跳过从这些日期开始的高峰时段。示例把周末全天视为低峰。
+- 派发时设置 `requirements.kind="flash"`，省略 `profile`。Broker 使用第一条与任务种类及策略匹配的规则。`when.strategies` 默认是 `["balanced"]`。`prefer` 按顺序匹配，每项 `match` 可以使用 `profile`、`runtime`、`provider`、`model` 中的任意组合，所填字段必须全部匹配。`model` 填 profile 中的完整模型 ID。
+- Broker 先按原有条件筛选。数据可比较时，仅在现有帕累托候选中考虑评分相对最佳值高出不超过 `score_tolerance` 的配置。这个容差取值为 `0` 至 `1`，默认为 `0.1`（10%）。数据不足时，在符合要求的配置中按低峰顺序选择。没有适用的偏好时按原规则选择。
+- 选择配置时只判断一次时间。排队跨过时段也不会重选。规则匹配时，可以用 `agent_result` 查看 `details.selection.preference` 中的记录。显式指定配置或模型、续用会话和重试均按原方式处理。远端新会话仍需指定 `profile`。
+
+先升级 Broker，再加入 `routing`。旧版本会拒绝该字段。Broker 启动时读取规则，省略 `routing` 时按原规则选择。[托管服务](#managed-services)
 
 <a id="parent-sessions-and-telegram"></a>
 ## 父会话与 Telegram

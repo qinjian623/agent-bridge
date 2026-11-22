@@ -36,20 +36,9 @@
 
 ### Flash 按供应商低峰时间分配
 
-以下为已配置这些名称时可选的示例。核对当前价格和账号条款后，可运行 [scripts/provider_windows.py](../../../../../skills/cli-agent-bridge/scripts/provider_windows.py)，在同等合适的已验证配置中按 `preferred_flash_profiles` 选择新任务：
+派发本机 Flash 新任务时，设置 `requirements.kind="flash"` 并省略 `profile`，让 Broker 从符合要求的配置中选择。照常指定所需工具、权限和输入条件。Broker 读取 `config.json` 中可选的 `routing`。示例优先选择处于低峰的 Ollama Cloud（通过 Claude Code），再考虑处于低峰的 DeepSeek（通过 Pi 或 Claude Code）。规则按程序和供应商匹配，配置名称可以不同。[配置示例](../../../getting-started.md#off-peak-routing)
 
-| 配置 | 程序与实际供应商 | 模型 | 低峰时段 |
-| :--- | :--- | :--- | :--- |
-| `claude-ollama` | Claude Code → Ollama Cloud | `deepseek-v4.1-flash` | UTC 工作日 00:00–12:00、18:00–24:00；UTC 周末全天 |
-| `pi-deepseek` | Pi → DeepSeek 官方 | `deepseek-flash` | 北京时间工作日 00:00–09:00、12:00–14:00、18:00–24:00；周末及中国法定节假日全天 |
-| `claude-deepseek` | Claude Code → DeepSeek 官方 | 当前已验证的 Flash ID（兼容旧名 `deepseek-v4-flash`） | 与官方 Pi 相同，二者共享官方账号配额 |
-
-- Ollama 低峰时优先 `claude-ollama`；两家同时低峰也先选 Ollama。Ollama 高峰（UTC 工作日 12:00–18:00）时，选处于官方低峰的 Pi 或 Claude，按工具和任务要求决定程序。
-- 这些示例配置都不适合时，根据任务要求从目录里找其他候选。低峰时间只用于选择新任务。
-- 脚本按 UTC 与北京时间分别判断周末。默认使用普通周规则；已核实为中国法定节假日时传 `--china-public-holiday`，不猜节假日日历。
-- 这是主 agent 的分配规则。脚本只报告时间窗口，不发任务、不验证供应商、不保证整个长任务都按低峰价格计费。价格不明仍记未知。
-
-核对日期：2026-11-09。来源：[Ollama 定价](https://ollama.com/pricing)、[DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。供应商调整时间或价格后重新核对。
+示例规则适用于 `balanced` 策略。没有适用的偏好时按原策略选择。规则匹配时，可用 `agent_result` 查看 `details.selection.preference`。Broker 按派发时的时间判断低峰，任务跨过时段后实际计费可能不同。远端新会话需显式指定 `profile`。
 
 需要专家核查时，选择可使用所需权限和工具的已验证模型。任务带图片时，先核对模型能否接收图片。
 

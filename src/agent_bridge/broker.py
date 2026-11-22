@@ -2703,7 +2703,8 @@ class Broker:
                     selected = await self.models.resolve(self.config.profiles[name], args.get("model"), args.get("effort"))
                     config = replace(config, profiles={name: selected})
                 selection = choose(
-                    config, self.store, requirements, args.get("profile"), access or "read-only"
+                    config, self.store, requirements, args.get("profile"), access or "read-only",
+                    prefer_off_peak=not args.get("retry_task_id"),
                 )
                 if selection.get("execute_locally"):
                     return selection

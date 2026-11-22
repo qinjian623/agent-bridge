@@ -59,6 +59,8 @@ agent-bridge call agent_dispatch --json '{"profile":"local","cwd":"/absolute/pat
 
 Save the returned `task_id` and `session_id`. Repeating the exact request with the same `request_id` returns the same task; give each new task a new ID. Through MCP, ask your assistant to call `agent_catalog`, then dispatch the same read-only task with `profile="local"` and your project directory.
 
+For automatic profile selection on new local tasks, see [off-peak routing](docs/getting-started.md#off-peak-routing).
+
 ## Read the result
 
 Replace the angle-bracket placeholders with the returned IDs:

@@ -34,20 +34,9 @@ Start with `agent_catalog`. Use a verified, available profile with the access mo
 
 ### Flash Off-Peak Provider Allocation
 
-Optional example for installations that already use these profile names. After verifying current prices and account terms, run `scripts/provider_windows.py` and use `preferred_flash_profiles` to break ties among equally suitable verified profiles for new tasks:
+For a new local Flash task, set `requirements.kind="flash"` and omit `profile` to let the broker choose among eligible profiles. Pass all required tools, access, and input constraints as usual. The broker applies preferences from the optional `routing` section of `config.json`. The example prefers Claude Code through Ollama Cloud during its off-peak hours, then Pi or Claude Code through DeepSeek during theirs. It matches runtime and provider fields, so profile names may differ. [Configuration example](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/getting-started.md#off-peak-routing)
 
-| Profile | Runtime & Provider | Model | Off-Peak Window |
-| :--- | :--- | :--- | :--- |
-| `claude-ollama` | Claude Code -> Ollama Cloud | `deepseek-v4.1-flash` | UTC weekdays 00:00-12:00, 18:00-24:00; all day UTC weekends |
-| `pi-deepseek` | Pi -> DeepSeek Official | `deepseek-flash` | Beijing time weekdays 00:00-09:00, 12:00-14:00, 18:00-24:00; weekends & Chinese public holidays |
-| `claude-deepseek` | Claude Code -> DeepSeek Official | Current verified Flash ID (compat alias `deepseek-v4-flash`) | Same as official Pi (shares official account quota) |
-
-- Prefer `claude-ollama` whenever Ollama is off-peak (including when both are off-peak). During Ollama peak hours (UTC weekdays 12:00-18:00), pick off-peak official Pi or Claude based on tool/task needs.
-- If none of these example profiles fit, use the available catalog entries and the normal task requirements. Time windows apply to new dispatches only.
-- Weekend checks use UTC and Asia/Shanghai separately. Weekdays follow the normal calendar unless `--china-public-holiday` is explicitly passed after verifying an official holiday.
-- This is a coordinator routing heuristic: `provider_windows.py` only reports windows without dispatching tasks, validating accounts, or guaranteeing off-peak pricing across multi-hour runs (unknown pricing remains unknown).
-
-Checked 2026-11-09 against [Ollama Pricing](https://ollama.com/pricing) and [DeepSeek Pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/). Re-verify whenever provider windows or pricing change.
+With the example configuration the preference applies to `balanced` tasks. If no preference applies, selection follows the usual strategy. For a matched rule, `agent_result` exposes `details.selection.preference`. Selection uses the time of dispatch, so actual billing can differ if work crosses a time boundary. For new remote sessions, pass an explicit `profile`.
 
 For specialist consultation, choose a verified model with the required access and tools. For visual work, verify image input support if the task includes images.
 

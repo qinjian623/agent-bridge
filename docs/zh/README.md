@@ -59,6 +59,8 @@ agent-bridge call agent_dispatch --json '{"profile":"local","cwd":"/absolute/pat
 
 保存返回的 `task_id` 和 `session_id`。相同参数与 `request_id` 重试会返回同一个任务；每个新任务使用新的 ID。通过 MCP 使用时，可以让助手先调用 `agent_catalog`，再用 `profile="local"` 和真实项目目录派发同一条只读任务。
 
+本机新任务自动选择配置时，可使用[低峰时段规则](getting-started.md#off-peak-routing)。
+
 ## 查看结果
 
 把尖括号占位符替换为返回的 ID：

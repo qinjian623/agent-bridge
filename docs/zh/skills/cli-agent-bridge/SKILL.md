@@ -34,7 +34,7 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - `recovery_needed` 表示不能确认外部执行结果。检查原生记录、worktree 和可能仍运行的外部命令后，使用 resolve 写入检查记录，再决定是否恢复；不要换 request_id 盲目重跑。
 - 会话因启动或中断请求失败而需要恢复时，尚未执行的任务仍是 `queued`；检查会话错误后明确 resume，这些排队任务不需要 resolve。
 - 需要输入或批准时从 `agent_inspect` 读取 question_id 和 expires，使用 respond 回答仍有效的请求；不自动扩大用户授权。
-- 已配置示例中的 Flash 配置并核对账号当前价格时，可用 [scripts/provider_windows.py](../../../../skills/cli-agent-bridge/scripts/provider_windows.py) 辅助选择新任务的模型。见 [Flash 低峰示例](resources/router-prompt.md#flash-按供应商低峰时间分配)。
+- 本机 Flash 新任务需要自动选配置时，设置 `requirements.kind="flash"` 并省略 `profile`。Broker 筛选配置后，再应用低峰时段规则。见 [Flash 低峰分配](resources/router-prompt.md#flash-按供应商低峰时间分配)。
 - 默认使用均衡策略。单个任务可传 `requirements.strategy=cost/speed/balanced`；指定模型不被自动替换。遇到配额等待先读 `quota_cooldowns`，确认恢复后再用 `quota_resume`；失败任务不会自动重跑。
 - 用量与计费：子任务统计含每次 attempt；需汇总父会话时在 `parent_register` 传原生 Codex 的 `usage_path`（可选 `usage_since`，`notify=false` 仅统计，`parent_meter_stop` 停止计数）。缺少执行前基数或未登记父用量时只报不完整/部分统计，不把历史总量当本轮新增；换模型重试的质量归各自 attempt、费用计全部执行；未知价格不按零算，CLI 估算不作实际账单。详见 [使用指南：均衡选择与费用](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#均衡选择与费用)。
 - 异步任务的父会话通知与可选 Telegram（详见 [使用指南：父会话与 Telegram](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#父会话与-telegram)）：不默认登记无关主会话；Telegram 任务须配置可读的 `telegram_database` 并保留默认 `external_child_filter` 子会话登记（不支持时更新现有 bot，严禁设为 `null` 绕过）。父会话若用临时 MCP 启动，登记时须传私有 `resume_config_file`（不改父模型或审批策略）。收到通知后仅 `completed` 可调 `agent_review`，结果不明先核查再 `resolve`，处理后用 `parent_ack` 确认（不重发结果不明的通知，也不重启共享 Codex daemon）。

@@ -13,6 +13,7 @@ from pathlib import Path
 from .errors import BridgeError
 from .hosts import HostConfig, parse_hosts
 from .i18n import validate_language
+from .routing_policy import RoutingPreference, parse_routing
 from .usage import validate_price
 
 AGY_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -125,6 +126,7 @@ class Config:
     hosts: dict[str, HostConfig] = field(default_factory=dict)
     projects: dict[str, str] = field(default_factory=dict)  # project_id -> resolved local root directory
     language: str | None = None
+    routing: tuple[RoutingPreference, ...] = ()
 
     @classmethod
     def load(cls, path: Path):
@@ -189,7 +191,8 @@ class Config:
         except BridgeError as error:
             raise BridgeError("invalid_config", "Invalid hosts configuration") from error
         try:
-            config = cls(profiles=profiles, hosts=hosts, **data)
+            routing = parse_routing(data.pop("routing", None), profiles)
+            config = cls(profiles=profiles, hosts=hosts, routing=routing, **data)
             if config.language is not None:
                 try:
                     config.language = validate_language(config.language)

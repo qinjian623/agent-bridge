@@ -345,11 +345,11 @@ Add a separate profile under `profiles` in `config.json` (merge the entry; keep 
 
 `env_file` is an owner-only `0600` JSON string map setting `ANTHROPIC_BASE_URL=https://ollama.com` (and optional proxy variables; inherited and explicitly empty proxy settings are preserved, and Bridge does not choose a local proxy port). Auth uses `OLLAMA_API_KEY` or falls back to owner-only `0600` `~/.config/claude-ollama/api-key` without sharing DeepSeek keys.
 
-Restart the broker after changing profile or provider code. Catalog success does not change `verified: false`; verify actual inference and the reported model first. Optional Flash off-peak preferences live in the [routing skill](../skills/cli-agent-bridge/resources/router-prompt.md); time rules do not alter broker scoring or migrate existing sessions.
+Restart the broker after changing profile or provider code. Catalog success does not change `verified: false`. Verify actual inference and the reported model first.
 
 ## Balanced Selection and Costs
 
-Explicit profiles are never silently replaced. Auto-selection (`default_strategy=balanced`) filters by input type, tools, context size, provider policy, cooldowns, verification status, and historical quality before weighting normalized cost and duration 0.5/0.5 (override per task with `requirements.strategy=cost|speed|balanced`; insufficient data returns `Unmeasured` in profile order). Samples include all task attempts plus metered single-task parent overhead (`requirements.learn_from_result=false` excludes fixed comparisons from selection updates). Cross-model retry keeps attempt quality isolated to each model while counting total attempt budget/cost.
+Explicit profiles are never silently replaced. Auto-selection (`default_strategy=balanced`) filters by input type, tools, context size, provider policy, cooldowns, verification status, and historical quality before weighting normalized cost and duration 0.5/0.5. Override per task with `requirements.strategy=cost|speed|balanced`. With insufficient data, selection uses profile order by default and reports `Unmeasured`. [Off-peak routing](#off-peak-routing) can change the order among eligible profiles. Samples include all task attempts plus metered single-task parent overhead (`requirements.learn_from_result=false` excludes fixed comparisons from selection updates). Cross-model retry keeps attempt quality isolated to each model while counting total attempt budget/cost.
 
 When comparable monetary prices are unavailable, selection consistently uses tokens. A complete comparison sample requires one parent record for one task, stopped parent metering, and a reviewed result; concurrent tasks sharing a parent do not get guessed allocations. A retried/cancelled model's failure record remains, even when a later model succeeds. Tasks spanning models do not become single-model cost/time comparisons; all attempts still count toward total budget. Changing parent sessions retains the old parent's involvement instead of assigning shared overhead to the remaining task. Current tasks accept text; tools may read explicitly supplied local files, but native binary/image input is not implemented.
 
@@ -366,6 +366,52 @@ Attempt metrics record start/end timestamps, `first_output`, native deltas (`mod
 Codex, Pi, and Claude report differences between native cumulative usage counters. Missing/reset Claude `model_usage` falls back to partial reporting without adding cumulative costs again. Empty counts, missing models, and invalid fields remain unknown; complete intervals need valid counters at both ends. A resumed Codex attempt without a verified pre-turn baseline reports incomplete usage rather than charging its full history. An older successful attempt cannot supply a missing crash baseline. CLI price estimates retain their source and unknown date; they are not account invoices. Cache tokens without a price do not cost zero.
 
 A profile price can use `price={"currency":"USD","source":"pricing reference","as_of":"2026-10-22","per_million":{"input_tokens":2,"output_tokens":10,"cache_read_tokens":0.5}}`; these numbers only illustrate the format. `catalog_estimate` remains separate from `actual_billed_usd`, which awaits invoice confirmation. For quota cooldowns, inspect `agent_catalog.quota_cooldowns` and use `agent_control(action=quota_resume, session_id=<quota-group>, expected_revision=..., evidence=..., request_id=...)` only after the account recovers. Exhaustion without a retry time waits for explicit action; failed tasks always require an explicit retry.
+
+## Off-Peak Routing
+
+For new local tasks, add the optional top-level `routing` key to `config.json`. Keep your existing `profiles` and other settings. This example gives Claude Code through Ollama Cloud first preference when it is off-peak, then Pi or Claude Code through DeepSeek when DeepSeek is off-peak. Confirm the applicable terms and hours for your accounts. [Ollama pricing](https://ollama.com/pricing) · [DeepSeek pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+
+```json
+{
+  "routing": {
+    "calendars": {
+      "china": {"holidays": []}
+    },
+    "windows": {
+      "ollama": {
+        "timezone": "UTC",
+        "ranges": [{"days": ["mon", "tue", "wed", "thu", "fri"], "start": "12:00", "end": "18:00"}]
+      },
+      "deepseek": {
+        "timezone": "Asia/Shanghai",
+        "calendar": "china",
+        "ranges": [
+          {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "09:00", "end": "12:00"},
+          {"days": ["mon", "tue", "wed", "thu", "fri"], "start": "14:00", "end": "18:00"}
+        ]
+      }
+    },
+    "preferences": [
+      {
+        "id": "flash-off-peak",
+        "when": {"kinds": ["flash"]},
+        "prefer": [
+          {"match": {"runtime": "claude", "provider": "ollama-anthropic", "model": "deepseek-v4.1-flash"}, "window": "ollama"},
+          {"match": {"runtime": "pi", "provider": "deepseek", "model": "deepseek-flash"}, "window": "deepseek"},
+          {"match": {"runtime": "claude", "provider": "deepseek-anthropic", "model": "deepseek-v4-flash"}, "window": "deepseek"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+- Each `window` uses an IANA time zone. `ranges` specify peak hours, inclusive at `start` and exclusive at `end`. Set `days` using `mon` through `sun`. `24:00` is allowed as an end time. An overnight range uses the weekday and holiday status of its start date. Fill `holidays` with confirmed `YYYY-MM-DD` dates to skip peak ranges starting on those days. The example treats weekends as off-peak.
+- Dispatch with `requirements.kind="flash"` and omit `profile`. The broker uses the first preference rule that matches the task kind and strategy. `when.strategies` defaults to `["balanced"]`. Within `prefer`, all supplied `match` fields must agree. Match by any combination of `profile`, `runtime`, `provider`, and `model`. Use the exact model ID from your profile.
+- The broker first applies its usual eligibility checks. When it has comparable measurements, it considers preferred profiles within `score_tolerance` of the best score among candidates on the existing Pareto frontier. The tolerance is relative, ranges from `0` to `1`, and defaults to `0.1` (10%). With insufficient data it applies the preference order among eligible profiles. If no preference applies, it uses the usual selection.
+- Time is checked once during selection. Queue delays do not trigger another selection. `agent_result` reports the recorded preference at `details.selection.preference` when a rule matched. Explicit profile or model choices, existing sessions, and retries keep their usual behavior. New remote sessions still require an explicit `profile`.
+
+Upgrade the broker before adding `routing`. Older versions reject the key. The broker reads the rules at startup and uses its usual selection when the key is absent. [Managed services](#managed-services)
 
 ## Parent Sessions and Telegram
 
