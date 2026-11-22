@@ -112,6 +112,8 @@ uv tool uninstall cli-agent-bridge
 
 通过源码目录 `uv sync` 安装时，没有全局包需要卸载。移除服务、MCP 登记和辅助脚本链接后，可以保留仓库和 `.venv`，或用平时的文件工具移除。先检查 `git status`，保存自己的修改。若曾通过 `uv tool install` 安装该源码目录，还需执行上面的 `uv tool uninstall`。
 
+用一键脚本安装时，确认 `~/.local/bin/agent-bridge` 是指向 `~/.local/share/cli-agent-bridge/bin/agent-bridge` 的符号链接，再移除该链接。
+
 托管服务和 OTA 默认另建 `~/.local/share/cli-agent-bridge`，含 `bin`、`current`、`releases`，与 uv 工具环境分开。确认所有服务、worker、更新进程、MCP 进程都已停止后，移除自己加入 shell 的托管 `bin` PATH 设置，再用文件工具将此目录移走或删除。自定义过 `root` 时使用实际目录。托管入口仍依赖安装时 Python 的情况下，不要先删除该 Python 环境。
 
 ## 5. 单独决定是否删除本地数据

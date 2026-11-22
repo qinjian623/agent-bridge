@@ -2,7 +2,12 @@
 
 # Changes
 
-## Unreleased
+## 0.3.2 — 2026-11-22
+
+- Publish the first stable Release in the public repository. The curl installer checks the release wheel, installs it into the managed version directory, and enables scheduled OTA updates.
+- Discover provider-specific reasoning levels and let new sessions choose a model and reasoning level explicitly.
+- Configure off-peak profile preferences for new local tasks and record each selection with the task.
+- Ignore nested launchd state fields when inspecting the broker service on macOS.
 
 - Prepare version 0.3.1. Check installed wheel and broker versions and exercise MCP on both package runners. Reconfigure an existing installation's GitHub update source explicitly, with confirmation before clearing a configured mirror.
 - Treat an empty state directory setting as unset. Reject non-private state directories without changing their permissions, and report Unix socket paths that are too long.

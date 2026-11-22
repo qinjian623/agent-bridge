@@ -112,6 +112,8 @@ uv tool uninstall cli-agent-bridge
 
 For `uv sync` in a source checkout, there is no global package to uninstall. Once services, MCP registrations, and source helper links have been removed, the checkout and its `.venv` can be retained or removed using your normal file tools. Check `git status` and preserve your edits first. If you installed the checkout through `uv tool install`, use `uv tool uninstall` as above as well.
 
+For a one-command release install, remove `~/.local/bin/agent-bridge` after confirming it is a symlink to `~/.local/share/cli-agent-bridge/bin/agent-bridge`.
+
 Managed services/OTA also create `~/.local/share/cli-agent-bridge` by default, containing `bin`, `current`, and `releases`. They are separate from a uv tool environment. After all services, workers, update jobs, and MCP processes have stopped, remove any shell PATH entries you added for its `bin`, then move this directory aside or remove it with your file tools. Use the configured `root` if different. Do not remove the bootstrap Python environment while a managed launcher still depends on it.
 
 ## 5. Keep or remove local data deliberately

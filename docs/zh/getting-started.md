@@ -6,9 +6,31 @@
 
 ## 环境与安装
 
-使用 Linux 或 macOS，需要 Python 3.11+ 和 `uv`。Windows 用户应在 WSL2 内运行 broker、模型 CLI、项目和 MCP 客户端；不支持原生 Windows。单独安装并登录至少一个目标 CLI（`codex`、`claude`、`pi` 或 `agy`）。Bridge 不安装这些程序，也不代为登录。使用同一用户账号，只连接受信任的远端主机；不要把 broker 或监控页面作为多人服务公开。
+使用 Linux 或 macOS。Windows 用户应在 WSL2 内运行 broker、模型 CLI、项目和 MCP 客户端。单独安装并登录一个模型 CLI（`codex`、`claude`、`pi` 或 `agy`）。使用同一用户账号，只连接受信任的远端主机，broker 和监控页面仅供该账号使用。
 
-独立安装：
+### 安装稳定版并启用自动更新
+
+在支持 `systemd --user` 的 Linux 上，或登录 macOS 桌面后，用当前账号运行安装脚本。
+
+```bash
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh
+```
+
+脚本会沿用已有 uv，缺少时安装到 `~/.local/bin`，并按需准备 Python 3.11 或更新版本。它通过 HTTPS 读取 `latest.json`，下载对应的稳定版 wheel，并按 `SHA256SUMS` 校验。安装完成后，broker 和 OTA 定时检查以当前账号运行。无需 `sudo` 或 GitHub 登录。运行前可以查看[脚本源码](../../install.sh)。
+
+`~/.local/bin/agent-bridge` 指向固定程序入口。如果找不到命令，把 `$HOME/.local/bin` 加入 `PATH`。用 `agent-bridge init` 配置 profile，再[单独登记 MCP](#mcp-setup)。
+
+只写入服务文件，暂不启动时，传入 `--no-start`。
+
+```bash
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh -s -- --no-start
+```
+
+之后运行 `agent-bridge init --non-interactive --enable-broker-service --enable-updater`，即可启动 broker 并启用定时检查。已有安装请参见[切换更新源](#switching-update-sources)或[托管服务](#managed-services)。
+
+### 从源码独立安装
+
+已有 Python 3.11+ 和 `uv` 时，可以直接从 Git 仓库安装并在前台运行 broker。
 
 ```bash
 uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
@@ -23,7 +45,7 @@ agent-bridge doctor
 
 ```bash
 git clone https://github.com/qinjian623/agent-bridge.git
-cd cli-agent-bridge
+cd agent-bridge
 uv sync --locked
 uv run agent-bridge init
 uv run agent-bridge doctor
@@ -161,27 +183,29 @@ agent-bridge call agent_review --json '{"task_id":"<task_id>","attempt_id":"<att
 <a id="managed-services"></a>
 ## 托管服务
 
-首次使用只需要前台 broker。需要用户级后台服务时，完成配置、停止前台 broker 后运行：
+一键安装默认启动用户级 broker。从独立安装切换到后台服务时，先完成配置并停止前台 broker，再运行下列命令。
 
 ```bash
 agent-bridge init --non-interactive --install-broker-service --enable-broker-service
 ```
 
-这会写入并启动 Linux `systemd --user` unit 或 macOS `launchd` LaunchAgent，通过固定程序入口启动。尚未选中托管发布版时，会用安装时的 Python 启动；请保留该 uv 工具环境或源码 `.venv`。遇到不同内容的已有服务文件会拒绝覆盖；不要在没有查看文件及活动任务的情况下添加 `--force-broker-service`。
+这会写入并启动 Linux `systemd --user` unit 或 macOS `launchd` LaunchAgent，通过固定程序入口启动。固定入口还在使用安装时的 Python 环境时，请保留该环境。已有服务文件冲突时，安装会停止。使用 `--force-broker-service` 前先检查服务文件和正在运行的任务。
 
 后台服务的 `PATH` 可能与交互终端不同。向导会把探测到的 CLI 绝对路径作为 profile 的 `executable` 默认值。如果 CLI 是脚本，还要依赖自定义目录里的 Node.js 等解释器，就把该目录加入 profile 私有 `env_file` 的 `PATH`。定时更新会使用配置时找到的 `uv` 所在目录。如果移动了 `uv`，在能找到它的终端重新配置更新服务。在交互终端运行 `doctor` 只检查当前终端环境。
 
-Linux 默认命令：
+Linux 下可查看服务状态和日志，修改 profile 后也可以用对应命令重启。
 
 ```bash
 systemctl --user status cli-agent-bridge.service
 journalctl --user -u cli-agent-bridge.service -n 50
+systemctl --user restart cli-agent-bridge.service
 ```
 
-macOS 默认命令：
+macOS 下可查看服务状态，修改 profile 后用 `kickstart` 重启。
 
 ```bash
 launchctl print "gui/$(id -u)/com.cli-agent-bridge.broker"
+launchctl kickstart -k "gui/$(id -u)/com.cli-agent-bridge.broker"
 ```
 
 自定义过服务名时使用实际名称。profiles 在 broker 启动时读取，普通配置修改需要重启；主机清单会自动检查变化，见下文。停止所有工作时，还要单独关闭并检查 worker。
@@ -547,7 +571,7 @@ agent-bridge call agent_open --json '{"profile":"agy","cwd":"/absolute/project",
 
 ## GitHub 发布与定时更新
 
-GitHub 在 push/PR 后于 Linux 运行离线测试和 Ruff，再于 Linux/macOS 运行打包安装检查。稳定 `vX.Y.Z` tag 全部通过后自动发布 wheel、源码包、`SHA256SUMS` 与 `latest.json`；见 [CI 与发布](ci-release.md)。
+GitHub 在 push/PR 后于 Linux 运行离线测试和 Ruff，再于 Linux 和 macOS 检查打包、安装。推送与版本匹配的 `vX.Y.Z` tag 后，流程会发布 wheel、源码包、`install.sh`、`SHA256SUMS` 和 `latest.json`。见 [CI 与发布](ci-release.md)。
 
 已安装版本可使用：
 
@@ -558,7 +582,7 @@ agent-bridge update run
 agent-bridge update --drain-workers run
 ```
 
-更新配置为 `~/.local/state/cli-agent-bridge/update.json`（0600），可配置 GitHub 仓库、独立版本目录、systemd/launchd 服务名和检查间隔。OTA 更新**默认通过公开 GitHub Releases HTTPS 直连**（若配置了 `HTTPS_PROXY` 则走代理 `CONNECT` 隧道）拉取资产并校验 `SHA256SUMS`，无需配置 `gh` CLI 或登录凭据。安装时默认不启动定时器，也不修改已有 Broker 服务；通过 `agent-bridge init`（第 5 项服务与 OTA 向导）或完成服务迁移后再启用定时器。Linux 每小时检查并随机延迟最多 5 分钟，macOS 使用 LaunchAgent 定时检查。
+更新配置为 `~/.local/state/cli-agent-bridge/update.json`（0600），可配置 GitHub 仓库、独立版本目录、systemd/launchd 服务名和检查间隔。OTA 更新**默认通过公开 GitHub Releases HTTPS 直连**（若配置了 `HTTPS_PROXY` 则走代理 `CONNECT` 隧道）拉取资产并校验 `SHA256SUMS`，无需配置 `gh` CLI 或登录凭据。一键安装默认启用定时器。独立安装可在 `agent-bridge init` 的 **5) Services & OTA** 中设置后台 broker 并启用更新。Linux 每小时检查并随机延迟最多 5 分钟，macOS 使用 LaunchAgent 定时检查。
 
 已有私有 `release_url` 设置会继续生效：从 `<base>/latest.json` 获取发布信息，从 `<base>/releases/<tag>/` 获取附件。再次运行 `init` 或修改检查间隔会保留原来源。镜像支持 HTTPS，HTTP 仅限回环地址及 Tailscale，并检查 DNS 地址。重定向必须保持原来源的协议、主机和端口。镜像请求失败不会改用 GitHub。
 
@@ -587,4 +611,4 @@ uv tool run --from /absolute/path/to/cli_agent_bridge-0.3.1-py3-none-any.whl \
   agent-bridge --state /absolute/path/to/state update source --repository OWNER/REPO
 ```
 
-为新仓库准备发布时，更新中英文 README 和安装指南的安装地址、`pyproject.toml` 的项目链接、随包 skill 的文档链接，以及 `src/agent_bridge/updater.py` 中的默认 `REPOSITORY`。既有安装继续使用已配置的来源，直到主动切换。
+为新仓库准备发布时，更新 `install.sh`、中英文 README 和安装指南中的安装地址、`pyproject.toml` 的项目链接、随包 skill 的文档链接，以及 `src/agent_bridge/updater.py` 中的默认 `REPOSITORY`。既有安装继续使用已配置的来源，直到主动切换。

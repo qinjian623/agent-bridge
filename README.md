@@ -4,35 +4,27 @@
 
 Run independent Codex, Claude Code, Pi, and Antigravity sessions through MCP or a command line. Send tasks, follow up, inspect results, and stop sessions; the broker keeps task history in SQLite, and workers can continue when the MCP client disconnects.
 
-For one user on their own computer or trusted SSH hosts. Requires Python 3.11+, [uv](https://docs.astral.sh/uv/getting-started/installation/), and at least one installed, authenticated model CLI. Linux and macOS are supported; Windows requires WSL2. Model calls use your CLI account and may cost money. Worktrees separate file edits; they do not provide OS isolation.
+For one user on their own computer or trusted SSH hosts. Supports Linux and macOS. On Windows, use WSL2. Model calls use your own authenticated CLI account and may cost money. Worktrees keep file edits separate and share your user account's OS permissions.
 
 ## Install
 
-Install directly from this GitHub repository with uv.
+On Linux with `systemd --user` or macOS in a logged-in desktop session, this command installs the latest stable release and enables automatic Bridge updates.
 
 ```bash
-uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
-agent-bridge init
-agent-bridge doctor
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh
 ```
 
-If `agent-bridge` is not found, run `uv tool update-shell` and open a new terminal. In `init`, choose **1) Profiles**, then **a** to add a profile named `local` using your logged-in Codex, Claude Code, or Pi CLI and its exact model ID; return with **b**, then **s** to save. Keep remote hosts and services unset for this first run. Profiles start unverified; specifying `local` explicitly still allows a first task. Antigravity needs additional setup and writable access; see the [guide](docs/getting-started.md#antigravity).
+The installer verifies the wheel, sets up uv and Python if needed, and starts the broker and update timer under your account. If your shell cannot find `agent-bridge`, add `$HOME/.local/bin` to `PATH` or run `~/.local/bin/agent-bridge` directly. For source installation, installing without starting services, or migrating an existing installation, see [installation options](docs/getting-started.md#requirements-and-installation).
 
-## Start
+## Configure and check
 
-Keep this running in a terminal:
+Install and log in to a model CLI separately. Run `agent-bridge init`, choose **1) Profiles**, then **a** to add a profile named `local` using your logged-in Codex, Claude Code, or Pi CLI and its exact model ID. Return with **b** and save with **s**. Profiles start unverified. You can still specify `local` to dispatch your first task. See [Antigravity setup](docs/getting-started.md#antigravity) for its access requirements.
 
-```bash
-agent-bridge serve
-```
-
-In a second terminal, check the broker:
+After saving a profile, restart the broker so it loads the changes, then check that it responds. See [managed service commands](docs/getting-started.md#managed-services) for Linux and macOS. With a standalone source installation, start `agent-bridge serve` in another terminal.
 
 ```bash
 agent-bridge call agent_inspect --json '{}'
 ```
-
-For background startup, see [managed services](docs/getting-started.md#managed-services).
 
 CLI help, setup prompts, the terminal monitor, Web pages, and parent task notices support English and Simplified Chinese. Try `agent-bridge --lang zh-CN --help`; the Web dashboard and login page have their own language selector. See [language settings](docs/getting-started.md#language).
 
@@ -40,7 +32,7 @@ To open the dashboard, run `agent-bridge monitor --web` in another terminal and 
 
 ## Connect MCP
 
-For Codex, run in the second terminal:
+For Codex, run:
 
 ```bash
 codex mcp add cli-agent-bridge -- "$(command -v agent-bridge)" mcp

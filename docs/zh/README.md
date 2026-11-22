@@ -4,35 +4,27 @@
 
 通过 MCP 或命令行运行 Codex、Claude Code、Pi 和 Antigravity 的独立会话。可以派发任务、继续追问、查看结果和停止会话；任务历史保存在 SQLite，MCP 客户端断开后 worker 仍可继续运行。
 
-适合单个用户在自己的电脑或受信任的 SSH 主机上使用。需要 Python 3.11+、[uv](https://docs.astral.sh/uv/getting-started/installation/) 和至少一个已安装、已登录的模型 CLI。支持 Linux、macOS；Windows 请使用 WSL2。模型调用使用你的 CLI 账号，可能产生费用。worktree 只能分开文件修改，不提供操作系统隔离。
+适合单个用户在自己的电脑或受信任的 SSH 主机上使用。支持 Linux 和 macOS，Windows 上请使用 WSL2。模型调用使用你登录的 CLI 账号，可能产生费用。worktree 将文件修改分开，仍使用同一个系统账号的权限。
 
 ## 安装
 
-用 uv 直接从这个 GitHub 仓库安装。
+在支持 `systemd --user` 的 Linux 上，或登录 macOS 桌面后，运行以下命令安装最新稳定版并启用自动更新。
 
 ```bash
-uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
-agent-bridge init
-agent-bridge doctor
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh
 ```
 
-找不到 `agent-bridge` 时，运行 `uv tool update-shell` 并打开新终端。在 `init` 中选择 **1) Profiles**，再选 **a**，添加一个名为 `local` 的配置，填写已登录的 Codex、Claude Code 或 Pi CLI 及其完整模型 ID；用 **b** 返回，再用 **s** 保存。首次使用保留远端主机和服务设置为空。新配置尚未经过实际推理检查，但可以通过明确指定 `local` 派发首个任务。Antigravity 需要额外设置及写入权限，见[详细说明](getting-started.md#antigravity)。
+脚本会校验 wheel，按需安装 uv 和 Python，并用当前账号启动 broker 和更新定时器。如果找不到 `agent-bridge`，把 `$HOME/.local/bin` 加入 `PATH`，或直接运行 `~/.local/bin/agent-bridge`。源码安装、暂不启动服务和迁移已有安装的步骤见[安装选项](getting-started.md#环境与安装)。
 
-## 启动
+## 配置与检查
 
-在一个终端中保持运行：
+请单独安装并登录模型 CLI。运行 `agent-bridge init`，选择 **1) Profiles**，再选 **a** 添加名为 `local` 的配置。填写已登录的 Codex、Claude Code 或 Pi CLI 及其完整模型 ID，用 **b** 返回，再用 **s** 保存。新配置尚未通过推理检查，首次派发时可以明确指定 `local`。Antigravity 的权限要求见[配置说明](getting-started.md#antigravity)。
 
-```bash
-agent-bridge serve
-```
-
-在另一个终端中检查服务：
+保存 profile 后，重启 broker 加载配置，再检查连接。Linux 和 macOS 的命令见[托管服务](getting-started.md#managed-services)。独立源码安装用户可在另一个终端运行 `agent-bridge serve`。
 
 ```bash
 agent-bridge call agent_inspect --json '{}'
 ```
-
-需要后台启动时，见[托管服务](getting-started.md#managed-services)。
 
 CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英文与简体中文。运行 `agent-bridge --lang zh-CN --help` 查看中文帮助；Web 仪表盘和登录页可单独选择语言，见[语言设置](getting-started.md#language)。
 
@@ -40,7 +32,7 @@ CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英
 
 ## 接入 MCP
 
-Codex 用户在第二个终端执行：
+Codex 用户执行：
 
 ```bash
 codex mcp add cli-agent-bridge -- "$(command -v agent-bridge)" mcp

@@ -6,9 +6,31 @@ Start with the [short walkthrough](../README.md). This guide covers configuratio
 
 ## Requirements and installation
 
-Use Linux or macOS with Python 3.11+ and `uv`. On Windows, run the broker, model CLIs, projects, and MCP client inside WSL2; native Windows is unsupported. Install and log in to at least one target CLI (`codex`, `claude`, `pi`, or `agy`) separately. Bridge does not install or authenticate those programs. Use a single user account and only trusted remote hosts; do not publish the broker or monitor as a multi-user service.
+Use Linux or macOS. On Windows, run the broker, model CLIs, projects, and MCP client inside WSL2. Install and log in to a target CLI (`codex`, `claude`, `pi`, or `agy`) separately. Use a single user account and only trusted remote hosts. Keep the broker and monitor private to that account.
 
-For a standalone installation, use a repository you can access:
+### Stable release with scheduled updates
+
+Run the installer as your own user on Linux with `systemd --user` or in a macOS desktop login session.
+
+```bash
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh
+```
+
+It uses your existing `uv` or installs it to `~/.local/bin` and provisions Python 3.11 or newer as needed. It reads `latest.json`, downloads the matching stable release wheel and verifies it against `SHA256SUMS` over HTTPS. It installs a managed version and starts the user broker and periodic OTA checks. No `sudo` or GitHub sign-in is required. You can review the [installer source](../install.sh) first.
+
+`~/.local/bin/agent-bridge` points to the stable launcher. Add `$HOME/.local/bin` to `PATH` if your shell cannot find the command. Use `agent-bridge init` to configure profiles and [register MCP separately](#mcp-setup).
+
+To write the service files without starting them during setup, pass `--no-start`.
+
+```bash
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh -s -- --no-start
+```
+
+To start the broker and enable checks later, run `agent-bridge init --non-interactive --enable-broker-service --enable-updater`. For an existing installation, see [switching update sources](#switching-update-sources) or [managed services](#managed-services).
+
+### Standalone install from source
+
+With Python 3.11+ and `uv` available, install directly from the Git repository if you want to run the broker in the foreground.
 
 ```bash
 uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
@@ -23,7 +45,7 @@ For development or a checkout you want to keep:
 
 ```bash
 git clone https://github.com/qinjian623/agent-bridge.git
-cd cli-agent-bridge
+cd agent-bridge
 uv sync --locked
 uv run agent-bridge init
 uv run agent-bridge doctor
@@ -163,27 +185,29 @@ Detached workers remain descendants of the broker. An updater can report `broker
 
 ## Managed services
 
-A foreground broker is enough for initial use. For user-level background services, finish configuration first, stop your foreground broker, then run:
+The one-command release installer starts the user broker by default. To set up a background service from a standalone installation, finish configuration, stop your foreground broker, then run this command.
 
 ```bash
 agent-bridge init --non-interactive --install-broker-service --enable-broker-service
 ```
 
-This writes and starts a Linux `systemd --user` unit or macOS `launchd` LaunchAgent using a stable managed launcher. It keeps the installation's Python as a bootstrap fallback until a managed release is selected; keep that uv tool environment or source `.venv` available. Existing conflicting service files are refused; do not add `--force-broker-service` without checking their contents and active work.
+This writes and starts a Linux `systemd --user` unit or macOS `launchd` LaunchAgent using the managed launcher. Keep the Python environment used for setup available while the launcher uses it. Setup refuses conflicting service files. Check the files and active work before using `--force-broker-service`.
 
 Background services may have a different `PATH` than your shell. The wizard offers the detected absolute path for the profile's `executable` field. If the executable is a script that needs an interpreter such as Node.js from a custom directory, include that directory in the `PATH` value of the profile's private `env_file`. The scheduled updater includes the directory of the `uv` found during setup. If you move `uv`, refresh the updater configuration from a shell that can find it. A successful `doctor` in your interactive shell only checks that shell's environment.
 
-Default Linux commands:
+Default Linux commands for status, logs, and a restart after editing profiles:
 
 ```bash
 systemctl --user status cli-agent-bridge.service
 journalctl --user -u cli-agent-bridge.service -n 50
+systemctl --user restart cli-agent-bridge.service
 ```
 
-Default macOS command:
+Default macOS commands for status and a restart after editing profiles:
 
 ```bash
 launchctl print "gui/$(id -u)/com.cli-agent-bridge.broker"
+launchctl kickstart -k "gui/$(id -u)/com.cli-agent-bridge.broker"
 ```
 
 Use your configured service name if changed. Runtime profiles are loaded at broker startup; ordinary profile changes need a broker restart. Host registry changes are watched automatically, as described below. Close/inspect workers separately when stopping all work.
@@ -501,7 +525,7 @@ Account terms: check the current terms for your account before using this runtim
 
 ## GitHub Releases and Scheduled OTA Updates
 
-For pushes and pull requests, GitHub Actions runs offline tests and Ruff on Linux, then clean packaging/installation smoke checks on Linux and macOS. Pushing a matching `vX.Y.Z` tag builds and publishes the wheel, source tarball, `SHA256SUMS`, and `latest.json`; see [CI and Releases](ci-release.md).
+For pushes and pull requests, GitHub Actions runs offline tests and Ruff on Linux, then checks packaging and installation on Linux and macOS. Pushing a matching `vX.Y.Z` tag publishes the wheel, source tarball, `install.sh`, `SHA256SUMS`, and `latest.json`. See [CI and Releases](ci-release.md).
 
 Manage scheduled self-updates from the CLI:
 
@@ -512,7 +536,7 @@ agent-bridge update run
 agent-bridge update --drain-workers run
 ```
 
-Settings live in `~/.local/state/cli-agent-bridge/update.json` (mode `0600`) specifying the GitHub repository, managed releases directory, `systemd`/`launchd` service name, and check interval. OTA updates pull release assets **from public GitHub Releases over HTTPS by default** (honoring `HTTPS_PROXY` via `CONNECT` if configured) and verify `SHA256SUMS`, requiring no `gh` CLI login or API credentials. Installation does not auto-enable the timer or disturb an unmanaged broker service; configure and enable managed services via `agent-bridge init` (item 5: Services & OTA) or migrate explicitly before enabling periodic checks. Linux checks hourly with up to 5 minutes of jitter; macOS uses a `LaunchAgent` timer.
+Settings live in `~/.local/state/cli-agent-bridge/update.json` (mode `0600`) specifying the GitHub repository, managed releases directory, `systemd`/`launchd` service name, and check interval. OTA updates pull release assets **from public GitHub Releases over HTTPS by default** (honoring `HTTPS_PROXY` via `CONNECT` if configured) and verify `SHA256SUMS`, requiring no `gh` CLI login or API credentials. The one-command installer enables the update timer by default. For a standalone installation, configure the managed broker and enable updates from **5) Services & OTA** in `agent-bridge init`. Linux checks hourly with up to 5 minutes of jitter. macOS uses a `LaunchAgent` timer.
 
 Existing private `release_url` settings remain in use: manifests come from `<base>/latest.json` and assets from `<base>/releases/<tag>/`. Re-running `init` or changing its interval preserves the source. Mirrors use HTTPS, or HTTP restricted to loopback/Tailscale with DNS and same-origin redirect checks. A mirror failure does not fall back to GitHub.
 
@@ -540,4 +564,4 @@ uv tool run --from /absolute/path/to/cli_agent_bridge-0.3.1-py3-none-any.whl \
   agent-bridge --state /absolute/path/to/state update source --repository OWNER/REPO
 ```
 
-When preparing a new release repository, update the README and guide installation URLs, `pyproject.toml` project URLs, the companion skill's documentation links, and the default `REPOSITORY` in `src/agent_bridge/updater.py`. Existing installations retain their configured source until explicitly switched.
+When preparing a new release repository, update `install.sh`, the README and guide installation URLs, `pyproject.toml` project URLs, the companion skill's documentation links, and the default `REPOSITORY` in `src/agent_bridge/updater.py`. Existing installations retain their configured source until explicitly switched.

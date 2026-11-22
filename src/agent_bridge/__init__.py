@@ -1,5 +1,5 @@
 """Local cross-runtime agent sessions."""
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 MIN_COMPATIBLE_WORKER_VERSION = "0.2.0"
 REQUIRES_WORKER_DRAIN = False
