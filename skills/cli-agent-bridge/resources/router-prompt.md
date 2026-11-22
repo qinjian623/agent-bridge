@@ -34,7 +34,7 @@ Start with `agent_catalog`. Use a verified, available profile with the access mo
 
 ### Flash Off-Peak Provider Allocation
 
-For a new local Flash task, set `requirements.kind="flash"` and omit `profile` to let the broker choose among eligible profiles. Pass all required tools, access, and input constraints as usual. The broker applies preferences from the optional `routing` section of `config.json`. The example prefers Claude Code through Ollama Cloud during its off-peak hours, then Pi or Claude Code through DeepSeek during theirs. It matches runtime and provider fields, so profile names may differ. [Configuration example](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/getting-started.md#off-peak-routing)
+For a new local Flash task, set `requirements.kind="flash"` and omit `profile` to let the broker choose among eligible profiles. Pass all required tools, access, and input constraints as usual. The broker applies preferences from the optional `routing` section of `config.json`. The example prefers Claude Code through Ollama Cloud during its off-peak hours, then Pi or Claude Code through DeepSeek during theirs. It matches runtime and provider fields, so profile names may differ. [Configuration example](https://github.com/qinjian623/agent-bridge/blob/main/docs/getting-started.md#off-peak-routing)
 
 With the example configuration the preference applies to `balanced` tasks. If no preference applies, selection follows the usual strategy. For a matched rule, `agent_result` exposes `details.selection.preference`. Selection uses the time of dispatch, so actual billing can differ if work crosses a time boundary. For new remote sessions, pass an explicit `profile`.
 

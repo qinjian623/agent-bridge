@@ -8,10 +8,10 @@ For one user on their own computer or trusted SSH hosts. Requires Python 3.11+, 
 
 ## Install
 
-Install from this repository. A private checkout requires repository access. No PyPI package is required.
+Install directly from this GitHub repository with uv.
 
 ```bash
-uv tool install 'git+https://github.com/qinjian623/cli-agent-bridge.git'
+uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
 agent-bridge init
 agent-bridge doctor
 ```

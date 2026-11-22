@@ -33,7 +33,7 @@ from xml.sax.saxutils import escape
 
 from .errors import BridgeError
 
-REPOSITORY = "qinjian623/cli-agent-bridge"
+REPOSITORY = "qinjian623/agent-bridge"
 GITHUB_WEB_ORIGIN = "https://github.com"
 GITHUB_API_ORIGIN = "https://api.github.com"
 _GITHUB_CDN_HOSTS = frozenset(

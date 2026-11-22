@@ -17,8 +17,8 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/qinjian623/cli-agent-bridge"
-Issues = "https://github.com/qinjian623/cli-agent-bridge/issues"
+Repository = "https://github.com/qinjian623/agent-bridge"
+Issues = "https://github.com/qinjian623/agent-bridge/issues"
 
 [project.scripts]
 agent-bridge = "agent_bridge.cli:main"

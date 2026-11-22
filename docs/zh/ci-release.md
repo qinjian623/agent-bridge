@@ -22,6 +22,6 @@ Actions 的测试、构建任务只有仓库读取权限；仅 tag 发布任务�
 
 ## 新公开仓库的首个版本
 
-用已检查的源码建立公开仓库。原有历史提交、Release 附件和 Actions 记录仍保存在私库。推送发布 tag 前，将中英文文档里的安装和克隆地址、包的 Repository 和 Issues 链接、随包 skill 的链接以及默认更新源改为已确认的新地址。tag 构建会核对包的链接和默认更新源是否指向当前发布仓库。
+用已检查的源码或 Git 历史建立公开仓库。未纳入发布的 Git 引用、旧 Release 附件和 Actions 记录留在私库。推送发布 tag 前，将中英文文档里的安装和克隆地址、包的 Repository 和 Issues 链接、随包 skill 的链接以及默认更新源设为公开地址。tag 构建会核对包的链接和默认更新源是否指向当前发布仓库。
 
 首发版本应高于存量节点安装的版本，并保留 Python 包名及 wheel 命名规则。存量节点继续使用现有更新源，直到管理员明确切换。先用未登录的客户端验证能从公开 Release 安装、连接 MCP 并读取 OTA 清单，再让存量节点切换。见[隐私检查](privacy.md)和[切换更新源](getting-started.md#switching-update-sources)。

@@ -410,7 +410,7 @@ class ReleaseValidationTests(UpdateFixture):
             release = updater.latest_release(updater.REPOSITORY)
         self.assertEqual("cli_agent_bridge-0.2.0-py3-none-any.whl", release["wheel"])
         self.assertEqual(
-            "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json",
+            "https://github.com/qinjian623/agent-bridge/releases/latest/download/latest.json",
             dl.call_args.args[0],
         )
 
@@ -418,7 +418,7 @@ class ReleaseValidationTests(UpdateFixture):
         import urllib.error
 
         not_found = urllib.error.HTTPError(
-            "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json",
+            "https://github.com/qinjian623/agent-bridge/releases/latest/download/latest.json",
             404,
             "Not Found",
             {},
@@ -433,7 +433,7 @@ class ReleaseValidationTests(UpdateFixture):
         self.assertEqual("v0.2.0", release["tag"])
         self.assertEqual(1, release["release_id"])
         self.assertEqual(
-            "https://api.github.com/repos/qinjian623/cli-agent-bridge/releases/latest",
+            "https://api.github.com/repos/qinjian623/agent-bridge/releases/latest",
             dl.call_args_list[1].args[0],
         )
 
@@ -1266,9 +1266,9 @@ class GitHubHttpsReleaseTests(UpdateFixture):
 
     def test_validate_github_url_enforces_https_and_github_hosts(self):
         self.assertEqual(
-            "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json",
+            "https://github.com/qinjian623/agent-bridge/releases/latest/download/latest.json",
             updater._validate_github_url(
-                "https://github.com/qinjian623/cli-agent-bridge/releases/latest/download/latest.json"
+                "https://github.com/qinjian623/agent-bridge/releases/latest/download/latest.json"
             ),
         )
         self.assertEqual(
@@ -1280,7 +1280,7 @@ class GitHubHttpsReleaseTests(UpdateFixture):
         )
         for bad in (
             "",
-            "http://github.com/qinjian623/cli-agent-bridge",
+            "http://github.com/qinjian623/agent-bridge",
             "http://198.51.100.10:8088/cli-agent-bridge",
             "http://127.0.0.1:8088/latest.json",
             "file:///tmp/latest.json",
@@ -1375,7 +1375,7 @@ class GitHubHttpsReleaseTests(UpdateFixture):
         try:
             started = time.monotonic()
             with patch.object(socket, "getaddrinfo", side_effect=slow_dns), self.assertRaises(TimeoutError):
-                updater._download_bytes("https://github.com/qinjian623/cli-agent-bridge", max_bytes=1024, timeout=0.15)
+                updater._download_bytes("https://github.com/qinjian623/agent-bridge", max_bytes=1024, timeout=0.15)
             self.assertLess(time.monotonic() - started, 0.5)
         finally:
             dns_release.set()

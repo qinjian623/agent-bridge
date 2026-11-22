@@ -11,7 +11,7 @@ Use Linux or macOS with Python 3.11+ and `uv`. On Windows, run the broker, model
 For a standalone installation, use a repository you can access:
 
 ```bash
-uv tool install 'git+https://github.com/qinjian623/cli-agent-bridge.git'
+uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
 agent-bridge --help
 agent-bridge init
 agent-bridge doctor
@@ -22,7 +22,7 @@ agent-bridge doctor
 For development or a checkout you want to keep:
 
 ```bash
-git clone https://github.com/qinjian623/cli-agent-bridge.git
+git clone https://github.com/qinjian623/agent-bridge.git
 cd cli-agent-bridge
 uv sync --locked
 uv run agent-bridge init

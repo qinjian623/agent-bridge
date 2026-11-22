@@ -10,7 +10,7 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 自动更新用 `agent-bridge update check/run`，最近结果在状态目录 `update-status.json`。维护期间的 `update_busy` 表示暂缓，不能换 request_id 重跑；`uncertain` 先核对实际进程与版本。更新不重启原生终端、不升级其他 CLI，也不清除旧版本或还原数据库。MCP/relay 和 skill 必须使用固定入口或 `current/skill`，不要继续引用旧 checkout。OTA 直接通过公开 GitHub Releases HTTPS 拉取并校验 SHA256，无需配置 `gh` 登录凭据。
 
 - 先读 `agent_catalog`。程序、供应商和模型分别核对（以 `agent_catalog` 中配置的实际供应商和模型为准）。指定的模型不得自动替换。
-- Antigravity 需要 `runtime=antigravity`、`provider=google-antigravity` 和完整 `agy models` ID，选 Claude 模型时也一样。仅支持文本和 `workspace-write`。headless 没有逐次工具审批，原生工具被拒绝时如实报告，保留原权限限制。使用前核实账号条款，见 [Antigravity 设置和账号限制](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#antigravity)。原生用量缺少可靠基数时，只报告观察到的用量并标为不完整。真实推理、工具调用和中断需要在当前环境单独验证。
+- Antigravity 需要 `runtime=antigravity`、`provider=google-antigravity` 和完整 `agy models` ID，选 Claude 模型时也一样。仅支持文本和 `workspace-write`。headless 没有逐次工具审批，原生工具被拒绝时如实报告，保留原权限限制。使用前核实账号条款，见 [Antigravity 设置和账号限制](https://github.com/qinjian623/agent-bridge/blob/main/docs/zh/getting-started.md#antigravity)。原生用量缺少可靠基数时，只报告观察到的用量并标为不完整。真实推理、工具调用和中断需要在当前环境单独验证。
 - `agent_catalog` 会自主查询已配置供应商的模型，缓存 5 分钟；需要最新结果时传 `refresh=true`，也可用 `profile` 只查一个配置。读 `discovery` 中的准确 `model`、来源、时间和错误；目录可见不代表推理成功。查询失败或 `stale=true` 时，不能选择其中的新模型。
 - 新会话可用 `agent_open/agent_dispatch(profile=已有配置名, model=准确ID, effort=档位)`。档位按 `agent_catalog` 中模型的 `reasoning_efforts` 原样填写，无法确认时不能显式设置。省略 `effort` 时，同一模型沿用 profile 设置，换模型时采用原生默认值。Antigravity 可以用完整模型 ID 选档。已有会话保留模型和档位。
 - 异步派单后保存返回的任务和会话 ID。新安装默认不发送父通知，用 `agent_result` 查看任务，需要先等事件时可用一次限时 `agent_wait`。配置并验证辅助程序和当前父会话后，再使用[自动父通知](resources/router-prompt.md#默认异步派单)。超时后不循环查询或再次派单。
@@ -21,7 +21,7 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - `agent_broadcast(group_id, message, expected_revision, request_id, reservation)` 只向指定组的成员各派发一条任务，可能产生推理费用；reservation 按每个成员计算。不要把全部会话加入临时组来代替明确选择目标。暂停、关闭、正在排空和等待恢复的成员会跳过，检查每个 recipient 的任务 ID 或原因。
 - 广播重试保留相同 request_id 和参数，返回原收件人和任务 ID；组成员后来改变不会补发。入队不等于执行成功，按 task_id 查看结果。移除成员或删除组不撤回已排队任务，需用 agent_cancel；删除的组 ID 不复用。
 - 原生成员广播与收件：用 `agent_broadcast_status(broadcast_id, refresh=true)` 查各目标状态（`pending`/`enqueued`/`received` 及 `processing_status`；收到不代表执行完成，`uncertain`/`unconfirmed` 先读原生记录核实，不自动重发）。Codex 仅入原会话队列，不唤醒已关闭会话；AGY 仅在确认原实例关闭后自动恢复同一原生 ID（沿用原配置，不写活动终端、不传跳过权限参数、不补发历史 `skipped`）。原生会话不计入 bridge 预算（启用 `token_budget` 时拒绝含原生成员的广播），无 `task_id` 故 `agent_cancel` 不适用。
-- 原生成员可主动用 `agent_group_inbox(group_id, runtime, native_id, after, limit)` 分页只读收件（保存 `cursor` 作下次 `after`，每页最多 10 条；协调者代查不等于目标已收到）。本机有管理权限的原生会话可发广播，受限子会话不可；只通知用户指定成员，禁止成员收到后自动广播确认。唤醒锁与进程检查细节见 [使用指南：分组与广播](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#分组与广播)。
+- 原生成员可主动用 `agent_group_inbox(group_id, runtime, native_id, after, limit)` 分页只读收件（保存 `cursor` 作下次 `after`，每页最多 10 条；协调者代查不等于目标已收到）。本机有管理权限的原生会话可发广播，受限子会话不可；只通知用户指定成员，禁止成员收到后自动广播确认。唤醒锁与进程检查细节见 [使用指南：分组与广播](https://github.com/qinjian623/agent-bridge/blob/main/docs/zh/getting-started.md#分组与广播)。
 - `agent_inspect {}` 总览直接列出每个会话的 `runtime`、`provider`、`model`、`profile`、`effort` 和 `service_tier`；查询实际会话详情时传 `session_id`。
 - 修改代码用 `agent_open(access=workspace-write)`；服务创建独立 Git worktree，默认从 HEAD 开始。需要当前未提交内容时列出 `snapshot_files`；非 Git 目录用 `workspace_mode=copy` 并列出文件。不能偷偷 commit、stash 或清理主目录。
 - `request_id` 在重试时保持不变，改变内容时使用新 ID。已存在的 session 固定程序和供应商；换模型用新 session，重试旧任务可提供 `retry_task_id`。
@@ -36,8 +36,8 @@ description: 通过本机服务让 Codex、Claude Code、Pi、Antigravity 分别
 - 需要输入或批准时从 `agent_inspect` 读取 question_id 和 expires，使用 respond 回答仍有效的请求；不自动扩大用户授权。
 - 本机 Flash 新任务需要自动选配置时，设置 `requirements.kind="flash"` 并省略 `profile`。Broker 筛选配置后，再应用低峰时段规则。见 [Flash 低峰分配](resources/router-prompt.md#flash-按供应商低峰时间分配)。
 - 默认使用均衡策略。单个任务可传 `requirements.strategy=cost/speed/balanced`；指定模型不被自动替换。遇到配额等待先读 `quota_cooldowns`，确认恢复后再用 `quota_resume`；失败任务不会自动重跑。
-- 用量与计费：子任务统计含每次 attempt；需汇总父会话时在 `parent_register` 传原生 Codex 的 `usage_path`（可选 `usage_since`，`notify=false` 仅统计，`parent_meter_stop` 停止计数）。缺少执行前基数或未登记父用量时只报不完整/部分统计，不把历史总量当本轮新增；换模型重试的质量归各自 attempt、费用计全部执行；未知价格不按零算，CLI 估算不作实际账单。详见 [使用指南：均衡选择与费用](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#均衡选择与费用)。
-- 异步任务的父会话通知与可选 Telegram（详见 [使用指南：父会话与 Telegram](https://github.com/qinjian623/cli-agent-bridge/blob/main/docs/zh/getting-started.md#父会话与-telegram)）：不默认登记无关主会话；Telegram 任务须配置可读的 `telegram_database` 并保留默认 `external_child_filter` 子会话登记（不支持时更新现有 bot，严禁设为 `null` 绕过）。父会话若用临时 MCP 启动，登记时须传私有 `resume_config_file`（不改父模型或审批策略）。收到通知后仅 `completed` 可调 `agent_review`，结果不明先核查再 `resolve`，处理后用 `parent_ack` 确认（不重发结果不明的通知，也不重启共享 Codex daemon）。
+- 用量与计费：子任务统计含每次 attempt；需汇总父会话时在 `parent_register` 传原生 Codex 的 `usage_path`（可选 `usage_since`，`notify=false` 仅统计，`parent_meter_stop` 停止计数）。缺少执行前基数或未登记父用量时只报不完整/部分统计，不把历史总量当本轮新增；换模型重试的质量归各自 attempt、费用计全部执行；未知价格不按零算，CLI 估算不作实际账单。详见 [使用指南：均衡选择与费用](https://github.com/qinjian623/agent-bridge/blob/main/docs/zh/getting-started.md#均衡选择与费用)。
+- 异步任务的父会话通知与可选 Telegram（详见 [使用指南：父会话与 Telegram](https://github.com/qinjian623/agent-bridge/blob/main/docs/zh/getting-started.md#父会话与-telegram)）：不默认登记无关主会话；Telegram 任务须配置可读的 `telegram_database` 并保留默认 `external_child_filter` 子会话登记（不支持时更新现有 bot，严禁设为 `null` 绕过）。父会话若用临时 MCP 启动，登记时须传私有 `resume_config_file`（不改父模型或审批策略）。收到通知后仅 `completed` 可调 `agent_review`，结果不明先核查再 `resolve`，处理后用 `parent_ack` 确认（不重发结果不明的通知，也不重启共享 Codex daemon）。
 
 任务结束后关闭不再使用的子会话，并检查 `owned_processes`；顶层回答结束不证明后台进程结束。cgroup 之外的 tmux、远程作业等需另查。保留未合入的 worktree、副本和补丁供主 agent 检查；不要自动删除。
 

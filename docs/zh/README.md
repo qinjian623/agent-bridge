@@ -8,10 +8,10 @@
 
 ## 安装
 
-直接从仓库安装。私有仓库需要访问权限，无需 PyPI 包。
+用 uv 直接从这个 GitHub 仓库安装。
 
 ```bash
-uv tool install 'git+https://github.com/qinjian623/cli-agent-bridge.git'
+uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
 agent-bridge init
 agent-bridge doctor
 ```

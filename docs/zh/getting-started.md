@@ -11,7 +11,7 @@
 独立安装：
 
 ```bash
-uv tool install 'git+https://github.com/qinjian623/cli-agent-bridge.git'
+uv tool install 'git+https://github.com/qinjian623/agent-bridge.git'
 agent-bridge --help
 agent-bridge init
 agent-bridge doctor
@@ -22,7 +22,7 @@ agent-bridge doctor
 需要开发或保留源码目录时：
 
 ```bash
-git clone https://github.com/qinjian623/cli-agent-bridge.git
+git clone https://github.com/qinjian623/agent-bridge.git
 cd cli-agent-bridge
 uv sync --locked
 uv run agent-bridge init
