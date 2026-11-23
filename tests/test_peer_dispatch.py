@@ -12,6 +12,7 @@ from agent_bridge import native_broadcast
 from agent_bridge.broker import Broker
 from agent_bridge.config import Config, Profile
 from agent_bridge.errors import BridgeError
+from agent_bridge.mirror_prune import expire_mirror_details
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.peer_api import DirectPeerService
 from agent_bridge.peer_protocol import INLINE_RESULT_BYTES, DeliverySource, PeerErrorCode
@@ -862,14 +863,96 @@ class DirectPeerServicePhaseBTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(page1["ok"], page1)
         self.assertEqual([first_local], [item["seq"] for item in page1["result"]["items"]])
         self.assertTrue(page1["result"]["has_more"])
+        self.assertNotIn("scanned_through", page1["result"])
         page2 = await self.peer("peer.events", {"after": page1["result"]["cursor"], "limit": 10})
         self.assertTrue(page2["ok"], page2)
         self.assertEqual([second_local], [item["seq"] for item in page2["result"]["items"]])
         self.assertFalse(page2["result"]["has_more"])
         self.assertEqual(second_local, page2["result"]["cursor"])
+        self.assertEqual(mirrored_b, page2["result"]["scanned_through"])
         tail = await self.peer("peer.events", {"after": page2["result"]["cursor"], "limit": 10})
         self.assertEqual([], tail["result"]["items"])
         self.assertFalse(tail["result"]["has_more"])
+        self.assertEqual(mirrored_b, tail["result"]["scanned_through"])
+
+    async def test_event_polls_can_exclude_tool_details_while_legacy_reads_include_them(self):
+        kinds = ["tool_started", "input_required", "task_finished", "tool_completed"]
+        with self.store.connection(write=True) as db:
+            first_tool, question, finished, last_tool = [self.store.event(db, kind, {}) for kind in kinds]
+        params = {"after": 0, "limit": 1, "include_tool_events": False}
+        first = (await self.peer("peer.events", params))["result"]
+        self.assertEqual([question], [item["seq"] for item in first["items"]])
+        self.assertTrue(first["has_more"])
+        self.assertNotIn("scanned_through", first)
+        last = (await self.peer("peer.events", {**params, "after": question}))["result"]
+        self.assertEqual([finished], [item["seq"] for item in last["items"]])
+        self.assertEqual(last_tool, last["scanned_through"])
+        self.assertFalse(last["has_more"])
+        for extra in ({}, {"include_tool_events": True}):
+            detailed = (await self.peer("peer.events", {"after": 0, **extra}))["result"]
+            self.assertEqual([first_tool, question, finished, last_tool], [item["seq"] for item in detailed["items"]])
+        self.assert_error(
+            await self.peer("peer.events", {"include_tool_events": 0}), PeerErrorCode.INVALID_PARAMS,
+        )
+        self.assert_error(await self.peer("peer.events", {"after": 2**63}), PeerErrorCode.INVALID_PARAMS)
+
+    async def test_event_scan_position_excludes_events_committed_after_page_read(self):
+        with self.store.connection(write=True) as db:
+            previous = self.store.event(db, "local_one", {})
+        read_page = self.store._event_rows
+        appended = []
+
+        def append_after_read(*args, **kwargs):
+            rows = read_page(*args, **kwargs)
+            with self.store.connection(write=True) as writer:
+                appended.append(self.store.event(writer, "task_finished", {}))
+            return rows
+
+        with patch.object(self.store, "_event_rows", side_effect=append_after_read):
+            first = (await self.peer("peer.events", {"after": previous}))["result"]
+        self.assertEqual([], first["items"])
+        self.assertEqual(previous, first["scanned_through"])
+        next_page = (await self.peer("peer.events", {"after": first["scanned_through"]}))["result"]
+        self.assertEqual(appended, [item["seq"] for item in next_page["items"]])
+
+    async def test_late_parent_notification_restores_expired_detail_and_deduplicates(self):
+        identity = self.identity.load_or_create()
+        self.store.parent_control("parent", "parent_register", 0, "register", "native-parent", str(self.state))
+        ref = {"host_id": "origin", "node_id": "origin-node", "state_generation": "origin-gen", "local_id": "task"}
+        detail = {
+            "ref": ref, "seq": 7, "type": "tool_completed", "payload": {"output": "sample " * 50}, "created": 1.0,
+        }
+        fingerprint = hashlib.sha256(encode(detail).encode("utf-8")).hexdigest()
+        with self.store.connection(write=True) as db:
+            local_seq = self.store.event(db, detail["type"], {
+                "source": ref, "remote_seq": detail["seq"], "type": detail["type"],
+                "payload": detail["payload"], "created": detail["created"],
+            })
+            self.store.mirror_peer_event("origin", "origin-node", "origin-gen", 7, fingerprint, local_seq, db=db)
+            self.store.advance_peer_event_cursor("origin", "origin-node", "origin-gen", 7, db=db)
+            db.execute("UPDATE peer_event_mirrors SET created=1 WHERE local_seq=?", (local_seq,))
+            db.execute("UPDATE events SET created=1 WHERE seq=?", (local_seq,))
+        self.assertEqual(1, expire_mirror_details(self.store.path, apply=True)["expired_mirrors"])
+        params = {
+            "operation": self.operation("late-notification"),
+            "parent_ref": {
+                "host_id": "gpu-a", "node_id": identity.node_id,
+                "state_generation": identity.state_generation, "local_id": "parent",
+            },
+            "event": detail,
+        }
+        changed = {**params, "event": {**detail, "payload": {"output": "different"}}}
+        self.assert_error(await self.peer("peer.notify_parent", changed), PeerErrorCode.OPERATION_CONFLICT)
+        first = await self.peer("peer.notify_parent", params)
+        self.assertTrue(first["ok"], first)
+        self.assertEqual({"mirror_seq": local_seq, "duplicate": False}, first["result"])
+        retry = await self.peer("peer.notify_parent", params)
+        self.assertEqual({"mirror_seq": local_seq, "duplicate": True}, retry["result"])
+        with self.store.connection() as db:
+            stored = db.execute("SELECT data FROM events WHERE seq=?", (local_seq,)).fetchone()[0]
+            self.assertEqual(detail["payload"], json.loads(stored)["payload"])
+            self.assertEqual(1, db.execute("SELECT count(*) FROM deliveries WHERE event_seq=?", (local_seq,)).fetchone()[0])
+        self.assertEqual(0, expire_mirror_details(self.store.path, apply=True)["expired_mirrors"])
 
     async def test_deliver_applies_open_model_via_model_directory_and_rejects_unknown_model_cleanly(self):
         resolved_profile = Profile(

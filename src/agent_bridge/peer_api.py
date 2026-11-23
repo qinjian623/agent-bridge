@@ -21,6 +21,7 @@ from typing import Any, Literal, NotRequired, Protocol, TypedDict
 from . import __version__, groups, update_guard
 from .config import Config, Profile, validate_reasoning_effort
 from .errors import BridgeError
+from .mirror_prune import restore_expired_mirror_detail
 from .node_identity import NodeIdentityStore
 from .peer_protocol import (
     CAPABILITIES,
@@ -30,9 +31,11 @@ from .peer_protocol import (
     MAX_WORKSPACE_CHUNK_BYTES,
     PROTOCOL_VERSION,
     SESSION_EFFORT_CAPABILITY,
+    TOOL_DETAIL_EVENT_TYPES,
     AckRequestResult,
     ArtifactRef,
     DeliverySource,
+    EventsResult,
     HelloResult,
     NodeOutboxStatus,
     NodeRef,
@@ -747,6 +750,8 @@ class DirectPeerService:
                         "this event is already routed to a different parent",
                     )
                 return {"mirror_seq": mirror_seq, "duplicate": True}
+            if origin_event["type"] in TOOL_DETAIL_EVENT_TYPES:
+                restore_expired_mirror_detail(db, mirror_seq, origin_event, result=normalized.get("result"))
             receipt: dict[str, Any] = {
                 "event": {"ref": event["ref"], "seq": event["seq"], "type": event["type"]},
                 "status": "received",
@@ -2357,22 +2362,28 @@ class DirectPeerService:
             response["summary"] = summary
         return response
 
-    def _events(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _events(self, params: dict[str, Any]) -> EventsResult:
         store = self._require_store(self._store)
         after = params.get("after", 0)
         limit = params.get("limit", MAX_PAGE_LIMIT)
-        if isinstance(after, bool) or not isinstance(after, int) or after < 0:
-            raise peer_error(PeerErrorCode.INVALID_PARAMS, "after must be a non-negative integer")
+        include_tool_events = params.get("include_tool_events", True)
+        if type(after) is not int or not 0 <= after <= 2**63 - 1:
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "after must be a non-negative 64-bit integer")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "limit must be a positive integer")
+        if not isinstance(include_tool_events, bool):
+            raise peer_error(PeerErrorCode.INVALID_PARAMS, "include_tool_events must be a boolean")
         limit = min(limit, MAX_PAGE_LIMIT)
-        rows = store.events(after, limit=limit + 1, exclude_mirrored=True)
-        if not rows:
-            return {"items": [], "cursor": after, "has_more": False}
-        has_more = len(rows) > limit
-        rows = rows[:limit]
-        identity = self._identity.load_or_create()
+        rows, scanned_through = store.peer_events_page(after, limit, include_tool_events=include_tool_events)
         items: list[PeerEvent] = []
+        result: EventsResult = {
+            "items": items, "cursor": rows[-1]["seq"] if rows else after, "has_more": scanned_through is None,
+        }
+        if scanned_through is not None:
+            result["scanned_through"] = scanned_through
+        if not rows:
+            return result
+        identity = self._identity.load_or_create()
         for row in rows:
             local_id = row.get("task_id") or row.get("session_id") or row.get("attempt_id") or str(row["seq"])
             items.append(
@@ -2389,8 +2400,7 @@ class DirectPeerService:
                     "created": row["created"],
                 }
             )
-        cursor = items[-1]["seq"] if items else after
-        return {"items": items, "cursor": cursor, "has_more": has_more}
+        return result
 
 
 # ---------------------------------------------------------------- coordinator manual resolution (design 3.8)

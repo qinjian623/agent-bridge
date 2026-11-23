@@ -1,13 +1,16 @@
 import hashlib
 import json
 import tempfile
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from agent_bridge.broker import Broker, EventMirror
 from agent_bridge.config import Config, Profile
 from agent_bridge.hosts import HostConfig
+from agent_bridge.mirror_prune import expire_mirror_details
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.notifications import deliver
 from agent_bridge.peer_api import DirectPeerService
@@ -142,7 +145,7 @@ class EventMirrorTests(MirrorTestCase):
         processed = await mirror.run_once(HOST_A)
 
         self.assertEqual(1, processed)
-        self.assertEqual([{"after": 0, "limit": 100}], client.event_params)
+        self.assertEqual([{"after": 0, "limit": 100, "include_tool_events": False}], client.event_params)
         self.assertEqual(18, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
         mirrored = self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, 18)
         self.assertEqual(fingerprint(item), mirrored["fingerprint"])
@@ -189,6 +192,93 @@ class EventMirrorTests(MirrorTestCase):
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM mirrored_parent_notifications").fetchone()[0])
             self.assertEqual(1, db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+
+    async def test_empty_and_full_exhausted_pages_advance_past_filtered_events(self):
+        client = FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [
+            {"items": [], "cursor": 0, "has_more": False, "scanned_through": 25},
+            {"items": [], "cursor": 25, "has_more": False, "scanned_through": 25},
+            {"items": [event(seq=26)], "cursor": 26, "has_more": False, "scanned_through": 40},
+        ])
+        mirror = self.mirror({HOST_A: client})
+
+        self.assertEqual(0, await mirror.run_once(HOST_A))
+        self.assertEqual(25, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+        with patch.object(self.store, "advance_peer_event_cursor") as advance:
+            self.assertEqual(0, await mirror.run_once(HOST_A))
+            advance.assert_not_called()
+        self.assertEqual(1, await mirror.run_once(HOST_A))
+        self.assertEqual(40, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+        self.assertEqual([0, 25, 25], [params["after"] for params in client.event_params])
+        self.assertIsNotNone(self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, 26))
+
+    async def test_malformed_or_incomplete_pages_never_use_the_scan_marker(self):
+        rejected_pages = [
+            {"items": {}, "cursor": 0, "has_more": False, "scanned_through": 50},
+            {"items": [], "cursor": True, "has_more": False, "scanned_through": 50},
+            {"items": [], "cursor": 2, "has_more": False, "scanned_through": 50},
+            {"items": [], "cursor": 0, "scanned_through": 50},
+            {"items": [], "cursor": 0, "has_more": True, "scanned_through": 50},
+            {"items": [], "cursor": 0, "has_more": False, "scanned_through": True},
+            {"items": [], "cursor": 0, "has_more": False, "scanned_through": 2**63},
+        ]
+        client = FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [
+            *rejected_pages,
+            {"items": [event(seq=2), event(seq=1)], "cursor": 1, "has_more": False, "scanned_through": 50},
+            {"items": [event(seq=2), {"seq": 3}], "cursor": 3, "has_more": False, "scanned_through": 50},
+        ])
+        mirror = self.mirror({HOST_A: client})
+        for page in rejected_pages:
+            with self.subTest(page=page):
+                self.assertEqual(0, await mirror.run_once(HOST_A))
+                self.assertEqual(0, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+
+        # An out-of-order page can't advance even to the accepted first event.
+        self.assertEqual(1, await mirror.run_once(HOST_A))
+        self.assertEqual(0, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+        # A valid prefix can advance normally, but the malformed item blocks the scan marker.
+        self.assertEqual(1, await mirror.run_once(HOST_A))
+        self.assertEqual(2, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+
+    async def test_failed_notification_is_retried_before_skipping_the_scanned_tail(self):
+        self.store.register_parent_route(HOST_A, NODE_A, GEN_A, "routed", self.local_parent())
+        routed = event(seq=18, local_id="routed")
+        client = FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [
+            {"items": [event(seq=17), routed], "cursor": 18, "has_more": False, "scanned_through": 25},
+            {"items": [routed], "cursor": 18, "has_more": False, "scanned_through": 25},
+        ])
+        mirror = self.mirror({HOST_A: client})
+
+        with patch.object(mirror, "_notify_local", side_effect=RuntimeError("fixture delivery failure")):
+            self.assertEqual(1, await mirror.run_once(HOST_A))
+        self.assertEqual(17, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+        self.assertEqual(1, await mirror.run_once(HOST_A))
+        self.assertEqual(25, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+        with self.store.connection() as db:
+            self.assertEqual(2, db.execute("SELECT COUNT(*) FROM peer_event_mirrors").fetchone()[0])
+            self.assertEqual(1, db.execute("SELECT COUNT(*) FROM mirrored_parent_notifications").fetchone()[0])
+
+    async def test_legacy_source_tools_are_filtered_by_default_and_preserved_on_opt_in(self):
+        self.registry.configs[HOST_B] = replace(self.registry.configs[HOST_B], mirror_tool_events=True)
+        clients = {}
+        for host, node, generation in ((HOST_A, NODE_A, GEN_A), (HOST_B, NODE_B, GEN_B)):
+            items = [event(host, node, generation, seq, event_type=kind) for seq, kind in enumerate(
+                ("tool_started", "tool_completed", "usage_updated", "task_finished"), start=1,
+            )]
+            clients[host] = FakeClient({"node_id": node, "state_generation": generation}, [
+                {"items": items, "cursor": 4, "has_more": False},
+            ])
+        mirror = self.mirror(clients)
+
+        self.assertEqual(4, await mirror.run_once(HOST_A))
+        self.assertEqual(4, await mirror.run_once(HOST_B))
+        self.assertEqual(4, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+        self.assertEqual(4, self.store.get_peer_event_cursor(HOST_B, NODE_B, GEN_B))
+        self.assertIs(False, clients[HOST_A].event_params[0]["include_tool_events"])
+        self.assertIs(True, clients[HOST_B].event_params[0]["include_tool_events"])
+        self.assertEqual([False, False, True, True], [
+            self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, seq) is not None for seq in range(1, 5)
+        ])
+        self.assertTrue(all(self.store.get_mirrored_event(HOST_B, NODE_B, GEN_B, seq) for seq in range(1, 5)))
 
     async def test_mirrored_notices_name_the_remote_host_task_and_outcome(self):
         parent_ref = self.local_parent()
@@ -294,6 +384,39 @@ class EventMirrorTests(MirrorTestCase):
         self.assertEqual(parent_ref, json.loads(row["parent_ref"]))
         self.assertEqual(18, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
 
+    async def test_late_remote_parent_receipt_restores_detail_expired_during_send(self):
+        self.registry.configs[HOST_A] = replace(self.registry.configs[HOST_A], mirror_tool_events=True)
+        item = event(event_type="tool_completed", payload={"detail": "x" * 700})
+        page = {"items": [item], "cursor": 18, "has_more": False}
+        source = FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [page, page])
+        parent = FakeClient({"node_id": NODE_B, "state_generation": GEN_B})
+        mirror = self.mirror({HOST_A: source, HOST_B: parent})
+        self.assertEqual(1, await mirror.run_once(HOST_A))
+
+        parent_ref = self.remote_parent()
+        self.store.register_parent_route(HOST_A, NODE_A, GEN_A, "remote-task", parent_ref)
+        local_seq = self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, 18)["local_seq"]
+        old = time.time() - 31 * 86400
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE events SET created=? WHERE seq=?", (old, local_seq))
+            db.execute("UPDATE peer_event_mirrors SET created=? WHERE local_seq=?", (old, local_seq))
+
+        notify_parent = parent.notify_parent
+
+        async def notify_with_expiry(params):
+            report = expire_mirror_details(self.store.path, apply=True)
+            self.assertEqual(1, report["expired_mirrors"])
+            return await notify_parent(params)
+
+        with patch.object(parent, "notify_parent", notify_with_expiry):
+            self.assertEqual(1, await mirror.run_once(HOST_A))
+        with self.store.connection() as db:
+            data = json.loads(db.execute("SELECT data FROM events WHERE seq=?", (local_seq,)).fetchone()[0])
+            receipt = db.execute("SELECT status FROM mirrored_parent_notifications WHERE local_seq=?", (local_seq,)).fetchone()
+        self.assertEqual(item["payload"], data["payload"])
+        self.assertEqual("sent", receipt["status"])
+        self.assertEqual(1, len(parent.notified))
+
     async def test_fingerprint_conflict_pauses_the_source_without_overwriting(self):
         with self.store.connection(write=True) as db:
             local_seq = db.execute("INSERT INTO events(kind,data,created) VALUES('old','{}',1)").lastrowid
@@ -355,7 +478,7 @@ class EventMirrorTests(MirrorTestCase):
             existing_seq = db.execute("INSERT INTO events(kind,data,created) VALUES('old','{}',1)").lastrowid
         self.store.mirror_peer_event(HOST_A, NODE_A, GEN_A, 2, "different", existing_seq)
         client = FakeClient({"node_id": NODE_A, "state_generation": GEN_A}, [
-            {"items": [good, bad], "cursor": 2, "has_more": False},
+            {"items": [good, bad], "cursor": 2, "has_more": False, "scanned_through": 50},
         ])
         await self.mirror({HOST_A: client}).run_once(HOST_A)
         self.assertEqual(1, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))

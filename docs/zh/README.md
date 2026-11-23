@@ -83,6 +83,6 @@ agent-bridge call agent_control --json '{"session_id":"<session_id>","action":"c
 
 再次查询，确认该会话的 worker 已退出。在 broker 终端按 Ctrl+C 可以停止 broker；独立 worker 需要单独取消任务或关闭会话。关闭会话会保留历史与工作目录。
 
-[配置与故障排查](getting-started.md) · [卸载](uninstall.md) · [设计](design.md) · [参与贡献](CONTRIBUTING.md) · [安全](SECURITY.md) · [检查与限制](production-readiness.md) · [隐私](privacy.md) · [变更](CHANGELOG.md)
+[配置与故障排查](getting-started.md) · [远程节点与事件记录](dynamic-hosts.md) · [卸载](uninstall.md) · [设计](design.md) · [参与贡献](CONTRIBUTING.md) · [安全](SECURITY.md) · [检查与限制](production-readiness.md) · [隐私](privacy.md) · [变更](CHANGELOG.md)
 
 采用 [Apache-2.0](../../LICENSE) 许可证。

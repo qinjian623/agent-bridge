@@ -37,6 +37,7 @@ class HostConfig:
     ssh_options: tuple[str, ...] = field(default_factory=tuple)  # extra -o options, whitelist-checked
     pull_interval: float = 2.0  # peer.pull_requests cadence (design 2.2)
     projects: dict[str, str] = field(default_factory=dict)  # project_id -> remote absolute path (ADR-11)
+    mirror_tool_events: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +100,7 @@ def _parse_host(host_id: str, raw: Mapping[str, object]) -> HostConfig:
         "ssh_options",
         "pull_interval",
         "projects",
+        "mirror_tool_events",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -141,6 +143,10 @@ def _parse_host(host_id: str, raw: Mapping[str, object]) -> HostConfig:
     ):
         raise BridgeError("invalid_config", f"Host {host_id!r} projects must map project ids to paths")
 
+    mirror_tool_events = raw.get("mirror_tool_events", False)
+    if not isinstance(mirror_tool_events, bool):
+        raise BridgeError("invalid_config", f"Host {host_id!r} mirror_tool_events must be a boolean")
+
     return HostConfig(
         host_id=host_id,
         ssh_target=ssh_target,
@@ -150,6 +156,7 @@ def _parse_host(host_id: str, raw: Mapping[str, object]) -> HostConfig:
         ssh_options=tuple(raw_options),
         pull_interval=float(pull_interval),
         projects=dict(projects),
+        mirror_tool_events=mirror_tool_events,
     )
 
 

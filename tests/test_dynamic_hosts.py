@@ -159,6 +159,18 @@ class DynamicHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(), self.retired_hosts())
         self.assertIs(previous_status, self.broker.host_registry.status("gpu-a")[0])
 
+    async def test_tool_event_policy_can_change_while_a_host_is_referenced(self):
+        groups.control_group(self.broker.store, "team", "create", 0, "create-team", remote_members=[{
+            "host_id": "gpu-a", "node_id": "node-gpu-a", "state_generation": "generation-gpu-a",
+            "target_kind": "bridge", "session_id": "remote-session",
+        }])
+        self.broker.store.advance_peer_event_cursor("gpu-a", "node-gpu-a", "generation-gpu-a", 17)
+        self.write_hosts({"gpu-a": host("gpu-a", mirror_tool_events=True)})
+        self.assert_changes(await self.broker.reload_hosts(), updated=["gpu-a"])
+        self.assertTrue(self.broker.host_registry.get("gpu-a").mirror_tool_events)
+        self.assertEqual(17, self.broker.store.get_peer_event_cursor("gpu-a", "node-gpu-a", "generation-gpu-a"))
+        self.factory.client.assert_not_called()
+
     async def test_reload_with_host_filter_never_waits_for_its_own_host_lock(self):
         for args in ({"host_id": "gpu-a"}, {"remote_members": [{"host_id": "gpu-a"}]}):
             with self.subTest(args=args):

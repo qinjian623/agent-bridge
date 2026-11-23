@@ -2,6 +2,15 @@
 
 # Changes
 
+## 0.3.6 — 2026-11-23
+
+- Advance remote event cursors across filtered history and keep tool details at the source by default.
+- Add previewable expiration of older mirrored tool details while preserving notification references and replay keys.
+
+## 0.3.5 — 2026-11-23
+
+- Reduce idle CPU in brokers, relays, and workers on Linux and macOS.
+
 ## 0.3.4 — 2026-11-22
 
 - Reduce idle broker CPU by checking for tasks every 500 ms and reusing the scheduler's SQLite connection.

@@ -8,11 +8,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_bridge import mirror_prune
+from agent_bridge import mirror_prune, update_guard
 from agent_bridge.cli import build_parser, main
 from agent_bridge.config import Profile
 from agent_bridge.errors import BridgeError
@@ -139,6 +140,115 @@ class MirrorPruneTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name)
         self.store = Store(self.state)
+
+    def _retention_mirror(self, *, created=100.0, **event):
+        origin = _raw_event(created=created, payload={"blob": "细节" * 512}, **event)
+        source = origin["ref"]
+        fingerprint = hashlib.sha256(encode(origin).encode("utf-8")).hexdigest()
+        local_seq = _insert_legacy_mirror(
+            self.store, origin, origin_node_id=source["node_id"],
+            origin_state_generation=source["state_generation"], origin_seq=origin["seq"],
+            origin_fingerprint=fingerprint,
+        )
+        with self.store.connection(write=True) as db:
+            db.execute("UPDATE events SET created=? WHERE seq=?", (created, local_seq))
+        return local_seq, origin
+
+    def test_expiration_only_trims_old_verified_tool_mirrors_covered_by_a_cursor(self):
+        eligible, _ = self._retention_mirror(seq=1, kind="tool_started")
+        self._retention_mirror(seq=2, created=time.time())
+        self._retention_mirror(seq=3, kind="task_finished")
+        self._retention_mirror(seq=4, generation="other-generation")
+        delivery, _ = self._retention_mirror(seq=5)
+        receipt, _ = self._retention_mirror(seq=6)
+        native, _ = self._retention_mirror(seq=7)
+        invalid, _ = self._retention_mirror(seq=8)
+        self._retention_mirror(seq=9)
+        self.store.advance_peer_event_cursor(HOST_A, NODE_A, GEN_A, 8)
+        with self.store.connection(write=True) as db:
+            self.store.event(db, "tool_completed", {"blob": "local original"})
+            db.execute("INSERT INTO parents(id,runtime,native_id,cwd) VALUES('parent','codex','native','.')")
+            db.execute("INSERT INTO deliveries(event_seq,parent_id) VALUES(?,'parent')", (delivery,))
+            db.execute(
+                "INSERT INTO mirrored_parent_notifications(local_seq,parent_ref,operation_id,status,updated) "
+                "VALUES(?,'{}','operation','sent',100)", (receipt,),
+            )
+            db.execute(
+                "INSERT INTO native_send_queue(id,runtime,native_id,local_seq,delivery_source,delivery_id,message,created) "
+                "VALUES('queue','codex','native',1,'parent_notification',?,'message',100)", (str(native),),
+            )
+            db.execute("UPDATE peer_event_mirrors SET origin_fingerprint='other' WHERE local_seq=?", (invalid,))
+        before = {row["seq"]: row["data"] for row in self.store.events()}
+
+        applied = mirror_prune.expire_mirror_details(self.store.path, apply=True)
+
+        self.assertEqual((9, 1, 1), (applied["scanned_mirrors"], applied["eligible_mirrors"], applied["expired_mirrors"]))
+        after = {row["seq"]: row["data"] for row in self.store.events()}
+        compact = {**before[eligible], "_mirror_detail_expired": True}
+        del compact["payload"]
+        self.assertEqual({**before, eligible: compact}, after)
+        self.assertEqual(len(encode(before[eligible]).encode()) - len(encode(compact).encode()),
+                         applied["reclaimable_data_bytes"])
+        self.assertEqual(8, self.store.get_peer_event_cursor(HOST_A, NODE_A, GEN_A))
+        self.assertEqual(0, mirror_prune.expire_mirror_details(self.store.path, apply=True)["expired_mirrors"])
+
+    def test_expired_detail_retains_replay_keys_and_restores_only_matching_origin(self):
+        local_seq, origin = self._retention_mirror(seq=1)
+        self.store.advance_peer_event_cursor(HOST_A, NODE_A, GEN_A, 1)
+        keys = self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, 1)
+        mirror_prune.expire_mirror_details(self.store.path, apply=True)
+        self.assertEqual(keys, self.store.get_mirrored_event(HOST_A, NODE_A, GEN_A, 1))
+        self.assertEqual(keys, self.store.get_mirrored_event_by_origin(NODE_A, GEN_A, 1))
+        self.assertEqual(0, self.store.prune_duplicate_mirrors(dry_run=False)["repaired_origins"])
+
+        with self.store.connection(write=True) as db:
+            with self.assertRaises(BridgeError) as conflict:
+                mirror_prune.restore_expired_mirror_detail(db, local_seq, {**origin, "payload": {"changed": True}})
+            self.assertEqual("operation_conflict", conflict.exception.code)
+            self.assertTrue(self.store.events()[0]["data"]["_mirror_detail_expired"])
+            self.assertTrue(mirror_prune.restore_expired_mirror_detail(db, local_seq, origin, result={"ok": True}))
+            db.execute(
+                "INSERT INTO mirrored_parent_notifications(local_seq,parent_ref,operation_id,status,updated) "
+                "VALUES(?,'{}','late-operation','received',100)", (local_seq,),
+            )
+        restored = self.store.events()[0]["data"]
+        self.assertEqual(origin["payload"], restored["payload"])
+        self.assertEqual({"ok": True}, restored["result"])
+        self.assertNotIn("_mirror_detail_expired", restored)
+        self.assertEqual(0, mirror_prune.expire_mirror_details(self.store.path, apply=True)["expired_mirrors"])
+
+    def test_cli_expiration_previews_by_default_and_apply_respects_maintenance(self):
+        first, _ = self._retention_mirror(seq=1)
+        second, _ = self._retention_mirror(seq=2)
+        self.store.advance_peer_event_cursor(HOST_A, NODE_A, GEN_A, 2)
+        args = ["--state", str(self.state), "mirrors", "expire", "--limit", "1"]
+        lease = update_guard.prepare(self.state, lambda _: {"busy": False})
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                main(args)
+            preview = json.loads(stdout.getvalue())
+            self.assertTrue(preview["dry_run"])
+            self.assertEqual(1, preview["eligible_mirrors"])
+            self.assertEqual(0, preview["expired_mirrors"])
+            self.assertEqual(first, preview["next_after"])
+            self.assertTrue(preview["has_more"])
+            with contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit):
+                main(args + ["--apply"])
+            self.assertEqual("update_busy", json.loads(stderr.getvalue())["error"]["code"])
+            self.assertTrue(all("payload" in row["data"] for row in self.store.events()))
+        finally:
+            update_guard.finish(self.state, lease["token"])
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            main(args + ["--after", str(first), "--apply"])
+        applied = json.loads(stdout.getvalue())
+        self.assertFalse(applied["dry_run"])
+        self.assertEqual(1, applied["expired_mirrors"])
+        self.assertEqual(second, applied["next_after"])
+        self.assertFalse(applied["has_more"])
+        retained, expired = self.store.events()
+        self.assertIn("payload", retained["data"])
+        self.assertTrue(expired["data"]["_mirror_detail_expired"])
 
     def test_dry_run_is_non_mutating_and_reports_accurate_plan(self):
         identity = FileNodeIdentityStore(self.state).load_or_create()

@@ -9,6 +9,7 @@ import socket
 import sys
 import unicodedata
 import uuid
+from contextlib import nullcontext
 
 from .config import Config, broker_socket_path, resolve_state_directory, state_directory
 from .errors import BridgeError
@@ -181,7 +182,7 @@ def build_parser():
     group_prune.add_argument(
         "--dry-run", action="store_true", help=_('Only report eligible and blocked groups; do not delete'),
     )
-    mirrors = commands.add_parser("mirrors", help=_('Inspect and prune duplicated peer event mirror history'))
+    mirrors = commands.add_parser("mirrors", help=_('Inspect and maintain peer event mirrors'))
     mirrors_commands = mirrors.add_subparsers(dest="mirrors_command", required=True)
     mirrors_prune = mirrors_commands.add_parser(
         "prune", help=_('Deduplicate mirrored peer events while keeping deliveries, notifications, and cursors intact'),
@@ -203,6 +204,13 @@ def build_parser():
     mirrors_prune.add_argument(
         "--batch-size", type=int, default=500, help=_('Maximum rows processed per read/delete batch (default: 500)'),
     )
+    mirrors_expire = mirrors_commands.add_parser(
+        "expire", help=_('Expire old mirrored tool details while keeping event identities and references'),
+    )
+    mirrors_expire.add_argument("--days", type=int, default=30, help=_('Age in days before details can expire (default: 30)'))
+    mirrors_expire.add_argument("--limit", type=int, default=500, help=_('Maximum mirrors scanned in one batch (default: 500)'))
+    mirrors_expire.add_argument("--after", type=int, default=0, help=_('Start after this local event sequence (default: 0)'))
+    mirrors_expire.add_argument("--apply", action="store_true", help=_('Expire eligible details (default: preview only)'))
     name_cmd = commands.add_parser("name", help=_('Set human-friendly alias name for a session'))
     name_cmd.add_argument("session_id", help=_('Session ID (prefix or full UUID)'))
     name_cmd.add_argument("name", help=_('Human-readable alias name'))
@@ -273,7 +281,20 @@ def _main(argv: list[str]):
                     repair_origins=not args.no_repair_origins,
                     vacuum=args.vacuum,
                 )
-                print(json.dumps(result, indent=2, ensure_ascii=False))
+            else:
+                import sqlite3
+
+                from . import update_guard
+                from .mirror_prune import expire_mirror_details
+
+                try:
+                    with update_guard.operation(state) if args.apply else nullcontext():
+                        result = expire_mirror_details(
+                            state / "bridge.sqlite", days=args.days, limit=args.limit, after=args.after, apply=args.apply,
+                        )
+                except sqlite3.Error as error:
+                    raise BridgeError("mirror_expiration_failed", str(error)) from error
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         elif args.command == "init":
             print(json.dumps(run_init(state, args), ensure_ascii=False, indent=2))
         elif args.command == "serve":

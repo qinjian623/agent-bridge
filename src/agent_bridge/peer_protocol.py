@@ -21,6 +21,7 @@ MAX_FRAME_BYTES = 1 << 20  # one JSONL frame; larger payloads must be Artifact r
 MAX_PAGE_LIMIT = 100
 INLINE_RESULT_BYTES = 16 * 1024  # results above this are returned as ArtifactRef only
 SESSION_EFFORT_CAPABILITY = "session_effort_v1"
+TOOL_DETAIL_EVENT_TYPES = ("tool_started", "tool_completed")
 CAPABILITIES = (
     "groups_v1",
     "ordered_delivery_v1",
@@ -522,6 +523,7 @@ class ReviewResult(TypedDict):
 class EventsParams(TypedDict):
     after: int
     limit: NotRequired[int]
+    include_tool_events: NotRequired[bool]  # defaults to true for existing and on-demand clients
 
 
 class PeerEvent(TypedDict):
@@ -534,6 +536,7 @@ class PeerEvent(TypedDict):
 
 class EventsResult(Page):
     items: list[PeerEvent]
+    scanned_through: NotRequired[int]  # last visible sequence in the snapshot, only on an exhausted page
 
 
 class ResultParams(TypedDict):

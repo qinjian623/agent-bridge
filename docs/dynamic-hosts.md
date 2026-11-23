@@ -41,3 +41,16 @@ Inspect `peer.hello` and `peer.inspect(kind=node)` over an explicit SSH target b
 - Changing only SSH connection fields for the same identity does not bypass an `EventMirror` fingerprint-conflict pause; explicit re-pinning or removal clears transient pause flags while keeping historical fingerprints and durable cursors intact.
 
 Known limitation: historical parent routes from a retired `state_generation` lack explicit retirement proofs and may block later removal if reusing the exact same `host_id` for a different `node_id`—assign a fresh `host_id` when provisioning replacement nodes rather than force-deleting safety checks.
+
+## Remote event history
+
+Background polling copies task and session events and skips individual tool starts and completions. To mirror future tool events from a specific node, set `mirror_tool_events: true` under its `hosts` entry. This setting can change on a registered host with active references. Polling resumes at the saved cursor. For earlier details, use `agent_wait` on the source node with the task ID and an independent cursor.
+
+Preview expiration of old mirrored tool payloads, then apply it explicitly on the machine storing the copies:
+
+```bash
+agent-bridge mirrors expire --days 30 --limit 500
+agent-bridge mirrors expire --days 30 --limit 500 --apply
+```
+
+Each call checks one page. When `has_more` is true, pass `next_after` as `--after` to continue that pass. Expiration requires the saved peer cursor to cover the event. It keeps the local sequence, source identity, timestamps and fingerprints, and preserves data referenced by notifications, deliveries or native sends. A valid late notification can restore its exact payload. Use the upgraded release to handle notifications after applying expiration. Source events are unaffected. SQLite can reuse freed space without an automatic VACUUM.

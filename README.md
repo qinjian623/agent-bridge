@@ -83,6 +83,6 @@ agent-bridge call agent_control --json '{"session_id":"<session_id>","action":"c
 
 Check the session again until its worker has exited. Pressing Ctrl+C in the broker terminal stops the broker; independent workers require their own cancellation or close. Closing a session preserves its history and working directory.
 
-[Configuration and troubleshooting](docs/getting-started.md) · [Uninstall](docs/uninstall.md) · [Design](docs/design.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Checks and limits](docs/production-readiness.md) · [Privacy](docs/privacy.md) · [Changes](CHANGELOG.md)
+[Configuration and troubleshooting](docs/getting-started.md) · [Remote hosts and event history](docs/dynamic-hosts.md) · [Uninstall](docs/uninstall.md) · [Design](docs/design.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Checks and limits](docs/production-readiness.md) · [Privacy](docs/privacy.md) · [Changes](CHANGELOG.md)
 
 Licensed under [Apache-2.0](LICENSE).

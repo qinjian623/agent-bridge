@@ -5,20 +5,25 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .errors import BridgeError
 from .node_identity import IDENTITY_FILENAME, FileNodeIdentityStore
-from .peer_protocol import DeliverySource, PeerErrorCode, peer_error, unwrap_peer_event
+from .peer_protocol import TOOL_DETAIL_EVENT_TYPES, DeliverySource, PeerErrorCode, peer_error, unwrap_peer_event
 from .store import encode
 
 if TYPE_CHECKING:
     from .store import Store
 
 _SQL_VAR_CHUNK = 400
+_EXPIRED_DETAIL = "_mirror_detail_expired"
+_EXPIRED_DETAIL_PREFIX = '{"_mirror_detail_expired":true,'
+_MIRROR_ENVELOPE = {"source", "remote_seq", "type", "payload", "created"}
 _PROTECTED_SQL = (
     "EXISTS (SELECT 1 FROM deliveries d WHERE d.event_seq=m.local_seq) "
     "OR EXISTS (SELECT 1 FROM mirrored_parent_notifications n WHERE n.local_seq=m.local_seq) "
@@ -148,7 +153,7 @@ def _create_plan_db() -> sqlite3.Connection:
 
 def _origin_for_row(store: Store, row: sqlite3.Row, *, repair_origins: bool) -> tuple[str, str, int, str]:
     if (
-        not repair_origins
+        (not repair_origins or _has_expired_detail(row["data"]))
         and row["origin_node_id"] is not None
         and row["origin_state_generation"] is not None
         and row["origin_seq"] is not None
@@ -161,6 +166,120 @@ def _origin_for_row(store: Store, row: sqlite3.Row, *, repair_origins: bool) -> 
             row["origin_fingerprint"],
         )
     return store._origin_mirror_values(row, force=repair_origins)
+
+
+def _has_expired_detail(data: Any) -> bool:
+    return isinstance(data, str) and data.startswith(_EXPIRED_DETAIL_PREFIX)
+
+
+def _expired_detail(row: sqlite3.Row) -> str | None:
+    if _has_expired_detail(row["data"]):
+        return None
+    try:
+        data = json.loads(row["data"])
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or data.keys() != _MIRROR_ENVELOPE:
+        return None
+    source = data["source"]
+    if (
+        not isinstance(source, dict)
+        or (source.get("node_id"), source.get("state_generation"), data["remote_seq"])
+        != (row["origin_node_id"], row["origin_state_generation"], row["origin_seq"])
+        or data["type"] != row["kind"]
+        or not isinstance(data["payload"], dict)
+    ):
+        return None
+    origin_event = {
+        "ref": source, "seq": data["remote_seq"], "type": data["type"],
+        "payload": data["payload"], "created": data["created"],
+    }
+    try:
+        fingerprint = hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest()
+    except (RecursionError, UnicodeError):
+        return None
+    if fingerprint != row["origin_fingerprint"]:
+        return None
+    del data["payload"]
+    data[_EXPIRED_DETAIL] = True
+    return encode(data)
+
+
+def restore_expired_mirror_detail(db, local_seq: int, origin_event: dict[str, Any], *, result=None) -> bool:
+    """Restore a verified detail before adding a late notification reference in the same transaction."""
+    row = db.execute(
+        "SELECT m.origin_fingerprint FROM events e JOIN peer_event_mirrors m ON m.local_seq=e.seq "
+        "WHERE e.seq=? AND SUBSTR(e.data,1,?)=?",
+        (local_seq, len(_EXPIRED_DETAIL_PREFIX), _EXPIRED_DETAIL_PREFIX),
+    ).fetchone()
+    if row is None:
+        return False
+    if hashlib.sha256(encode(origin_event).encode("utf-8")).hexdigest() != row["origin_fingerprint"]:
+        raise peer_error(PeerErrorCode.OPERATION_CONFLICT, "remote event was mirrored with different content")
+    data = {
+        "source": origin_event["ref"], "remote_seq": origin_event["seq"], "type": origin_event["type"],
+        "payload": origin_event["payload"], "created": origin_event["created"],
+    }
+    if result is not None:
+        data["result"] = result
+    db.execute("UPDATE events SET data=? WHERE seq=?", (encode(data), local_seq))
+    return True
+
+
+def expire_mirror_details(
+    database: Path, *, days: int = 30, limit: int = 500, after: int = 0, apply: bool = False,
+) -> dict[str, Any]:
+    """Expire at most one page of old tool mirror details while keeping replay keys and event sequences."""
+    if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "days must be a positive integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "limit must be an integer from 1 to 500")
+    if isinstance(after, bool) or not isinstance(after, int) or not 0 <= after < 2**63:
+        raise peer_error(PeerErrorCode.INVALID_PARAMS, "after must be a non-negative SQLite sequence")
+    now = time.time()
+    retention_seconds = days * 86_400
+    cutoff = 0.0 if retention_seconds >= now else now - retention_seconds
+    uri = database.resolve().as_uri() + ("?mode=rw" if apply else "?mode=ro")
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=2)) as db, db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
+        seqs = [row[0] for row in db.execute(
+            "SELECT local_seq FROM peer_event_mirrors WHERE local_seq>? ORDER BY local_seq LIMIT ?",
+            (after, limit + 1),
+        )]
+        page = seqs[:limit]
+        next_after = page[-1] if page else after
+        updates = []
+        reclaimable_bytes = 0
+        if page:
+            kinds = ",".join("?" for _ in TOOL_DETAIL_EVENT_TYPES)
+            # Visit only this page of mirrors even when local event sequences are sparse.
+            rows = db.execute(
+                "SELECT m.local_seq,m.origin_node_id,m.origin_state_generation,m.origin_seq,m.origin_fingerprint,"
+                "e.kind,e.data FROM peer_event_mirrors m CROSS JOIN events e ON e.seq=m.local_seq "
+                "JOIN peer_event_cursors c ON c.host_id=m.host_id AND c.node_id=m.node_id "
+                "AND c.state_generation=m.state_generation AND c.after_seq>=m.remote_seq "
+                f"WHERE m.local_seq>? AND m.local_seq<=? AND e.kind IN ({kinds}) "
+                "AND m.created<? AND e.created<? AND e.session_id IS NULL AND e.task_id IS NULL "
+                "AND e.attempt_id IS NULL AND m.origin_fingerprint IS NOT NULL AND NOT (" + _PROTECTED_SQL + ")",
+                (after, next_after, *TOOL_DETAIL_EVENT_TYPES, cutoff, cutoff, str(DeliverySource.PARENT_NOTIFICATION)),
+            )
+            for row in rows:
+                detail = _expired_detail(row)
+                if detail is not None:
+                    saved = len(row["data"].encode("utf-8")) - len(detail.encode("utf-8"))
+                    if saved > 0:
+                        updates.append((detail, row["local_seq"]))
+                        reclaimable_bytes += saved
+            if apply:
+                db.executemany("UPDATE events SET data=? WHERE seq=?", updates)
+    return {
+        "dry_run": not apply, "days": days, "cutoff": cutoff, "limit": limit,
+        "scanned_mirrors": len(page), "eligible_mirrors": len(updates),
+        "expired_mirrors": len(updates) if apply else 0,
+        "reclaimable_data_bytes": reclaimable_bytes,
+        "next_after": next_after, "has_more": len(seqs) > limit,
+    }
 
 
 def _origin_event_from_row(store: Store, row: sqlite3.Row) -> dict[str, Any] | None:

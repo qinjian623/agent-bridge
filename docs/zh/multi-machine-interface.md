@@ -31,6 +31,8 @@
 - 连接中断只能得到 `peer_host_offline`，**不得**转成任务失败；结果以 `peer.lookup_delivery` 查证为准。
 - `relay` 每帧重新检查配置；配置损坏或已加载文件被删除时拒绝执行请求。`peer.catalog` 保留 `entries`，生产入口同时返回 `profiles` 和 `discovery`，`refresh=true` 调用已有模型目录查询，失败通过 `stale/error` 表示。
 - 发件箱或事件连续三次返回空结果后，对应的轮询最多多等两秒（默认 `pull_interval` 从 2 秒增至 4 秒）。收到消息或查询失败后恢复配置的间隔。轮询前的 `peer.hello` 可用 `identity_only: true` 略过动态功能查询，仍验证节点身份和数据库的确认序号。
+- `peer.events` 最后一页可返回 `scanned_through`，表示同一 SQLite 快照里已检查到的最大序号。接收端验证并处理完该页后推进游标，空页也可推进。部分结果或未返回该字段的旧节点继续使用最后一条已处理事件的序号。
+- 事件轮询默认跳过 `tool_started` 和 `tool_completed`。对单个节点设置 `mirror_tool_events: true` 可同步其后续工具明细。旧客户端或按需查询未传 `include_tool_events` 时，源端仍返回工具明细。新版接收端也会过滤旧节点发来的工具明细。这些记录可在来源节点用 `agent_wait` 按本地任务 ID 和游标读取。
 - 自动更新切换 managed `current` 后，旧 relay 完整返回在途帧的响应再退出；静默等待输入的旧 relay 在下一帧到达时返回明确未执行错误后退出。后续请求通过固定入口启动新版，不自动重放结果不明的业务请求。
 - `peer.pull_requests` 按条数和完整 UTF-8 响应字节数共同分页。新单条请求大到无法容纳一帧时，在写入 outbox 前拒绝；历史超大记录报出对应 operation_id，不跳过或伪造 ACK。连接旧 relay 时协调端可减小读取页，最小为 1 条。
 

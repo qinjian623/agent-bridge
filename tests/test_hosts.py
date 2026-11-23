@@ -57,6 +57,7 @@ class ConfigHostParsingTests(unittest.TestCase):
                     "ssh_options": ["StrictHostKeyChecking=yes"],
                     "pull_interval": 5,
                     "projects": {"proj": "/srv/proj"},
+                    "mirror_tool_events": True,
                 },
                 "gpu-b": {
                     "host_id": "gpu-b",
@@ -77,6 +78,7 @@ class ConfigHostParsingTests(unittest.TestCase):
         self.assertEqual(gpu_a.ssh_options, ("StrictHostKeyChecking=yes",))
         self.assertEqual(gpu_a.pull_interval, 5.0)
         self.assertEqual(gpu_a.projects, {"proj": "/srv/proj"})
+        self.assertIs(True, gpu_a.mirror_tool_events)
 
         gpu_b = config.hosts["gpu-b"]
         self.assertIsNone(gpu_b.remote_state)
@@ -84,6 +86,7 @@ class ConfigHostParsingTests(unittest.TestCase):
         self.assertEqual(gpu_b.ssh_options, ())
         self.assertEqual(gpu_b.pull_interval, 2.0)
         self.assertEqual(gpu_b.projects, {})
+        self.assertIs(False, gpu_b.mirror_tool_events)
 
     def test_config_without_hosts_defaults_to_an_empty_mapping(self):
         self.config_path.write_text(
@@ -110,6 +113,8 @@ class ConfigHostParsingTests(unittest.TestCase):
             },
             {"gpu-a": {"ssh_target": "gpu-a", "remote_executable": "/bin/agent-bridge", "ssh_options": "-o"}},
             {"gpu-a": {"ssh_target": "gpu-a", "remote_executable": "/bin/agent-bridge", "pull_interval": 0}},
+            {"gpu-a": {"ssh_target": "gpu-a", "remote_executable": "/bin/agent-bridge", "mirror_tool_events": "true"}},
+            {"gpu-a": {"ssh_target": "gpu-a", "remote_executable": "/bin/agent-bridge", "mirror_tool_events": 1}},
         )
         for hosts in cases:
             with self.subTest(hosts=hosts):

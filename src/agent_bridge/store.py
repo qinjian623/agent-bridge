@@ -16,7 +16,14 @@ from .codex_parent import read_resume_config
 from .config import Config, Profile
 from .errors import BridgeError
 from .parent_usage import meter_usage, refresh_meter, start_meter
-from .peer_protocol import MAX_FRAME_BYTES, DeliverySource, PeerErrorCode, compute_stream_id, unwrap_peer_event
+from .peer_protocol import (
+    MAX_FRAME_BYTES,
+    TOOL_DETAIL_EVENT_TYPES,
+    DeliverySource,
+    PeerErrorCode,
+    compute_stream_id,
+    unwrap_peer_event,
+)
 
 
 def encode(value):
@@ -1953,6 +1960,13 @@ class Store:
     def events(self, after=0, session_id=None, task_id=None, limit=100, *, exclude_mirrored=False):
         if not isinstance(after, int) or after < 0:
             raise BridgeError("invalid_cursor", "Event cursor must be a nonnegative integer")
+        with self.connection() as db:
+            return self._event_rows(
+                db, after, session_id, task_id, limit, exclude_mirrored=exclude_mirrored,
+            )
+
+    @staticmethod
+    def _event_rows(db, after, session_id, task_id, limit, *, exclude_mirrored, include_tool_events=True):
         clauses, values = ["seq>?"], [after]
         for key, value in (("session_id", session_id), ("task_id", task_id)):
             if value:
@@ -1964,12 +1978,27 @@ class Store:
                 "NOT EXISTS (SELECT 1 FROM mirrored_parent_notifications n WHERE n.local_seq=events.seq)",
                 "kind!='peer_event_conflict'",
             ])
-        with self.connection() as db:
-            rows = db.execute(
-                "SELECT * FROM events WHERE " + " AND ".join(clauses) + " ORDER BY seq LIMIT ?",
-                (*values, min(limit, 200)),
-            ).fetchall()
+        if not include_tool_events:
+            clauses.append("kind NOT IN (?,?)")
+            values.extend(TOOL_DETAIL_EVENT_TYPES)
+        rows = db.execute(
+            "SELECT * FROM events WHERE " + " AND ".join(clauses) + " ORDER BY seq LIMIT ?",
+            (*values, min(limit, 200)),
+        ).fetchall()
         return [{**dict(row), "data": json.loads(row["data"])} for row in rows]
+
+    def peer_events_page(self, after, limit, *, include_tool_events):
+        with self.connection() as db:
+            # Read the tail in the same snapshot so a concurrently appended event cannot be skipped.
+            db.execute("BEGIN")
+            rows = self._event_rows(
+                db, after, None, None, limit + 1,
+                exclude_mirrored=True, include_tool_events=include_tool_events,
+            )
+            if len(rows) > limit:
+                return rows[:limit], None
+            upper = db.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()[0]
+            return rows, max(after, upper)
 
     # ---------------------------------------------------------------- multi-machine phase B storage
 

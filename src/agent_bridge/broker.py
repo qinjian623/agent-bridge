@@ -24,10 +24,12 @@ from .config import Config, Profile, broker_socket_path, read_admin_token, safe_
 from .discovery import ModelDirectory
 from .errors import BridgeError
 from .hosts import HOST_PINS_FILENAME, ConfigHostRegistry
+from .mirror_prune import restore_expired_mirror_detail
 from .peer_protocol import (
     MAX_WORKSPACE_CHUNK_BYTES,
     PROTOCOL_VERSION,
     SESSION_EFFORT_CAPABILITY,
+    TOOL_DETAIL_EVENT_TYPES,
     NodeRef,
     PeerDeliveryStatus,
     PeerErrorCode,
@@ -857,6 +859,7 @@ class EventMirror:
                 }
             )
             with self.store.connection(write=True) as db:
+                restore_expired_mirror_detail(db, local_seq, event)
                 db.execute(
                     "INSERT OR IGNORE INTO mirrored_parent_notifications"
                     "(local_seq,parent_ref,operation_id,status,receipt,updated) VALUES(?,?,?,?,?,?)",
@@ -924,11 +927,15 @@ class EventMirror:
         client = self._client(host_id)
         node = await self._node(host_id, client)
         cursor = self.store.get_peer_event_cursor(host_id, node.node_id, node.state_generation)
-        response = await client.events({"after": cursor, "limit": 100})
-        items = response.get("items") if isinstance(response, dict) else None
-        if not isinstance(items, list):
-            items = []
+        config = self._host_config(host_id)
+        include_tool_events = config.mirror_tool_events if config is not None else False
+        limit = 100
+        response = await client.events({"after": cursor, "limit": limit, "include_tool_events": include_tool_events})
+        if not isinstance(response, dict) or not isinstance(response.get("items"), list):
+            return 0
+        items = response["items"]
         processed = 0
+        first_seq = None
         last_seq = None
         local_key = self._local_node_key()
         for raw_event in items:
@@ -937,12 +944,19 @@ class EventMirror:
                 break
             source = event["ref"]
             remote_seq = event["seq"]
+            if last_seq is not None and remote_seq <= last_seq:
+                # An out-of-order page cannot establish a successfully processed prefix.
+                return processed
+            if first_seq is None:
+                first_seq = remote_seq
             origin_event, wrapped = unwrap_peer_event(event)
             origin_ref = origin_event["ref"]
             origin_seq = origin_event["seq"]
             if (
                 origin_ref["node_id"] == local_key[0]
                 or source["node_id"] == local_key[0]
+                # Legacy sources can return details even when the receiver opted out.
+                or not include_tool_events and origin_event["type"] in TOOL_DETAIL_EVENT_TYPES
             ):
                 last_seq = remote_seq
                 processed += 1
@@ -1040,8 +1054,19 @@ class EventMirror:
             self._last_errors.pop(f"notify:{host_id}", None)
             last_seq = remote_seq
             processed += 1
-        if last_seq is not None:
-            self.store.advance_peer_event_cursor(host_id, node.node_id, node.state_generation, last_seq)
+        page_cursor = last_seq if last_seq is not None else cursor
+        reported_cursor = response.get("cursor")
+        scanned_through = response.get("scanned_through")
+        if (
+            processed == len(items) <= limit
+            and (first_seq is None or first_seq > cursor)
+            and response.get("has_more") is False
+            and type(reported_cursor) is int and reported_cursor == page_cursor
+            and type(scanned_through) is int and page_cursor <= scanned_through <= 2**63 - 1
+        ):
+            page_cursor = scanned_through
+        if page_cursor > cursor:
+            self.store.advance_peer_event_cursor(host_id, node.node_id, node.state_generation, page_cursor)
         return processed
 
     async def _host_loop(self, config):
@@ -1501,7 +1526,12 @@ class Broker:
                 if not affected and not added:
                     self.host_reload_error = None
                     return {"added": [], "updated": [], "removed": []}
-                self._check_host_references(affected)
+                routing_changes = removed | {
+                    host_id for host_id in updated
+                    if replace(current[host_id], mirror_tool_events=candidates[host_id].mirror_tool_events)
+                    != candidates[host_id]
+                }
+                self._check_host_references(routing_changes)
                 self._hosts_changing.update(affected)
                 async with contextlib.AsyncExitStack() as stack:
                     for host_id in sorted(affected):
@@ -1510,8 +1540,8 @@ class Broker:
                     for component in (self.outbox_puller, self.event_mirror):
                         for host_id in sorted(affected):
                             await stack.enter_async_context(component._poll_locks.setdefault(host_id, asyncio.Lock()))
-                    self._check_host_references(affected)
-                    await self._check_host_parent_routes(affected)
+                    self._check_host_references(routing_changes)
+                    await self._check_host_parent_routes(routing_changes)
                     if self.host_registry.read_configured_hosts() != candidates:
                         raise BridgeError("config_changed", "Host configuration changed during refresh; retry")
                     if affected:
