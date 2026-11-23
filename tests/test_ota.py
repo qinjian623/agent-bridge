@@ -410,12 +410,12 @@ class WorkerRollingUpgradeTests(unittest.IsolatedAsyncioTestCase):
         orig_v1_begin = worker_v1.store.begin_attempt
         v1_claimed = False
 
-        def begin_attempt_v1(*args):
+        def begin_attempt_v1(*args, **kwargs):
             nonlocal v1_claimed
             if not v1_claimed:
                 v1_claimed = True
                 worker_v1.store.claim(self.config)
-            return orig_v1_begin(*args)
+            return orig_v1_begin(*args, **kwargs)
 
         worker_v1.store.begin_attempt = begin_attempt_v1
         orig_retire = worker_v1._should_retire_for_release
@@ -479,12 +479,12 @@ class WorkerRollingUpgradeTests(unittest.IsolatedAsyncioTestCase):
         orig_v2_begin = worker_v2.store.begin_attempt
         v2_claimed = False
 
-        def begin_attempt_v2(*args):
+        def begin_attempt_v2(*args, **kwargs):
             nonlocal v2_claimed
             if not v2_claimed:
                 v2_claimed = True
                 worker_v2.store.claim(self.config)
-            return orig_v2_begin(*args)
+            return orig_v2_begin(*args, **kwargs)
 
         worker_v2.store.begin_attempt = begin_attempt_v2
         received_instructions = []

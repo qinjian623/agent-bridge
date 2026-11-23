@@ -458,10 +458,15 @@ class DirectPeerClient:
                 return await self._request(name, params)
             verifying = True
             try:
-                hello = await self._request("hello", params if name == "hello" else self._hello_params)
+                hello_params = params if name == "hello" else self._hello_params
+                if name in {"events", "pull_requests"}:
+                    hello_params = {**hello_params, "identity_only": True}
+                hello = await self._request("hello", hello_params)
                 self._verify_hello(hello)
                 if name == "hello":
-                    self._hello_params = cast(HelloParams, dict(params))
+                    self._hello_params = cast(
+                        HelloParams, {key: value for key, value in params.items() if key != "identity_only"},
+                    )
                     return hello
                 verifying = False
                 if name == "deliver":

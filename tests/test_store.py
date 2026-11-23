@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_bridge.config import Config, Profile
 from agent_bridge.errors import BridgeError
@@ -35,6 +37,119 @@ class StoreTests(unittest.TestCase):
                     db.execute("UPDATE sessions SET desired='closed' WHERE id=?", (sid,))
                     raise RuntimeError("rollback")
             self.assertEqual("open", self.store.get_session(sid)["desired"])
+
+    def test_idle_claim_reads_during_enqueue_and_sees_task_after_commit(self):
+        sid = self.session("idle-claim")
+        with self.store.connection(timeout=0) as reader:
+            with self.store.connection(write=True) as writer:
+                task = self.store.enqueue_task(writer, sid, "work", [], 0, {})
+                with patch.object(self.store, "queue_context") as accounting:
+                    self.assertIsNone(self.store.claim(self.config, reuse=reader))
+                    accounting.assert_not_called()
+            self.assertEqual(task["task_id"], self.store.claim(self.config, reuse=reader)["task_id"])
+
+    def test_claim_ignores_paused_and_stopped_queues_until_workers_are_ready(self):
+        paused = self.session("paused-claim")
+        self.store.control(paused, "pause", 0, "pause-before-claim")
+        first = self.store.dispatch(paused, "first", "paused-first")["task_id"]
+        second = self.store.dispatch(paused, "second", "paused-second")["task_id"]
+        stopped = self.store.open(self.profile, str(self.path), "read-only", "stopped-claim")["session_id"]
+        stopped_task = self.store.dispatch(stopped, "work", "stopped-task")["task_id"]
+
+        with self.store.connection(timeout=0) as reader, self.store.connection(write=True):
+            with patch.object(self.store, "queue_context") as accounting:
+                self.assertIsNone(self.store.claim(self.config, reuse=reader))
+                accounting.assert_not_called()
+
+        self.store.worker_ready(stopped, "generation", 123, "start", "native-" + stopped)
+        self.assertEqual(stopped_task, self.store.claim(self.config)["task_id"])
+        self.store.control(paused, "resume", 1, "resume-after-claim")
+        self.assertEqual(first, self.store.claim(self.config)["task_id"])
+        self.assertEqual("queued", self.store.get_task(second)["status"])
+
+    def test_scheduler_sessions_only_returns_workers_and_open_stopped_sessions(self):
+        active = self.session("scheduler-active")
+        self.store.control(active, "pause", 0, "pause-active")
+        stopped = self.store.open(self.profile, str(self.path), "read-only", "scheduler-stopped")["session_id"]
+        closed = self.store.open(self.profile, str(self.path), "read-only", "scheduler-closed")["session_id"]
+        self.store.control(closed, "close", 0, "close-stopped")
+
+        with self.store.connection() as reader:
+            self.assertEqual(
+                [
+                    {"id": active, "desired": "paused", "observed": "idle", "worker_pid": 123,
+                     "worker_start": "start", "generation": "generation"},
+                    {"id": stopped, "desired": "open", "observed": "stopped", "worker_pid": None,
+                     "worker_start": None, "generation": None},
+                ],
+                self.store.scheduler_sessions(reuse=reader),
+            )
+
+    def test_idle_worker_reads_during_assignment_and_sees_it_after_commit(self):
+        sid = self.session("idle-attempt")
+        task = self.store.dispatch(sid, "work", "idle-attempt-task")["task_id"]
+        with self.store.connection(timeout=0) as reader:
+            with self.store.connection(write=True) as writer:
+                writer.execute(
+                    "INSERT INTO attempts(id,task_id,session_id,status) VALUES('assigned-attempt',?,?,'assigned')",
+                    (task, sid),
+                )
+                writer.execute("UPDATE tasks SET status='assigned',active_attempt='assigned-attempt' WHERE id=?", (task,))
+                self.assertIsNone(self.store.begin_attempt(sid, "generation", reuse=reader))
+                with self.assertRaisesRegex(BridgeError, "sessions: missing"):
+                    self.store.begin_attempt("missing", "generation", reuse=reader)
+            started = self.store.begin_attempt(sid, "generation", reuse=reader)
+        self.assertEqual(task, started["id"])
+        self.assertEqual("assigned-attempt", started["active_attempt"])
+
+    def test_begin_attempt_rechecks_generation_under_write_lock(self):
+        sid = self.session("attempt-generation")
+        task = self.store.dispatch(sid, "work", "generation-task")["task_id"]
+        self.store.claim(self.config)
+        connect = self.store.connection
+
+        def replace_generation(sql):
+            if sql == "BEGIN IMMEDIATE":
+                with connect(write=True, timeout=0) as writer:
+                    writer.execute("UPDATE sessions SET generation='replacement' WHERE id=?", (sid,))
+
+        with connect(timeout=0) as reader:
+            reader.set_trace_callback(replace_generation)
+            self.assertIsNone(self.store.begin_attempt(sid, "generation", reuse=reader))
+
+        self.assertEqual("assigned", self.store.get_task(task)["status"])
+        self.assertEqual(task, self.store.begin_attempt(sid, "replacement")["id"])
+
+    def test_idle_outbox_reads_one_snapshot_during_enqueue(self):
+        previous = self.store.add_outbox("previous", "peer.deliver", {})
+        self.store.ack_outbox("previous")
+        statements = []
+        with self.store.connection(timeout=0) as reader, self.store.connection(write=True) as writer:
+            queued = writer.execute(
+                "INSERT INTO node_outbox(operation_id,method,payload,created) VALUES('new','peer.deliver','{}',1)"
+            ).lastrowid
+            reader.set_trace_callback(statements.append)
+            with patch.object(self.store, "connection", partial(self.store.connection, reuse=reader)):
+                self.assertEqual(([], previous), self.store.pull_outbox_page())
+        self.assertEqual(1, len(statements))
+
+        rows, scan_upper_seq = self.store.pull_outbox_page()
+        self.assertEqual(queued, scan_upper_seq)
+        self.assertEqual([queued], [row["seq"] for row in rows])
+        self.assertEqual("pulled", rows[0]["status"])
+        self.assertIsNotNone(rows[0]["pulled_at"])
+
+    def test_outbox_page_max_includes_acknowledged_rows_beyond_the_page(self):
+        first = self.store.add_outbox("first", "peer.deliver", {})
+        second = self.store.add_outbox("second", "peer.deliver", {})
+        last = self.store.add_outbox("last", "peer.deliver", {})
+        self.store.ack_outbox("last")
+
+        rows, scan_upper_seq = self.store.pull_outbox_page(limit=1)
+        self.assertEqual(last, scan_upper_seq)
+        self.assertEqual([first], [row["seq"] for row in rows])
+        self.assertEqual([second], [row["seq"] for row in self.store.pull_outbox(first)])
+        self.assertEqual(([], last), self.store.pull_outbox_page(after=second))
 
     def test_reused_scheduler_connections_claim_atomically(self):
         sessions = [self.session("scheduler" + str(i)) for i in range(4)]

@@ -440,6 +440,25 @@ class DynamicHostTests(unittest.IsolatedAsyncioTestCase):
                             task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
 
+    async def test_idle_poll_backoff_resets_after_activity_or_error(self):
+        for component in (self.broker.outbox_puller, self.broker.event_mirror):
+            with self.subTest(component=type(component).__name__):
+                intervals = []
+                component._stopping.clear()
+
+                async def wait(stopping, draining, interval, *, intervals=intervals, **kwargs):
+                    intervals.append(interval)
+                    if len(intervals) == 9:
+                        stopping.set()
+
+                results = [0, 0, 0, 0, 1, 0, 0, 0, OSError("peer unavailable")]
+                with (
+                    patch.object(component, "run_once", side_effect=results),
+                    patch("agent_bridge.broker._wait_host_interval", new=wait),
+                ):
+                    await component._host_loop(self.broker.host_registry.get("gpu-a"))
+                self.assertEqual([2, 2, 4, 4, 2, 2, 2, 4, 2], intervals)
+
     async def test_reload_waits_for_complete_poller_ack_before_retiring_connection(self):
         ack_started, release_ack = asyncio.Event(), asyncio.Event()
         trace = []

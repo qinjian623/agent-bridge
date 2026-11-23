@@ -276,9 +276,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             worker = Worker(self.state, self.broker.config, sid)
             begin = worker.store.begin_attempt
 
-            def assign(*args):
+            def assign(*args, **kwargs):
                 worker.store.claim(self.broker.config)
-                return begin(*args)
+                return begin(*args, **kwargs)
 
             async def connect():
                 return None

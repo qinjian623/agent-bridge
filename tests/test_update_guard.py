@@ -130,7 +130,7 @@ class BrokerUpdateGuardTests(unittest.IsolatedAsyncioTestCase):
             if len(delays) == 2:
                 self.broker.stopping.set()
 
-        with (patch.object(self.broker.store, "sessions", side_effect=sessions),
+        with (patch.object(self.broker.store, "scheduler_sessions", side_effect=sessions),
               patch.object(self.broker.store, "claim", side_effect=claim),
               patch.object(self.broker, "_loop_wait", side_effect=wait)):
             await self.broker.scheduler()
@@ -240,7 +240,7 @@ class BrokerUpdateGuardTests(unittest.IsolatedAsyncioTestCase):
                 self.broker.stopping.set()
 
         with (
-            patch.object(self.broker.store, "sessions", side_effect=flaky_sessions),
+            patch.object(self.broker.store, "scheduler_sessions", side_effect=flaky_sessions),
             patch.object(self.broker, "_loop_wait", side_effect=sched_wait),
         ):
             await self.broker.scheduler()

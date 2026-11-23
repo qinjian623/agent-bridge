@@ -23,7 +23,7 @@ from . import __version__, groups, native_broadcast, peer_api, update_guard
 from .config import Config, Profile, broker_socket_path, read_admin_token, safe_error, validate_reasoning_effort
 from .discovery import ModelDirectory
 from .errors import BridgeError
-from .hosts import ConfigHostRegistry
+from .hosts import HOST_PINS_FILENAME, ConfigHostRegistry
 from .peer_protocol import (
     MAX_WORKSPACE_CHUNK_BYTES,
     PROTOCOL_VERSION,
@@ -45,6 +45,7 @@ from .workspace import (
     MAX_WORKSPACE_TOTAL_BYTES,
     create_workspace_manifest,
     directory_copy,
+    file_identity,
     selected_path,
     worktree,
 )
@@ -67,6 +68,13 @@ _HOST_BLOCKING_CODES = {
 }
 _SESSION_EFFORT_METHODS = {"agent_open", "agent_dispatch"}
 _SESSION_EFFORT_WIRE_SUFFIX = "_with_effort"
+_IDLE_POLLS_BEFORE_BACKOFF = 3
+
+
+def _peer_poll_delay(interval, empty_polls):
+    if empty_polls >= _IDLE_POLLS_BEFORE_BACKOFF:
+        return min(2 * interval, interval + 2)
+    return interval
 
 
 async def _wait_host_interval(
@@ -123,7 +131,7 @@ class DeliveryScheduler:
             return self.peer_factory(host_id)
         return self.peer_factory
 
-    def heads(self, host_id=None):
+    def heads(self, host_id=None, *, reuse=None):
         """Return the blocking head row of every target stream (optionally one host)."""
         placeholders = ",".join("?" for _ in _TERMINAL_PEER_STATUSES)
         sql = (
@@ -138,7 +146,7 @@ class DeliveryScheduler:
             sql += " AND o.host_id=?"
             values.append(host_id)
         sql += " ORDER BY o.host_id,o.stream_id,o.target_seq"
-        with self.store.connection() as db:
+        with self.store.connection(reuse=reuse) as db:
             return [dict(row) for row in db.execute(sql, values)]
 
     def _claim(self, delivery_id):
@@ -316,10 +324,10 @@ class DeliveryScheduler:
             outbox, status, result=result, error=error, release=release, expected_revision=outbox["revision"],
         )
 
-    async def step(self, host_id=None):
+    async def step(self, host_id=None, *, reuse=None):
         """Launch at most one pending head per target stream; blocked heads are left untouched."""
         processed = []
-        for head in self.heads(host_id):
+        for head in self.heads(host_id, reuse=reuse):
             if head["status"] == str(PeerDeliveryStatus.ACCEPTED_REMOTE) and head["target_kind"] == "native":
                 refreshed = await self._refresh_native(head)
                 if refreshed is not None:
@@ -394,20 +402,21 @@ class DeliveryScheduler:
         return await peer_api.resolve_delivery(self.store, self.peer_factory, params, **kwargs)
 
     async def run(self):
-        while not self._stopping.is_set():
-            paused = self._draining is not None and self._draining.is_set()
-            if not paused:
+        with self.store.connection() as db:
+            while not self._stopping.is_set():
+                paused = self._draining is not None and self._draining.is_set()
+                if not paused:
+                    try:
+                        with update_guard.operation(self.store.state):
+                            await self.step(reuse=db)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
                 try:
-                    with update_guard.operation(self.store.state):
-                        await self.step()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
+                    await asyncio.wait_for(self._stopping.wait(), 0.15 if paused else 0.5)
+                except TimeoutError:
                     pass
-            try:
-                await asyncio.wait_for(self._stopping.wait(), 0.15 if paused else 0.5)
-            except TimeoutError:
-                pass
 
 
 class OutboxPuller:
@@ -669,20 +678,24 @@ class OutboxPuller:
         return processed
 
     async def _host_loop(self, config):
+        empty_polls = 0
         while not self._stopping.is_set() and self._host_config(config.host_id) == config:
             paused = self._draining is not None and self._draining.is_set()
-            if not paused:
+            if paused:
+                empty_polls = 0
+            else:
                 try:
                     with update_guard.operation(self.store.state):
-                        await self.run_once(config.host_id)
+                        processed = await self.run_once(config.host_id)
+                    empty_polls = 0 if processed else min(empty_polls + 1, _IDLE_POLLS_BEFORE_BACKOFF)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    pass
+                    empty_polls = 0
             await _wait_host_interval(
                 self._stopping,
                 self._draining,
-                config.pull_interval,
+                _peer_poll_delay(config.pull_interval, empty_polls),
                 paused=paused,
                 keep_going=lambda: self._host_config(config.host_id) == config,
             )
@@ -1032,21 +1045,26 @@ class EventMirror:
         return processed
 
     async def _host_loop(self, config):
+        empty_polls = 0
         while not self._stopping.is_set() and self._host_config(config.host_id) == config:
             paused = self._draining is not None and self._draining.is_set()
-            if not paused:
+            if paused:
+                empty_polls = 0
+            else:
                 try:
                     with update_guard.operation(self.store.state):
-                        await self.run_once(config.host_id)
+                        processed = await self.run_once(config.host_id)
+                    empty_polls = 0 if processed else min(empty_polls + 1, _IDLE_POLLS_BEFORE_BACKOFF)
                     self._last_errors.pop(f"poll:{config.host_id}", None)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
+                    empty_polls = 0
                     self._note_error(f"poll:{config.host_id}", f"{config.host_id} poll", error)
             await _wait_host_interval(
                 self._stopping,
                 self._draining,
-                config.pull_interval or self.interval,
+                _peer_poll_delay(config.pull_interval or self.interval, empty_polls),
                 paused=paused,
                 keep_going=lambda: self._host_config(config.host_id) == config,
             )
@@ -1372,7 +1390,7 @@ class Broker:
                     delay = 0.5
                     try:
                         with update_guard.operation(self.state):
-                            for session in self.store.sessions(reuse=scheduler_db):
+                            for session in self.store.scheduler_sessions(reuse=scheduler_db):
                                 if session["worker_pid"] and not alive(session):
                                     self.store.worker_stopped(session["id"], session["generation"], "Worker process disappeared")
                                 elif (
@@ -1522,11 +1540,24 @@ class Broker:
                 raise
 
     async def watch_hosts(self):
+        paths = (self.state / "config.json", self.state / HOST_PINS_FILENAME)
+        last_snapshot = None
         while not self.stopping.is_set():
             if not self.update_draining.is_set():
                 try:
-                    with update_guard.operation(self.state):
-                        await self.reload_hosts()
+                    snapshot = []
+                    for path in paths:
+                        try:
+                            info = path.stat() if path.name == "config.json" else path.lstat()
+                        except FileNotFoundError:
+                            info = None
+                        snapshot.append(file_identity(info))
+                    if snapshot != last_snapshot or self.host_reload_error is not None or self._hosts_changing:
+                        with update_guard.operation(self.state):
+                            await self.reload_hosts()
+                        last_snapshot = snapshot
+                except OSError as error:
+                    self.host_reload_error = safe_error(error)
                 except Exception:
                     pass  # Keep the last valid registry; agent_hosts exposes the refresh error.
             try:

@@ -330,6 +330,7 @@ class HelloParams(TypedDict):
     coordinator_generation: str
     expected: NotRequired[dict[str, str]]  # {host_id,node_id,state_generation} pinned by coordinator, if known
     last_acked_seq: NotRequired[int]  # coordinator's view of node max_confirmed_seq
+    identity_only: NotRequired[bool]  # preliminary hello for polling; skip dynamic Broker feature checks
 
 
 class HelloResult(TypedDict):

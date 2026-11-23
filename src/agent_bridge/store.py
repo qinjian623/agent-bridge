@@ -1083,6 +1083,13 @@ class Store:
             result.append(value)
         return result
 
+    def scheduler_sessions(self, *, reuse=None):
+        with self.connection(reuse=reuse) as db:
+            return [dict(row) for row in db.execute(
+                "SELECT id,desired,observed,worker_pid,worker_start,generation FROM sessions "
+                "WHERE worker_pid IS NOT NULL OR (desired='open' AND observed='stopped') ORDER BY created"
+            )]
+
     def control(self, session_id, action, revision, request_id, continue_task_id=None):
         if action not in {"pause", "pause_drain", "resume", "close", "reopen"}:
             raise BridgeError("invalid_action", "Unknown session control action")
@@ -1241,9 +1248,19 @@ class Store:
 
     def claim(self, config: Config, *, reuse=None):
         """Reserve capacity and claim one task atomically across competing schedulers."""
-        with self.connection(write=True, reuse=reuse) as db:
+        eligible = (
+            "FROM tasks t JOIN sessions s ON s.id=t.session_id "
+            "WHERE t.status='queued' AND s.desired='open' AND s.observed='idle'"
+        )
+        with self.connection(reuse=reuse) as db:
+            if db.execute(f"SELECT 1 {eligible} LIMIT 1").fetchone() is None:
+                return None
+            db.execute("BEGIN IMMEDIATE")
+            queued = db.execute(f"SELECT t.* {eligible} ORDER BY t.created,t.id").fetchall()
+            if not queued:
+                return None
             active, accounting = self.queue_context(db)
-            for task in db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created,id").fetchall():
+            for task in queued:
                 if self.queue_reason(db, task, config, active, accounting):
                     continue
                 session = self.required(db, "sessions", task["session_id"])
@@ -1354,13 +1371,23 @@ class Store:
             )
             self.event(db, "worker_ready", {}, session_id)
 
-    def begin_attempt(self, session_id, generation):
-        with self.connection(write=True) as db:
-            session = self.required(db, "sessions", session_id)
-            if session["generation"] != generation or session["desired"] != "open":
+    def begin_attempt(self, session_id, generation, *, reuse=None):
+        with self.connection(reuse=reuse) as db:
+            session = db.execute(
+                "SELECT generation,desired,EXISTS(SELECT 1 FROM tasks "
+                "WHERE session_id=s.id AND status='assigned') AS assigned FROM sessions s WHERE s.id=?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise BridgeError("not_found", f"sessions: {session_id}")
+            if session["generation"] != generation or session["desired"] != "open" or not session["assigned"]:
                 return None
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT * FROM tasks WHERE session_id=? AND status='assigned' ORDER BY created LIMIT 1", (session_id,)
+                "SELECT t.* FROM tasks t JOIN sessions s ON s.id=t.session_id "
+                "WHERE t.session_id=? AND t.status='assigned' AND s.generation IS ? AND s.desired='open' "
+                "ORDER BY t.created LIMIT 1",
+                (session_id, generation),
             ).fetchone()
             if not row:
                 return None
@@ -2384,18 +2411,31 @@ class Store:
 
     def pull_outbox(self, after=0, limit=100):
         """Return pending/pulled outbox rows after `after`, marking them pulled for retry safety."""
+        return self.pull_outbox_page(after, limit)[0]
+
+    def pull_outbox_page(self, after=0, limit=100):
+        """Pull a page and its maximum sequence from the same snapshot."""
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "after must be a non-negative integer")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "limit must be a positive integer")
         limit = min(limit, 100)
-        now = time.time()
-        with self.connection(write=True) as db:
+        max_seq = "SELECT COALESCE(MAX(seq),0) FROM node_outbox"
+        with self.connection() as db:
+            available, scan_upper_seq = db.execute(
+                "SELECT EXISTS(SELECT 1 FROM node_outbox WHERE seq>? AND status IN ('pending','pulled')), "
+                f"({max_seq})",
+                (after,),
+            ).fetchone()
+            if not available:
+                return [], scan_upper_seq
+            db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
                 "SELECT * FROM node_outbox WHERE seq>? AND status IN ('pending','pulled') ORDER BY seq LIMIT ?",
                 (after, limit),
             ).fetchall()
             if rows:
+                now = time.time()
                 db.executemany(
                     "UPDATE node_outbox SET status='pulled',pulled_at=? WHERE seq=?",
                     [(now, row["seq"]) for row in rows],
@@ -2405,7 +2445,8 @@ class Store:
                     f"SELECT * FROM node_outbox WHERE seq IN ({marks}) ORDER BY seq",
                     [row["seq"] for row in rows],
                 ).fetchall()
-        return [self._node_outbox(row) for row in rows]
+            scan_upper_seq = db.execute(max_seq).fetchone()[0]
+        return [self._node_outbox(row) for row in rows], scan_upper_seq
 
     def ack_outbox(self, operation_id, result=None, outcome="accepted", status="acked"):
         """Mark one outbox request acknowledged, persisting `result` and `outcome`.

@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -12,8 +14,31 @@ from agent_bridge.config import Config, Profile
 from agent_bridge.errors import BridgeError
 from agent_bridge.runtimes import PiRuntime
 from agent_bridge.store import Store
-from agent_bridge.worker import Worker
+from agent_bridge.worker import IDLE_POLL_THRESHOLD, Worker, process_identity
 from agent_bridge.workspace import directory_copy
+
+
+class WorkerIdentityTests(unittest.TestCase):
+    def test_unavailable_darwin_lookup_falls_back_to_ps(self):
+        with (
+            patch("agent_bridge.worker.sys.platform", "darwin"),
+            patch("agent_bridge.worker.os.kill") as kill,
+            patch("agent_bridge.worker._darwin_process_start", return_value=None),
+            patch("agent_bridge.worker.subprocess.check_output", return_value="Mon Nov  2 12:00:00 2026  \n") as ps,
+        ):
+            self.assertEqual("darwin:123:Mon Nov  2 12:00:00 2026", process_identity(123))
+        kill.assert_called_once_with(123, 0)
+        ps.assert_called_once_with(["ps", "-p", "123", "-o", "lstart="], stderr=subprocess.DEVNULL, text=True)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires the macOS proc_pidinfo API")
+    def test_darwin_native_lookup_matches_legacy_identity_in_multiple_locales(self):
+        pid = os.getpid()
+        for locale_name in ("C", "fr_FR.UTF-8", "ja_JP.UTF-8", "zh_CN.UTF-8"):
+            with self.subTest(locale=locale_name), patch.dict(os.environ, {"LC_ALL": locale_name}):
+                expected = subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="], text=True).strip()
+                with patch("agent_bridge.worker.subprocess.check_output") as ps:
+                    self.assertEqual(f"darwin:{pid}:{expected}", process_identity(pid))
+                ps.assert_not_called()
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -28,14 +53,63 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     def session(self, access="read-only"):
         return self.store.open(self.profile, str(self.root), access, "open")["session_id"]
 
+    async def test_idle_worker_watcher_waits_then_interrupts_active_work(self):
+        sid = self.session()
+        worker = Worker(self.root, self.config, sid)
+        begin = worker.store.begin_attempt
+        idle = asyncio.Event()
+        started = asyncio.Event()
+        interrupted = asyncio.Event()
+        polls = 0
+
+        def observe_idle(*args, **kwargs):
+            nonlocal polls
+            task = begin(*args, **kwargs)
+            if task is None:
+                polls += 1
+                if polls == IDLE_POLL_THRESHOLD:
+                    idle.set()
+            return task
+
+        async def run(instruction, on_started, on_event):
+            await on_started("turn")
+            started.set()
+            await interrupted.wait()
+            return "interrupted", {}, {}
+
+        async def interrupt():
+            interrupted.set()
+
+        agent = SimpleNamespace(native_id="fixture", connect=AsyncMock(), close=AsyncMock(), run=run, interrupt=interrupt)
+        with (
+            patch("agent_bridge.worker.runtime", return_value=agent),
+            patch.object(worker.store, "begin_attempt", observe_idle),
+            patch.object(worker.store, "get_session", wraps=worker.store.get_session) as worker_session,
+        ):
+            owner = asyncio.create_task(worker.run())
+            try:
+                await asyncio.wait_for(idle.wait(), 2)
+                worker_session.assert_called_once_with(sid)
+                task_id = self.store.dispatch(sid, "work", "dispatch")["task_id"]
+                self.assertTrue(self.store.claim(self.config))
+                await asyncio.wait_for(started.wait(), 2)
+                self.store.control(sid, "pause", self.store.get_session(sid)["revision"], "pause")
+                await asyncio.wait_for(owner, 2)
+                self.assertTrue(interrupted.is_set())
+                self.assertEqual("interrupted", self.store.get_task(task_id)["status"])
+            finally:
+                if not owner.done():
+                    owner.cancel()
+                    await asyncio.gather(owner, return_exceptions=True)
+
     async def run_worker(self, sid, *, slow_close=False):
         worker = Worker(self.root, self.config, sid)
         begin = worker.store.begin_attempt
         owners = []
 
-        def begin_with_assignment(*args):
+        def begin_with_assignment(*args, **kwargs):
             worker.store.claim(self.config)
-            return begin(*args)
+            return begin(*args, **kwargs)
 
         async def connect():
             owners.append(asyncio.current_task())
@@ -164,9 +238,9 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         begin = worker.store.begin_attempt
         invocations = []
 
-        def assign(*args):
+        def assign(*args, **kwargs):
             worker.store.claim(self.config)
-            return begin(*args)
+            return begin(*args, **kwargs)
 
         async def stalled_run(instruction, on_started, on_event):
             invocations.append(instruction)
@@ -227,9 +301,9 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         begin = worker.store.begin_attempt
         interrupted = asyncio.Event()
 
-        def assign(*args):
+        def assign(*args, **kwargs):
             worker.store.claim(self.config)
-            return begin(*args)
+            return begin(*args, **kwargs)
 
         async def run(instruction, on_started, on_event):
             await on_started("native-turn")
@@ -298,9 +372,9 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         worker = Worker(self.root, self.config, sid)
         begin = worker.store.begin_attempt
         interrupted = asyncio.Event()
-        def assign(*args):
+        def assign(*args, **kwargs):
             worker.store.claim(self.config)
-            return begin(*args)
+            return begin(*args, **kwargs)
         async def run(instruction, on_started, on_event):
             await on_started("turn")
             await interrupted.wait()
@@ -330,9 +404,9 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         begin = worker.store.begin_attempt
         interrupted = asyncio.Event()
 
-        def assign(*args):
+        def assign(*args, **kwargs):
             worker.store.claim(self.config)
-            return begin(*args)
+            return begin(*args, **kwargs)
 
         async def run(instruction, on_started, on_event):
             await on_started("native-turn")
@@ -462,9 +536,9 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         agent.connect = AsyncMock()
         begin = worker.store.begin_attempt
 
-        def assign(*args):
+        def assign(*args, **kwargs):
             worker.store.claim(config)
-            return begin(*args)
+            return begin(*args, **kwargs)
 
         with patch("agent_bridge.worker.runtime", return_value=agent), patch.object(worker.store, "begin_attempt", assign):
             await asyncio.wait_for(worker.run(), 1)
@@ -490,9 +564,9 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         interrupted = asyncio.Event()
         interrupt_finished = False
 
-        def assign(*args):
+        def assign(*args, **kwargs):
             worker.store.claim(self.config)
-            return begin(*args)
+            return begin(*args, **kwargs)
 
         async def run(instruction, on_started, on_event):
             await on_started(instruction)

@@ -30,6 +30,7 @@ The broker watches `config.json.hosts` and `host_pins.json` periodically and sup
 - Relay and node handlers validate `require_method` first and return `peer_method_not_allowed` for unknown methods.
 - Broken transports return `peer_host_offline` and **never** mark remote tasks `failed`; inspect true state via `peer.lookup_delivery`.
 - `relay` revalidates on-disk config each frame and refuses requests if missing or corrupt. `peer.catalog` returns sanitized `entries`, `profiles`, and `discovery` (`refresh=true` queries provider catalogs; failures report `stale`/`error`).
+- After three empty outbox or event polls, that poller waits up to two extra seconds between checks (2 → 4 seconds with the default `pull_interval`). Activity or a polling error restores the configured interval. The preliminary `peer.hello` can send `identity_only: true` to skip dynamic capability checks while still verifying node identity and the database's confirmed sequence.
 - When OTA switches managed `current`, old relays finish in-flight frame responses before exiting (or reject newly arriving idle frames explicitly so coordinators spawn a fresh relay via the managed launcher without blindly retrying uncertain mutations).
 - `peer.pull_requests` paginates by both item count and full UTF-8 byte limits. Single items exceeding a frame are rejected before writing `node_outbox`; oversized historical items report their `operation_id` rather than skipping or forging ACKs (coordinators may shrink page sizes down to 1 item).
 

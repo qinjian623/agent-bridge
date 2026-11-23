@@ -26,9 +26,9 @@ class TaskTimeoutWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     async def execute(self, worker, agent):
         begin = worker.store.begin_attempt
-        def assigned(*args):
+        def assigned(*args, **kwargs):
             worker.store.claim(self.config)
-            return begin(*args)
+            return begin(*args, **kwargs)
         with patch("agent_bridge.worker.runtime", return_value=agent), patch.object(worker.store, "begin_attempt", assigned):
             await asyncio.wait_for(worker.run(), 3)
 

@@ -30,6 +30,7 @@
 - Relay 与节点分发器必须先调用 `require_method`，白名单之外的方法一律返回 `peer_method_not_allowed`。
 - 连接中断只能得到 `peer_host_offline`，**不得**转成任务失败；结果以 `peer.lookup_delivery` 查证为准。
 - `relay` 每帧重新检查配置；配置损坏或已加载文件被删除时拒绝执行请求。`peer.catalog` 保留 `entries`，生产入口同时返回 `profiles` 和 `discovery`，`refresh=true` 调用已有模型目录查询，失败通过 `stale/error` 表示。
+- 发件箱或事件连续三次返回空结果后，对应的轮询最多多等两秒（默认 `pull_interval` 从 2 秒增至 4 秒）。收到消息或查询失败后恢复配置的间隔。轮询前的 `peer.hello` 可用 `identity_only: true` 略过动态功能查询，仍验证节点身份和数据库的确认序号。
 - 自动更新切换 managed `current` 后，旧 relay 完整返回在途帧的响应再退出；静默等待输入的旧 relay 在下一帧到达时返回明确未执行错误后退出。后续请求通过固定入口启动新版，不自动重放结果不明的业务请求。
 - `peer.pull_requests` 按条数和完整 UTF-8 响应字节数共同分页。新单条请求大到无法容纳一帧时，在写入 outbox 前拒绝；历史超大记录报出对应 operation_id，不跳过或伪造 ACK。连接旧 relay 时协调端可减小读取页，最小为 1 条。
 

@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from agent_bridge.config import Config
 from agent_bridge.discovery import ModelDirectory
 from agent_bridge.node_identity import FileNodeIdentityStore
 from agent_bridge.peer_api import DirectPeerService
-from agent_bridge.peer_protocol import PeerErrorCode, ok
+from agent_bridge.peer_protocol import SESSION_EFFORT_CAPABILITY, PeerErrorCode, ok
 from agent_bridge.peer_transport import DirectRelayServer
 from agent_bridge.store import Store
 
@@ -70,6 +71,40 @@ class RelayRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['ok'], result)
         self.assertEqual([], result['result']['profiles'])
         self.assertEqual([], result['result']['discovery'])
+
+    async def test_unchanged_config_is_cached_but_same_mtime_replacement_is_loaded(self):
+        self.service._reload_config()
+        before = self.path.stat()
+        replacement = self.path.with_suffix('.new')
+        replacement.write_bytes(self.path.read_bytes().replace(b'old-model', b'new-model'))
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with patch.object(Config, 'load', wraps=Config.load) as load:
+            self.service._reload_config()
+            load.assert_not_called()
+            replacement.replace(self.path)
+            self.service._reload_config()
+            load.assert_called_once_with(self.path)
+        self.assertEqual('new-model', self.service._config.profiles['worker'].model)
+
+    async def test_identity_only_hello_preserves_identity_checks_without_probing_broker(self):
+        self.service._capability_probe = AsyncMock(
+            return_value={'features': ['task_timeout_v1', SESSION_EFFORT_CAPABILITY]},
+        )
+        params = {'protocol_versions': [1]}
+        normal = (await self.service.handle(request('peer.hello', params)))['result']
+        poll = (await self.service.handle(request('peer.hello', {**params, 'identity_only': True})))['result']
+        self.service._capability_probe.assert_awaited_once()
+        for key in ('node', 'node_state', 'max_confirmed_seq', 'protocol_version'):
+            self.assertEqual(normal[key], poll[key])
+        self.assertEqual(
+            {'task_timeout_v1', SESSION_EFFORT_CAPABILITY},
+            set(normal['capabilities']) - set(poll['capabilities']),
+        )
+        damaged = await self.service.handle(request(
+            'peer.hello', {**params, 'identity_only': True, 'last_acked_seq': 1},
+        ))
+        self.assertFalse(damaged['ok'])
+        self.assertEqual(PeerErrorCode.STATE_CORRUPTED, damaged['error']['code'])
 
     async def test_bad_config_never_reuses_old_config_for_writes_and_can_recover(self):
         for invalid in ('{', '{"profiles": []}'):

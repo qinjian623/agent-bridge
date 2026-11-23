@@ -64,6 +64,7 @@ from .peer_protocol import (
     validate_object_ref,
 )
 from .store import Store, encode, identifier, validate_session_name, validate_task_timeout
+from .workspace import file_identity
 from .workspace import git as workspace_git
 
 # ---------------------------------------------------------------- MCP tool parameter contracts
@@ -224,7 +225,7 @@ class DirectPeerService:
         self._store = store
         self._config = config
         self._config_path = config_path
-        self._config_digest = None
+        self._config_identity = None
         self._models = model_directory
         self._capability_probe = capability_probe
         self._broker_version = broker_version
@@ -256,17 +257,19 @@ class DirectPeerService:
     def _reload_config(self):
         if self._config_path is None:
             return
-        if self._config is None and self._config_digest is None and not self._config_path.exists():
-            return
         try:
-            data = self._config_path.read_bytes()
-            digest = hashlib.sha256(data).digest()
-            if digest != self._config_digest:
+            try:
+                identity = file_identity(self._config_path.stat())
+            except FileNotFoundError:
+                if self._config is None and self._config_identity is None:
+                    return
+                raise
+            if identity != self._config_identity:
                 config = Config.load(self._config_path)
-                if self._config_path.read_bytes() != data:
+                if file_identity(self._config_path.stat()) != identity:
                     raise ValueError("Config changed while being loaded")
                 self._config = config
-                self._config_digest = digest
+                self._config_identity = identity
         except (OSError, ValueError, TypeError, KeyError, AttributeError, BridgeError) as error:
             raise peer_error(
                 PeerErrorCode.HOST_OFFLINE,
@@ -377,7 +380,7 @@ class DirectPeerService:
             state_generation=identity.state_generation,
         )
         capabilities = list(IMPLEMENTED_PEER_METHODS) + list(CAPABILITIES)
-        broker_features = await self._broker_features()
+        broker_features = [] if params.get("identity_only") is True else await self._broker_features()
         for feature in ("task_timeout_v1", SESSION_EFFORT_CAPABILITY):
             if feature not in broker_features:
                 capabilities.remove(feature)
@@ -545,9 +548,9 @@ class DirectPeerService:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "limit must be a positive integer")
         limit = min(limit, MAX_PAGE_LIMIT)
-        rows = store.pull_outbox(after, limit)
-        with store.connection() as db:
-            scan_upper_seq = db.execute("SELECT COALESCE(MAX(seq),0) FROM node_outbox").fetchone()[0]
+        rows, scan_upper_seq = store.pull_outbox_page(after, limit)
+        if not rows:
+            return {"items": [], "cursor": after, "has_more": False, "scan_upper_seq": scan_upper_seq}
         # Include the actual response envelope and UTF-8 bytes, not just the number of requests.
         overhead = len(encode(ok(request_id, {
             "items": [], "cursor": max(after, scan_upper_seq), "has_more": False,
@@ -2364,6 +2367,8 @@ class DirectPeerService:
             raise peer_error(PeerErrorCode.INVALID_PARAMS, "limit must be a positive integer")
         limit = min(limit, MAX_PAGE_LIMIT)
         rows = store.events(after, limit=limit + 1, exclude_mirrored=True)
+        if not rows:
+            return {"items": [], "cursor": after, "has_more": False}
         has_more = len(rows) > limit
         rows = rows[:limit]
         identity = self._identity.load_or_create()
