@@ -18,6 +18,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from time import monotonic
 
 from . import __version__, groups, native_broadcast, peer_api, update_guard
 from .config import Config, Profile, broker_socket_path, read_admin_token, safe_error, validate_reasoning_effort
@@ -102,6 +103,9 @@ class DeliveryScheduler:
     later sequence for that target and is never skipped. Network I/O happens outside the CAS transaction.
     """
 
+    _RECEIPT_ACTIVE_MAX_INTERVAL = 2.0
+    _RECEIPT_MAX_INTERVAL = 30.0
+
     def __init__(self, store, peer_factory=None, *, authority_ref=None, config=None, draining=None):
         self.store = store
         self.peer_factory = peer_factory
@@ -109,6 +113,8 @@ class DeliveryScheduler:
         self.config = config
         self._draining = draining
         self._stopping = asyncio.Event()
+        # delivery_id -> (local revision, next lookup time, interval)
+        self._receipt_polls: dict[str, tuple[int, float, float]] = {}
 
     def _decode(self, value):
         if value is None:
@@ -320,20 +326,56 @@ class DeliveryScheduler:
         if (status == outbox["status"] and encoded_error == outbox["error"]
                 and result.get("send_status") == outbox["send_status"]
                 and result.get("processing_status") == outbox["processing_status"]
-                and encoded_receipt == outbox["receipt"]):
+                # _finish retains the acceptance receipt when the native queue has no receipt yet.
+                and (encoded_receipt is None or encoded_receipt == outbox["receipt"])):
             return None
         return self._finish(
             outbox, status, result=result, error=error, release=release, expected_revision=outbox["revision"],
         )
 
-    async def step(self, host_id=None, *, reuse=None):
+    @staticmethod
+    def _needs_native_receipt(outbox):
+        return outbox["status"] == str(PeerDeliveryStatus.ACCEPTED_REMOTE) and outbox["target_kind"] == "native"
+
+    async def step(self, host_id=None, *, reuse=None, automatic=False):
         """Launch at most one pending head per target stream; blocked heads are left untouched."""
+        heads = self.heads(host_id, reuse=reuse)
+        if automatic:
+            # Give new sends a chance before waiting on passive read-only lookups.
+            heads.sort(key=self._needs_native_receipt)
+            live_receipts = {head["delivery_id"] for head in heads if self._needs_native_receipt(head)}
+            for delivery_id in self._receipt_polls.keys() - live_receipts:
+                del self._receipt_polls[delivery_id]
         processed = []
-        for head in self.heads(host_id, reuse=reuse):
-            if head["status"] == str(PeerDeliveryStatus.ACCEPTED_REMOTE) and head["target_kind"] == "native":
+        for head in heads:
+            if self._needs_native_receipt(head):
+                delivery_id = head["delivery_id"]
+                poll = self._receipt_polls.get(delivery_id) if automatic else None
+                if poll is not None and poll[0] != head["revision"]:
+                    poll = None
+                if poll is not None and monotonic() < poll[1]:
+                    continue
                 refreshed = await self._refresh_native(head)
                 if refreshed is not None:
                     processed.append(refreshed)
+                if automatic:
+                    current = refreshed if refreshed is not None else head
+                    if not self._needs_native_receipt(current):
+                        self._receipt_polls.pop(delivery_id, None)
+                        continue
+                    enqueued = current["send_status"] == "enqueued"
+                    # A deferred send can cycle between pending and sending without making progress.
+                    changed = enqueued != (head["send_status"] == "enqueued") or any(
+                        current[key] != head[key] for key in ("processing_status", "receipt")
+                    )
+                    recovered = current["error"] is None and head["error"] is not None
+                    if changed or recovered:
+                        interval = 0.5
+                    else:
+                        active = current["error"] is None and (enqueued or current["processing_status"] == "running")
+                        cap = self._RECEIPT_ACTIVE_MAX_INTERVAL if active else self._RECEIPT_MAX_INTERVAL
+                        interval = min(cap, 2 * poll[2] if poll is not None else 1.0)
+                    self._receipt_polls[delivery_id] = (current["revision"], monotonic() + interval, interval)
                 continue
             if head["status"] not in {
                 str(PeerDeliveryStatus.PENDING), str(PeerDeliveryStatus.TOMBSTONE_PENDING),
@@ -410,7 +452,7 @@ class DeliveryScheduler:
                 if not paused:
                     try:
                         with update_guard.operation(self.store.state):
-                            await self.step(reuse=db)
+                            await self.step(reuse=db, automatic=True)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -1270,7 +1312,9 @@ class Broker:
                 delay = 2
                 try:
                     with update_guard.operation(self.state):
-                        await native_broadcast.deliver(self.store, self.config, tasks=running)
+                        await native_broadcast.deliver(
+                            self.store, self.config, tasks=running, retry_interval=native_broadcast.QUEUE_RETRY_INTERVAL,
+                        )
                     getattr(self, "_loop_errors", {}).pop("native_notifications", None)
                 except BridgeError as error:
                     if error.code != "update_busy":

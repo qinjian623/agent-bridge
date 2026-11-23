@@ -459,7 +459,7 @@ class DirectPeerClient:
             verifying = True
             try:
                 hello_params = params if name == "hello" else self._hello_params
-                if name in {"events", "pull_requests"}:
+                if name in {"events", "pull_requests", "lookup_delivery"}:
                     hello_params = {**hello_params, "identity_only": True}
                 hello = await self._request("hello", hello_params)
                 self._verify_hello(hello)

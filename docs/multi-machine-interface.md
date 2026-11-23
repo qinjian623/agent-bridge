@@ -73,6 +73,7 @@ Deliveries (`DeliveryScheduler`):
 - Retries reuse identical `delivery_id` and `target_seq` and never blindly resend `uncertain`.
 - Native targets settle to `accepted_remote` upon local enqueue; periodic lookups match node, target, sequence, receipt, and turn before releasing `target_seq`.
 - `peer.lookup_delivery` checks live `native_send_queue` read-only without launching or resuming Codex/AGY sessions; non-empty `cwd` persists cleanly for native wake checks.
+- Automatic receipt checks for unresolved native deliveries back off from 1 second to 30 seconds. A healthy enqueued or running delivery is checked at most two seconds apart after the initial lookup. Explicit status refresh runs immediately. A status check verifies peer identity and skips the dynamic capability probe.
 - Remote Antigravity rejects `read-only` prior to session creation identically to local hosts.
 
 Identity: Verify DB commit sequence never falls below `node_identity.json` (plus optional peer `last_acked_seq`). Rollbacks trigger `state_corrupted` requiring manual re-generation; never fabricate missing commit records.

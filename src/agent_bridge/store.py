@@ -2897,48 +2897,50 @@ class Store:
             ).fetchone()
         return None if row is None else dict(row)
 
-    @classmethod
-    def _claim_native_send_head(cls, db, allowed, now, limit=None):
-        heads = db.execute(
-            "SELECT runtime,native_id,MIN(local_seq) AS local_seq FROM native_send_queue "
-            "WHERE status IN (?,?,?) GROUP BY runtime,native_id "
-            "ORDER BY MIN(last_attempt),MIN(created),runtime,native_id",
-            cls.NATIVE_SEND_BLOCKING_STATUSES,
-        ).fetchall()
-        claimed = []
-        for head in heads:
-            if limit is not None and len(claimed) >= limit:
-                break
-            row = db.execute(
-                "SELECT * FROM native_send_queue WHERE runtime=? AND native_id=? AND local_seq=?",
-                (head["runtime"], head["native_id"], head["local_seq"]),
-            ).fetchone()
-            if row is None or row["status"] != "pending":
-                continue
-            if allowed is not None and row["delivery_source"] not in allowed:
-                continue
-            if not db.execute(
-                "UPDATE native_send_queue SET status='sending',last_attempt=?,revision=revision+1 "
-                "WHERE id=? AND status='pending'",
-                (now, row["id"]),
-            ).rowcount:
-                continue
-            claimed.append(dict(db.execute("SELECT * FROM native_send_queue WHERE id=?", (row["id"],)).fetchone()))
-        return claimed
-
-    def claim_eligible_native_sends(self, limit: int = 10, *, delivery_sources=None) -> list[dict]:
+    def claim_eligible_native_sends(
+        self, limit: int = 10, *, delivery_sources=None, retry_interval: float = 0,
+    ) -> list[dict]:
         """Claim at most one pending head per target, up to `limit` targets, in fair order.
 
         A target whose oldest unfinished item is `sending` or `uncertain` is blocked: later items for that target
         must never overtake an in-flight or unconfirmed native write. Other targets are unaffected.
+        A positive retry interval also keeps a previously attempted pending head in place until it is due.
         """
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
             raise BridgeError(PeerErrorCode.INVALID_PARAMS, "limit must be a non-negative integer")
         if limit == 0:
             return []
-        allowed = None if delivery_sources is None else {str(source) for source in delivery_sources}
-        with self.connection(write=True) as db:
-            return self._claim_native_send_head(db, allowed, time.time(), limit)
+        allowed = None if delivery_sources is None else sorted({str(source) for source in delivery_sources})
+        if allowed == []:
+            return []
+        now = time.time()
+        values = list(self.NATIVE_SEND_BLOCKING_STATUSES)
+        query = (
+            "WITH heads AS (SELECT runtime,native_id,MIN(local_seq) AS local_seq,"
+            "MIN(last_attempt) AS last_attempt,MIN(created) AS created FROM native_send_queue "
+            "WHERE status IN (?,?,?) GROUP BY runtime,native_id) "
+            "SELECT q.id FROM heads h JOIN native_send_queue q USING(runtime,native_id,local_seq) "
+            "WHERE q.status='pending'"
+        )
+        if allowed is not None:
+            query += " AND q.delivery_source IN (" + ",".join("?" for _ in allowed) + ")"
+            values.extend(allowed)
+        if retry_interval:
+            query += " AND (q.last_attempt=0 OR q.last_attempt<=? OR q.last_attempt>?)"
+            values.extend((now - retry_interval, now))
+        query += " ORDER BY h.last_attempt,h.created,h.runtime,h.native_id LIMIT ?"
+        with self.connection() as db:
+            if db.execute(query, (*values, 1)).fetchone() is None:
+                return []
+            db.execute("BEGIN IMMEDIATE")
+            ids = [row["id"] for row in db.execute(query, (*values, limit))]
+            claimed_at = time.time()
+            db.executemany(
+                "UPDATE native_send_queue SET status='sending',last_attempt=?,revision=revision+1 WHERE id=?",
+                [(claimed_at, item_id) for item_id in ids],
+            )
+            return [dict(db.execute("SELECT * FROM native_send_queue WHERE id=?", (item_id,)).fetchone())
+                    for item_id in ids]
 
     def claim_native_send_head(self, delivery_source: str, delivery_id: str) -> dict | None:
         """Claim one delivery only when it is the pending head of its target's queue.

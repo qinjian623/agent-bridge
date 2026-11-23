@@ -4,11 +4,13 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from agent_bridge import groups
 from agent_bridge.broker import Broker
 from agent_bridge.config import Config, Profile
 from agent_bridge.errors import BridgeError
+from agent_bridge.native_broadcast import deliver as deliver_broadcasts
 from agent_bridge.notifications import deliver
 from agent_bridge.store import Store
 
@@ -85,6 +87,30 @@ class NativeSendQueueTests(unittest.TestCase):
             self.store.claim_eligible_native_sends(-1)
         with self.assertRaises(BridgeError):
             self.store.claim_eligible_native_sends(True)
+
+    def test_background_retry_wait_preserves_the_head_and_survives_reopening_the_db(self):
+        head = self.enqueue(delivery_id="deferred")
+        later = self.enqueue(delivery_id="behind-deferred")
+        with patch("agent_bridge.store.time.time", return_value=1_000):
+            self.assertEqual(head["id"], self.store.claim_eligible_native_sends(retry_interval=30)[0]["id"])
+        self.store.update_native_send(head["id"], status="pending", error="busy", expected_status="sending")
+        other = self.enqueue(self.other, delivery_id="other-target")
+        reopened = Store(self.root)
+        with patch("agent_bridge.store.time.time", return_value=1_029):
+            self.assertEqual([other["id"]], [row["id"] for row in reopened.claim_eligible_native_sends(retry_interval=30)])
+        self.assertEqual("pending", self.item(later["id"])["status"])
+        with patch("agent_bridge.store.time.time", return_value=1_030):
+            self.assertEqual([head["id"]], [row["id"] for row in reopened.claim_eligible_native_sends(retry_interval=30)])
+
+    def test_empty_queue_claim_is_read_only_during_a_concurrent_writer(self):
+        connection = self.store.connection
+        statements = []
+        with connection(timeout=0) as reader:
+            reader.set_trace_callback(statements.append)
+            with connection(write=True):
+                with patch.object(self.store, "connection", side_effect=lambda: connection(reuse=reader)):
+                    self.assertEqual([], self.store.claim_eligible_native_sends(retry_interval=30))
+        self.assertFalse(any(sql.startswith("BEGIN IMMEDIATE") for sql in statements))
 
     def test_unrelated_target_is_not_blocked_by_another_targets_uncertain_head(self):
         blocked_head = self.enqueue(delivery_id="a-1")
@@ -226,6 +252,27 @@ class NativeSendQueueTests(unittest.TestCase):
         # An uncertain head must keep blocking later writes after the restart.
         self.enqueue(delivery_id="later")
         self.assertEqual([], self.store.claim_eligible_native_sends(10))
+
+
+class NativeWakePlatformTests(unittest.IsolatedAsyncioTestCase):
+    async def test_macos_automatic_wake_fails_before_starting_a_helper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory))
+            queued = store.enqueue_native_send(
+                "antigravity", "native-session", "local_broadcast", "macos-native-delivery", "fixture",
+            )
+            with (
+                patch("agent_bridge.agy_presence.sys.platform", "darwin"),
+                patch("agent_bridge.native_broadcast.asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn,
+            ):
+                await deliver_broadcasts(store, Config({}))
+                result = store.get_native_send_queue_item(queued["id"])
+                await deliver_broadcasts(store, Config({}))
+                self.assertEqual(result, store.get_native_send_queue_item(queued["id"]))
+        spawn.assert_not_awaited()
+        self.assertEqual("failed", result["status"])
+        self.assertIn("unsupported on macOS", result["error"])
+        self.assertIsNone(result["receipt"])
 
 
 class NotificationOrderingTests(unittest.IsolatedAsyncioTestCase):

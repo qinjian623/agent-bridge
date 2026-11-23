@@ -957,7 +957,15 @@ class Updater:
         compatibility = json.loads(raw) if raw else {}
         _run([python, "-m", "agent_bridge.cli", "--state", str(self.state), "doctor"], timeout=30)
         # Keep the temporary socket short even when the managed release root is deeply nested.
-        with tempfile.TemporaryDirectory(prefix="bridge-selftest-", dir="/tmp") as name:
+        # Linux /tmp may be a quota-limited tmpfs, too small for the broker's SQLite files.
+        test_root = "/var/tmp" if sys.platform == "linux" else "/tmp"
+        try:
+            test_directory = tempfile.TemporaryDirectory(prefix="bridge-selftest-", dir=test_root)
+        except OSError:
+            if test_root == "/tmp":
+                raise
+            test_directory = tempfile.TemporaryDirectory(prefix="bridge-selftest-", dir="/tmp")
+        with test_directory as name:
             test = Path(name).resolve()
             _write(test / "config.json", {"profiles": {}, "hosts": {}, "telegram_database": None})
             process = subprocess.Popen(

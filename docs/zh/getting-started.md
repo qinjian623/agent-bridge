@@ -293,7 +293,7 @@ agent-bridge call agent_broadcast_status --json '{"broadcast_id":"上一步返�
 
 原生 Codex 消息使用已经运行的共享服务的 `thread/queue/add`，不调用 `thread/resume`、`turn/start`、`turn/steer` 或中断接口，也不启动 daemon。正在运行的原生终端保持原有写锁，队列由原生程序处理；关闭的 Codex 会话不会被本功能唤醒。发送前检查原生 ID 和目录，并继续遵守 Telegram 暂停、删除状态。
 
-原生 Antigravity 支持关闭后按组消息自动恢复。新广播先保存为 `pending`；bridge 与 Telegram 共用 `antigravity-locks/<native_id>.lock`，并检查原生 presence 锁、进程参数的两种 `--conversation` 写法及 `-c/--continue`。同一会话仍活动、存在重复实例或无法确认进程所属时，消息等待，不写活动终端。确认关闭后，核对原生记录存在，再用原 ID 启动一次 stream-json 进程；启动后及写入前再次检查其他实例。原会话的模型、认证、MCP 和权限设置沿用原生配置，不传跳过权限参数。历史 `skipped` 通知保持原样，不自动补发旧通知。
+Linux 上的原生 Antigravity 支持关闭后按组消息自动恢复。新广播先保存为 `pending`；bridge 与 Telegram 共用 `antigravity-locks/<native_id>.lock`，并检查原生 presence 锁、进程参数的两种 `--conversation` 写法及 `-c/--continue`。同一会话仍活动、存在重复实例或无法确认进程所属时，消息继续等待。确认关闭后，核对原生记录，再用原 ID 启动一次 stream-json 进程；启动后及写入前再次检查其他实例。原会话沿用模型、认证、MCP 和权限设置。历史 `skipped` 通知保持原样。发送前暂缓的消息，后台至少间隔 30 秒才再次尝试。macOS 暂无可靠的原生锁归属检查，自动恢复在启动辅助进程前返回不支持，原生会话仍可用组收件箱主动读取。
 
 `agent_broadcast_status` 列出每个目标的当前结果：`pending` 只表示 bridge 本地待发送；`enqueued` 表示已取得 Codex 原生队列回执。Codex 的 `received` 表示原生历史中出现了匹配消息 ID 的用户消息；AGY 的 `received` 要求原 ID 返回新的 `user_input/DONE` 事件，过滤恢复时重放的历史步骤。`native_turn_id` 对 AGY 是这条原生用户输入的步骤编号。收到后立即保存，后续推理通过 `processing_status=running/completed/failed` 单独记录，其他会话可以继续发送。原生审批拒绝会记录失败，不放宽权限重试。
 

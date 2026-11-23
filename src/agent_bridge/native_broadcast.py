@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from .agy_presence import unsupported_platform_reason
 from .config import safe_error
 from .errors import BridgeError
 from .groups import native_members_input, validate_group_id
@@ -15,6 +16,7 @@ from .store import encode
 
 LEGACY_SOURCES = (str(DeliverySource.LOCAL_BROADCAST), "native_broadcast")
 QUEUE_SOURCES = (*LEGACY_SOURCES, str(DeliverySource.PEER_DELIVER), str(DeliverySource.MIGRATION))
+QUEUE_RETRY_INTERVAL = 30
 # Legacy rows written by an older build may still be the only evidence of an in-flight write; map them onto the
 # queue states that refuse to overtake an unconfirmed native write.
 LEGACY_STATUS = {"sending": "uncertain", "unconfirmed": "uncertain"}
@@ -72,6 +74,8 @@ async def send(config, delivery, *, inspect=False):
 
 
 async def send_agy(store, config, row, *, queue_id=None):
+    if (reason := unsupported_platform_reason()) is not None:
+        return {"status": "failed", "error": reason}
     item_id = queue_id or row["id"]
     payload = {**row, "async_state": str(store.state), "timeout": config.task_timeout}
     try:
@@ -174,9 +178,9 @@ async def refresh_queue_receipt(store, config, row, sender=None):
     )
 
 
-async def deliver(store, config, sender=send, *, tasks=None):
+async def deliver(store, config, sender=send, *, tasks=None, retry_interval=0):
     capacity = max(0, config.parallel_limit - len(tasks)) if tasks is not None else 10
-    rows = store.claim_eligible_native_sends(capacity, delivery_sources=QUEUE_SOURCES)
+    rows = store.claim_eligible_native_sends(capacity, delivery_sources=QUEUE_SOURCES, retry_interval=retry_interval)
 
     async def process_row(row, item_id):
         try:

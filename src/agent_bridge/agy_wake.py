@@ -15,7 +15,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
-from .agy_presence import inactive_reason
+from .agy_presence import inactive_reason, unsupported_platform_reason
 
 
 def native_baseline(home, native_id):
@@ -33,6 +33,8 @@ def wake(job, emit):
     native_id = job["native_id"]
     if str(uuid.UUID(native_id)) != native_id:
         raise ValueError("Invalid native UUID")
+    if reason := unsupported_platform_reason():
+        return {"status": "failed", "error": reason}
     home = Path(job.get("native_home") or Path.home() / ".gemini/antigravity-cli")
     executable = job.get("executable", "agy")
     locks = Path(job["async_state"]) / "antigravity-locks"

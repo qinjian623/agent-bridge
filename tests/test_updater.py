@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import errno
 import fcntl
 import hashlib
 import io
@@ -61,6 +62,31 @@ class UpdateFixture(unittest.TestCase):
 
 
 class PreflightTests(UpdateFixture):
+    def test_self_test_prefers_linux_disk_space_and_falls_back_on_creation_error(self):
+        make_temp = tempfile.TemporaryDirectory
+        for platform, fail_first, directories in (
+            ("linux", False, ["/var/tmp"]),
+            ("linux", True, ["/var/tmp", "/tmp"]),
+            ("darwin", False, ["/tmp"]),
+        ):
+            with self.subTest(platform=platform, fail_first=fail_first):
+                def make_test_directory(*, prefix, dir, fail_first=fail_first):
+                    if fail_first and dir == "/var/tmp":
+                        raise OSError(errno.EDQUOT, "fixture quota exceeded")
+                    return make_temp(prefix=prefix, dir=self.home)
+
+                with (
+                    patch.object(updater.sys, "platform", platform),
+                    patch.object(updater.tempfile, "TemporaryDirectory", side_effect=make_test_directory) as temporary,
+                    patch.object(updater, "_run", side_effect=['{"requires_worker_drain":false}', ""]),
+                    patch.object(updater.subprocess, "Popen") as popen,
+                    patch.object(self.updater, "_healthy", new_callable=AsyncMock) as healthy,
+                ):
+                    popen.return_value.poll.return_value = 0
+                    self.assertEqual({"requires_worker_drain": False}, self.updater.preflight(self.new, "v0.2.0"))
+                self.assertEqual([call(prefix="bridge-selftest-", dir=directory) for directory in directories], temporary.call_args_list)
+                healthy.assert_awaited_once()
+
     def test_self_test_socket_is_independent_of_the_release_root_length(self):
         long_root = self.root / ("nested-" * 18)
         long_root.mkdir(mode=0o700)

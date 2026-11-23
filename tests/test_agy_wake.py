@@ -13,6 +13,14 @@ from unittest.mock import patch
 
 from agent_bridge import agy_wake
 
+
+def process_is_live(pid):
+    result = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
+    if result.returncode not in (0, 1):
+        raise AssertionError("Could not inspect the isolated fake AGY process")
+    return any(not state.startswith("Z") for state in result.stdout.split())
+
+
 FAKE_AGY = r'''
 import json
 import os
@@ -128,10 +136,24 @@ class AgyWakeTests(unittest.TestCase):
         self.presence = patch.object(agy_wake, "inactive_reason", return_value=None)
         self.inactive = self.presence.start()
         self.addCleanup(self.presence.stop)
+        self.capability = patch.object(agy_wake, "unsupported_platform_reason", return_value=None)
+        self.capability.start()
+        self.addCleanup(self.capability.stop)
         self.receipts = []
 
     def calls(self):
         return [json.loads(line) for line in self.record.read_text().splitlines()] if self.record.exists() else []
+
+    def test_darwin_unsupported_is_definite_failure_before_lock_or_process_creation(self):
+        self.presence.stop()
+        self.capability.stop()
+        with patch("agent_bridge.agy_presence.sys.platform", "darwin"), \
+             patch.object(agy_wake.subprocess, "Popen", side_effect=AssertionError("must not start AGY")):
+            result = agy_wake.wake(self.job, self.receipts.append)
+        self.assertEqual("failed", result["status"])
+        self.assertIn("unsupported on macOS", result["error"])
+        self.assertFalse((self.root / "async").exists())
+        self.assertEqual([], self.receipts)
 
     def wake(self, scenario="success", emit=None):
         with patch.dict(os.environ, {"FAKE_AGY_SCENARIO": scenario}):
@@ -151,7 +173,7 @@ class AgyWakeTests(unittest.TestCase):
         self.assertIn(self.job["message"], calls[1]["content"])
         with sqlite3.connect(self.conversation) as db:
             self.assertEqual(11, db.execute("SELECT MAX(idx) FROM steps").fetchone()[0])
-        self.assertFalse(Path("/proc", str(calls[0]["pid"])).exists())
+        self.assertFalse(process_is_live(calls[0]["pid"]))
 
     def test_existing_active_or_unknown_native_owner_never_starts_cli(self):
         self.inactive.return_value = "Original session is active or ownership cannot be verified"
@@ -178,7 +200,7 @@ class AgyWakeTests(unittest.TestCase):
                 self.assertEqual("deferred", result["status"])
                 calls = self.calls()
                 self.assertTrue(all(call["phase"] == "started" for call in calls))
-                self.assertTrue(all(not Path("/proc", str(call["pid"])).exists() for call in calls))
+                self.assertTrue(all(not process_is_live(call["pid"]) for call in calls))
                 self.record.unlink()
 
     def test_missing_native_records_fail_without_creating_a_replacement(self):
@@ -199,7 +221,7 @@ class AgyWakeTests(unittest.TestCase):
         result = self.wake("wrong_init")
         self.assertEqual("failed", result["status"])
         self.assertEqual(["started"], [call["phase"] for call in self.calls()])
-        self.assertFalse(Path("/proc", str(self.calls()[0]["pid"])).exists())
+        self.assertFalse(process_is_live(self.calls()[0]["pid"]))
 
     def test_no_ack_replayed_step_and_invalid_protocol_remain_uncertain(self):
         for scenario in ("no_ack", "replay", "invalid_json", "exit_without_ack", "wrong_step"):
@@ -207,7 +229,7 @@ class AgyWakeTests(unittest.TestCase):
                 result = self.wake(scenario)
                 self.assertEqual("uncertain", result["status"])
                 self.assertEqual([], self.receipts)
-                self.assertFalse(Path("/proc", str(self.calls()[-2]["pid"])).exists())
+                self.assertFalse(process_is_live(self.calls()[-2]["pid"]))
 
     def test_receipt_is_emitted_before_long_processing_and_blocks_second_delivery(self):
         attempts = []
@@ -215,7 +237,7 @@ class AgyWakeTests(unittest.TestCase):
         def received(receipt):
             self.receipts.append(receipt)
             self.assertEqual("running", receipt["processing_status"])
-            self.assertTrue(Path("/proc", str(self.calls()[0]["pid"])).exists())
+            self.assertTrue(process_is_live(self.calls()[0]["pid"]))
             other_job = {**self.job, "id": str(uuid.uuid4()), "group_id": "another-group"}
             attempts.append(agy_wake.wake(other_job, self.fail))
             self.release.touch()
@@ -244,11 +266,7 @@ class AgyWakeTests(unittest.TestCase):
         descendant = next(call["pid"] for call in self.calls() if call["phase"] == "descendant")
 
         def child_is_live():
-            try:
-                state = Path("/proc", str(descendant), "stat").read_text().split(") ", 1)[1].split()[0]
-                return state != "Z"
-            except (FileNotFoundError, ProcessLookupError):
-                return False
+            return process_is_live(descendant)
 
         if child_is_live():
             self.addCleanup(subprocess.run, ["kill", "-KILL", str(descendant)], check=False, capture_output=True)

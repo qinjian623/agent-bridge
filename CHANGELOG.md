@@ -2,6 +2,12 @@
 
 # Changes
 
+## 0.3.7 — 2026-11-23
+
+- Pace native delivery retries and receipt checks, and skip redundant writes and capability probes.
+- Report unsupported Antigravity automatic resume on macOS before starting a helper.
+- Prefer `/var/tmp` for Linux OTA self-tests and fall back to `/tmp` if directory creation fails.
+
 ## 0.3.6 — 2026-11-23
 
 - Advance remote event cursors across filtered history and keep tool details at the source by default.

@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import fcntl
 import os
+import sys
 from pathlib import Path
+
+
+def unsupported_platform_reason(platform_name=None):
+    """Identify platforms without verified automatic-resume ownership checks."""
+    platform_name = sys.platform if platform_name is None else platform_name
+    if platform_name.startswith("linux"):
+        return None
+    platform_label = "macOS" if platform_name == "darwin" else platform_name
+    # Darwin's F_GETLK reports pid -1 for flock; an open fd does not prove ownership.
+    return (f"AGY automatic resume is unsupported on {platform_label}: "
+            "process and native flock ownership cannot be verified safely")
 
 
 def _lock_records(proc_root):
@@ -65,6 +77,8 @@ def inactive_reason(native_id, executable, *, native_home=None, proc_root=None, 
     """Return None only when no matching or unidentified AGY instance is active."""
     if not isinstance(native_id, str) or not native_id or Path(native_id).name != native_id:
         return "Invalid native AGY conversation ID"
+    if proc_root is None and (reason := unsupported_platform_reason()):
+        return reason
     native_home = Path(native_home) if native_home is not None else Path.home() / ".gemini/antigravity-cli"
     proc_root = Path(proc_root) if proc_root is not None else Path("/proc")
     reason = _target_lock_reason(native_id, native_home, proc_root, exclude_pid)

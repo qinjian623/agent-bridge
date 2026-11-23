@@ -610,13 +610,16 @@ class DefaultPeerClientFactoryTests(unittest.IsolatedAsyncioTestCase):
         await client.pull_requests({"after": 0})
         self.assertIs(transport.calls[0][0]["params"]["identity_only"], True)
         self.assertEqual("peer.pull_requests", transport.calls[1][0]["method"])
+        await client.lookup_delivery({"delivery_id": "delivery-1"})
+        self.assertIs(transport.calls[2][0]["params"]["identity_only"], True)
+        self.assertEqual("peer.lookup_delivery", transport.calls[3][0]["method"])
         transport.hello = hello_result(generation="gen-b")
         with self.assertRaises(BridgeError) as caught:
             await client.events({"after": 0})
 
         self.assertEqual(PeerErrorCode.IDENTITY_MISMATCH, caught.exception.code)
-        self.assertEqual(3, len(transport.calls))
-        self.assertIs(transport.calls[2][0]["params"]["identity_only"], True)
+        self.assertEqual(5, len(transport.calls))
+        self.assertIs(transport.calls[4][0]["params"]["identity_only"], True)
 
     async def test_explicit_identity_only_hello_does_not_change_later_ordinary_requests(self):
         registry = ConfigHostRegistry({"gpu-a": make_host()})

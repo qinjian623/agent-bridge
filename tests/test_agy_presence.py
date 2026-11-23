@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_bridge.agy_presence import inactive_reason
+from agent_bridge.agy_presence import inactive_reason, unsupported_platform_reason
 
 
 class AgYPresenceTests(unittest.TestCase):
@@ -185,6 +185,39 @@ class AgYPresenceTests(unittest.TestCase):
     def test_custom_script_executable_is_recognized(self):
         self.process(601, ["python3", str(self.executable), "--conversation=target"], binary="python3")
         self.assertIn("conversation is active", self.check())
+
+    def test_platform_capability_is_explicit_and_does_not_claim_darwin_owner_support(self):
+        self.assertIsNone(unsupported_platform_reason("linux"))
+        self.assertIsNone(unsupported_platform_reason("linux2"))
+        for platform_name, label in (("darwin", "macOS"), ("freebsd14", "freebsd14")):
+            with self.subTest(platform=platform_name):
+                reason = unsupported_platform_reason(platform_name)
+                self.assertIn("unsupported", reason)
+                self.assertIn(label, reason)
+                self.assertIn("flock ownership", reason)
+
+    def test_darwin_without_proc_fixture_fails_closed_before_inspection(self):
+        with patch("agent_bridge.agy_presence.sys.platform", "darwin"), \
+             patch("agent_bridge.agy_presence._target_lock_reason", side_effect=AssertionError("no Linux lock probe")), \
+             patch.object(Path, "iterdir", side_effect=AssertionError("no /proc scan")):
+            for excluded in (None, 123):
+                reason = inactive_reason("target", "agy", native_home=self.home, exclude_pid=excluded)
+                self.assertIn("unsupported on macOS", reason)
+
+    def test_explicit_proc_fixture_keeps_linux_semantics_on_darwin(self):
+        with patch("agent_bridge.agy_presence.sys.platform", "darwin"):
+            self.assertIsNone(self.check())
+            self.process(801, ["agy-real", "--conversation=target"])
+            self.assertIn("conversation is active", self.check())
+            self.assertIsNone(self.check(exclude_pid=801))
+
+    def test_unverifiable_flock_is_not_treated_as_excluded_owner_on_darwin(self):
+        path = self.home / "presence/target.lock"
+        path.touch()
+        with path.open("rb") as handle, patch("agent_bridge.agy_presence.sys.platform", "darwin"):
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIn("unsupported on macOS", inactive_reason("target", "agy", native_home=self.home,
+                                                                exclude_pid=os.getpid()))
 
 
 if __name__ == "__main__":

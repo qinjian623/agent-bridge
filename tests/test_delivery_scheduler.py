@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_bridge import groups
 from agent_bridge.broker import Broker, DeliveryScheduler
@@ -158,6 +159,126 @@ class DeliverySchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], await self.scheduler.step())
         self.assertEqual(1, len(self.client.deliver_calls))
         self.assertEqual("pending", self.outbox(second["recipients"][0]["delivery_id"])["status"])
+
+    async def test_unchanged_pending_lookup_preserves_the_acceptance_receipt_without_writing(self):
+        self.create([REMOTE_NATIVE])
+        self.broadcast("one", "send-1")
+        receipt = {"accepted_at": 12.5}
+        self.client.deliveries.append({"status": "accepted_remote", "send_status": "pending", "receipt": receipt})
+        [accepted] = await self.scheduler.step()
+
+        with patch.object(self.scheduler, "_finish", wraps=self.scheduler._finish) as finish:
+            self.assertEqual([], await self.scheduler.step())
+            self.assertEqual([], await self.scheduler.step())
+        finish.assert_not_called()
+        stored = self.outbox(accepted["delivery_id"])
+        self.assertEqual(receipt, json.loads(stored["receipt"]))
+        self.assertEqual(accepted["revision"], stored["revision"])
+        self.assertEqual(2, len(self.client.lookup_calls))
+
+    async def test_automatic_deferred_receipts_back_off_to_a_cap_and_never_resubmit(self):
+        self.create([REMOTE_NATIVE])
+        first = self.broadcast("one", "send-1")
+        second = self.broadcast("two", "send-2")
+        self.client.deliveries.extend([{"status": "accepted_remote", "send_status": "pending"}] * 2)
+        first_id = first["recipients"][0]["delivery_id"]
+        second_id = second["recipients"][0]["delivery_id"]
+
+        now = 0.0
+        with patch("agent_bridge.broker.monotonic", side_effect=lambda: now):
+            await self.scheduler.step(automatic=True)
+            due_times = (0.5, 1.5, 3.5, 7.5, 15.5, 31.5, 61.5, 91.5)
+            for index, due in enumerate(due_times):
+                if index:
+                    now = due - 0.25
+                    self.assertEqual([], await self.scheduler.step(automatic=True))
+                    self.assertEqual(index, len(self.client.lookup_calls))
+                self.client.lookups.append(self.native_lookup(
+                    first, "sending" if index % 2 else "pending",
+                    processing_status=None, receipt=None, native_turn_id=None,
+                ))
+                now = due
+                await self.scheduler.step(automatic=True)
+                self.assertEqual(index + 1, len(self.client.lookup_calls))
+                self.assertEqual("pending", self.outbox(second_id)["status"])
+                self.assertEqual(1, len(self.client.deliver_calls))
+            self.client.lookups.append(self.native_lookup(first))
+            now += 30
+            [released] = await self.scheduler.step(automatic=True)
+            self.assertEqual("released", released["status"])
+            self.assertNotIn(first_id, self.scheduler._receipt_polls)
+            [next_delivery] = await self.scheduler.step(automatic=True)
+            self.assertEqual(second_id, next_delivery["delivery_id"])
+        self.assertEqual([first_id, second_id], [call["delivery_id"] for call in self.client.deliver_calls])
+
+    async def test_automatic_read_errors_back_off_but_step_and_pump_bypass_the_delay(self):
+        self.create([REMOTE_NATIVE])
+        first = self.broadcast("one", "send-1")
+        self.client.deliveries.append({"status": "accepted_remote", "send_status": "pending"})
+        enqueued_lookup = self.native_lookup(first, "enqueued", native_turn_id=None)
+        self.client.lookups.extend([
+            ConnectionError("first read failed"), ConnectionError("different read error"),
+            enqueued_lookup, enqueued_lookup, self.native_lookup(first),
+        ])
+        now = 0.0
+        with patch("agent_bridge.broker.monotonic", side_effect=lambda: now):
+            await self.scheduler.step(automatic=True)
+            now = 0.5
+            await self.scheduler.step(automatic=True)
+            now = 1.5
+            await self.scheduler.step(automatic=True)
+            now = 2.0
+            self.assertEqual([], await self.scheduler.step(automatic=True))
+            self.assertEqual(2, len(self.client.lookup_calls))
+            [enqueued] = await self.scheduler.step()
+            self.assertEqual("enqueued", enqueued["send_status"])
+            # A changed local revision bypasses the prior automatic deadline too.
+            self.assertEqual([], await self.scheduler.step(automatic=True))
+            self.assertEqual(4, len(self.client.lookup_calls))
+            [released] = await self.scheduler.pump()
+            self.assertEqual("released", released["status"])
+        self.assertEqual(5, len(self.client.lookup_calls))
+        self.assertEqual(1, len(self.client.deliver_calls))
+
+    async def test_automatic_enqueued_receipts_are_checked_quickly_after_new_sends(self):
+        self.create([REMOTE_NATIVE])
+        self.create([REMOTE_BRIDGE], name="other")
+        first = self.broadcast("one", "send-1")
+        self.client.deliveries.extend([
+            {"status": "accepted_remote", "send_status": "pending"}, {"status": "accepted_remote"},
+        ])
+        enqueued = self.native_lookup(first, "enqueued", native_turn_id=None)
+        self.client.lookups.extend([enqueued] * 5)
+        now = 0.0
+        with patch("agent_bridge.broker.monotonic", side_effect=lambda: now):
+            await self.scheduler.step(automatic=True)
+            now = 0.5
+            await self.scheduler.step(automatic=True)
+            self.broadcast("other stream", "different", name="other")
+            now = 1.0
+            lookup = self.client.lookup_delivery
+            heads = self.scheduler.heads
+
+            def native_first(*args, **kwargs):
+                return sorted(heads(*args, **kwargs), key=lambda head: head["target_kind"] != "native")
+
+            async def lookup_after_send(params):
+                self.assertEqual(2, len(self.client.deliver_calls))
+                return await lookup(params)
+
+            with (
+                patch.object(self.scheduler, "heads", native_first),
+                patch.object(self.client, "lookup_delivery", lookup_after_send),
+            ):
+                await self.scheduler.step(automatic=True)
+            self.assertEqual(2, len(self.client.lookup_calls))
+            for index, due in enumerate((2.0, 4.0, 6.0), start=2):
+                now = due - 0.25
+                self.assertEqual([], await self.scheduler.step(automatic=True))
+                self.assertEqual(index, len(self.client.lookup_calls))
+                now = due
+                self.assertEqual([], await self.scheduler.step(automatic=True))
+                self.assertEqual(index + 1, len(self.client.lookup_calls))
 
     async def test_native_receipt_releases_once_and_processing_failure_does_not_block(self):
         self.create([REMOTE_NATIVE])
