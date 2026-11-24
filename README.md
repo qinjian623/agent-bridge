@@ -35,11 +35,10 @@ To install Web as a background service that restarts with OTA, pass `--with-web`
 For Codex, run:
 
 ```bash
-codex mcp add cli-agent-bridge -- "$(command -v agent-bridge)" mcp
-codex mcp list
+agent-bridge integrate codex
 ```
 
-Start a new Codex session to load the tools. For other MCP clients, use the absolute `agent-bridge` executable as the command and `["mcp"]` as its arguments. The broker must be running. See [MCP setup](docs/getting-started.md#mcp-setup) for custom state directories and managed launchers.
+Start a new Codex session to load the tools. For Claude Code, Pi, or Antigravity, replace `codex` with `claude`, `pi`, or `agy`. For another MCP client, use the absolute `agent-bridge` executable as the command and `["mcp"]` as its arguments. The broker must be running. See [MCP setup](docs/getting-started.md#mcp-setup) for custom state directories and managed launchers.
 
 ## Send a first task
 

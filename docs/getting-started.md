@@ -129,7 +129,18 @@ Help, setup prompts, monitor labels, fixed human-facing errors, and parent notic
 <a id="mcp-setup"></a>
 ## MCP setup
 
-Run the broker first (`agent-bridge serve`). For Codex, register the installed executable:
+With Bridge and the target CLI installed, run one of these commands to install the bundled skill and register the Bridge MCP server for that user:
+
+```bash
+agent-bridge integrate codex
+agent-bridge integrate claude
+agent-bridge integrate pi
+agent-bridge integrate agy
+```
+
+Each invocation targets one client. Pi needs a version with a built-in `pi mcp add` command. Existing conflicting entries and shared skills are left in place. Pass `--state /absolute/path` before `integrate` to connect the client to a specific Bridge state directory. For an OTA installation, both new registrations use stable paths. Start a new client session or reload it after setup, and keep the broker running to use the tools.
+
+To register just MCP manually, run the broker first (`agent-bridge serve`). For Codex:
 
 ```bash
 codex mcp add cli-agent-bridge -- "$(command -v agent-bridge)" mcp

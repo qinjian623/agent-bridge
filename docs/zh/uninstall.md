@@ -90,7 +90,7 @@ codex mcp remove cli-agent-bridge
 codex mcp list
 ```
 
-在其他配置过的 MCP 客户端中移除对应条目，再重载或退出客户端，让其 stdio MCP 进程退出。这不会删除模型 CLI 的登录凭据。
+用过 `agent-bridge integrate` 时，确认该命令输出的 skill 链接指向 Bridge 随包技能，再移除该链接。在其他配置过的 MCP 客户端中移除对应条目，再重载或退出客户端，让其 stdio MCP 进程退出。这不会删除模型 CLI 的登录凭据。
 
 使用过 `scripts/install_local.py` 时，检查它创建的链接：
 

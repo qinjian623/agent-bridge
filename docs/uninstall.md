@@ -90,7 +90,7 @@ codex mcp remove cli-agent-bridge
 codex mcp list
 ```
 
-Remove the matching entry from any other MCP clients you configured, then reload or exit those clients so their stdio MCP processes stop. This does not remove model CLI login credentials.
+For clients configured using `agent-bridge integrate`, also remove the skill symlink printed by that command after confirming that it points to the bundled Bridge skill. Remove the matching entry from any other MCP clients you configured, then reload or exit those clients so their stdio MCP processes stop. This does not remove model CLI login credentials.
 
 If you used `scripts/install_local.py`, inspect its links:
 

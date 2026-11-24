@@ -35,11 +35,10 @@ CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英
 Codex 用户执行：
 
 ```bash
-codex mcp add cli-agent-bridge -- "$(command -v agent-bridge)" mcp
-codex mcp list
+agent-bridge integrate codex
 ```
 
-新建一个 Codex 会话以加载工具。其他 MCP 客户端将命令设为 `agent-bridge` 的绝对路径，参数设为 `["mcp"]`。broker 需要保持运行。自定义状态目录和托管入口见 [MCP 设置](getting-started.md#mcp-setup)。
+新建一个 Codex 会话以加载工具。Claude Code、Pi 或 Antigravity 可将 `codex` 换成 `claude`、`pi` 或 `agy`。其他 MCP 客户端将命令设为 `agent-bridge` 的绝对路径，参数设为 `["mcp"]`。broker 需要保持运行。自定义状态目录和托管入口见 [MCP 设置](getting-started.md#mcp-setup)。
 
 ## 派发第一个任务
 

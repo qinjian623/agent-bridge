@@ -125,6 +125,10 @@ def build_parser():
     add_init_arguments(init_parser)
     commands.add_parser("serve", help=_('Run the persistent Unix socket broker'))
     commands.add_parser("mcp", help=_('Run the MCP tools over stdio'))
+    integration = commands.add_parser(
+        "integrate", help=_('Install the Bridge MCP server and skill for one agent'),
+    )
+    integration.add_argument("agent", choices=("codex", "claude", "claude-code", "pi", "antigravity", "agy"))
     commands.add_parser("doctor", help=_('Check local configuration and installed CLI paths'))
     commands.add_parser(
         "update",
@@ -301,6 +305,10 @@ def _main(argv: list[str]):
             from .broker import Broker
 
             asyncio.run(Broker(state).serve())
+        elif args.command == "integrate":
+            from .integration import install_integration
+
+            print(json.dumps(install_integration(state, args.agent), ensure_ascii=False, indent=2))
         elif args.command == "update":
             from .updater import main as update_main
 

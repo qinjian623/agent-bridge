@@ -83,6 +83,26 @@ def main(dist: Path) -> None:
         assert timer.is_file()
         subprocess.run([str(launcher), "doctor"], cwd=work, env=env,
                        stdout=subprocess.DEVNULL, check=True, timeout=25)
+        codex = fixtures / "codex"
+        codex.write_text(
+            f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -I - \"$@\" <<'PY'\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "assert sys.argv[1:5] == ['mcp', 'add', 'cli-agent-bridge', '--']\n"
+            "command, *args = sys.argv[5:]\n"
+            "(Path(os.environ['CODEX_HOME']) / 'config.toml').write_text(\n"
+            "    '[mcp_servers.cli-agent-bridge]\\ncommand = ' + json.dumps(command) + '\\nargs = ' + json.dumps(args) + '\\n')\n"
+            "PY\n",
+            encoding="utf-8",
+        )
+        codex.chmod(0o700)
+        codex_home = home / ".codex"
+        integration = json.loads(subprocess.check_output(
+            [str(launcher), "integrate", "codex"], cwd=work, env={**env, "CODEX_HOME": str(codex_home)},
+            text=True, timeout=25,
+        ))
+        assert Path(integration["skill"]).readlink() == root / "current/skill"
+        assert str(root / "bin/agent-bridge") in (codex_home / "config.toml").read_text()
         repeated = subprocess.run(installer, cwd=work, env=env, capture_output=True, text=True, timeout=25)
         assert repeated.returncode != 0 and "already exists" in repeated.stderr, repeated.stderr
         assert json.loads((state / "update.json").read_text()) == settings
