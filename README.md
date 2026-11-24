@@ -28,7 +28,7 @@ agent-bridge call agent_inspect --json '{}'
 
 CLI help, setup prompts, the terminal monitor, Web pages, and parent task notices support English and Simplified Chinese. Try `agent-bridge --lang zh-CN --help`; the Web dashboard and login page have their own language selector. See [language settings](docs/getting-started.md#language).
 
-To open the dashboard, run `agent-bridge monitor --web` in another terminal and visit [the local login page](http://127.0.0.1:8080/login). Sign in with the token in your Bridge state's `admin.token`. See [Web setup](docs/getting-started.md#monitoring-and-http--sse-api).
+To install Web as a background service that restarts with OTA, pass `--with-web` to the installer. For a foreground dashboard, run `agent-bridge monitor --web`. Visit [the local login page](http://127.0.0.1:8080/login). Sign in with the token in your Bridge state's `admin.token`. See [Web setup](docs/getting-started.md#monitoring-and-http--sse-api).
 
 ## Connect MCP
 

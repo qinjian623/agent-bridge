@@ -10,6 +10,7 @@ import http.client
 import ipaddress
 import json
 import os
+import plistlib
 import re
 import secrets
 import shlex
@@ -830,7 +831,7 @@ class Updater:
         path = self.state / "update-status.json"
         if result.get("status") == "uncertain" and path.exists():
             previous = json.loads(path.read_text())
-            for key in ("target_version", "previous_version", "candidate", "previous"):
+            for key in ("target_version", "previous_version", "candidate", "previous", "web_restart_pending"):
                 if key in previous:
                     result.setdefault(key, previous[key])
         _write(path, {**result, "checked_at": time.time()})
@@ -844,6 +845,8 @@ class Updater:
 
     def _reconcile(self, previous):
         """Inspect an interrupted switch; never automatically repeat its restart."""
+        if previous.get("web_restart_pending"):
+            return self._record({"status": "uncertain", "reason": "previous_web_restart_needs_checking"})
         try:
             actual = asyncio.run(self._actual()) if previous.get("target_version") else {}
         except (OSError, TimeoutError, BridgeError):
@@ -1016,13 +1019,28 @@ class Updater:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _restart(self):
+    def _managed_web_job(self) -> str | None:
+        if self.settings["service_kind"] != "launchd":
+            return None
+        web_path, web_content = _web_service_spec(self.state, self.settings)
+        launcher = str(self.root / "bin/agent-bridge")
+        if (
+            web_path.is_file() and not web_path.is_symlink() and web_path.read_bytes() == web_content
+            and _probe_broker_service_state("launchd", web_path.stem, launcher)[2]
+        ):
+            return f"gui/{os.getuid()}/{web_path.stem}"
+        return None
+
+    def _restart(self, web_job: str | None = None):
         service = self.settings["service_name"]
         if self.settings["service_kind"] == "systemd":
-            command = ["systemctl", "--user", "restart", service]
-        else:
-            command = ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{_launchd_label(service)}"]
-        _run(command, timeout=45)
+            _run(["systemctl", "--user", "restart", service], timeout=45)
+            return
+        domain = f"gui/{os.getuid()}"
+        _run(["launchctl", "kickstart", "-k", f"{domain}/{_launchd_label(service)}"], timeout=45)
+        if web_job:
+            # launchd has no equivalent of the systemd Web unit's PartOf= relationship.
+            _run(["launchctl", "kickstart", "-k", web_job], timeout=45)
 
     def service_managed(self):
         """Changing current has no effect until the service uses our stable launcher."""
@@ -1081,32 +1099,35 @@ class Updater:
                 return {"status": "deferred", **snapshot}
             target_version = target_meta["tag"][1:]
             previous_version = json.loads((previous / "release.json").read_text())["tag"][1:] if previous else None
-            self._record(
-                {
-                    "status": "activating",
-                    "target_version": target_version,
-                    "previous_version": previous_version,
-                    "candidate": str(target),
-                    "previous": str(previous) if previous else None,
-                    "hot": effective_hot,
-                }
-            )
+            web_job = self._managed_web_job()
+            journal = {
+                "status": "activating",
+                "target_version": target_version,
+                "previous_version": previous_version,
+                "candidate": str(target),
+                "previous": str(previous) if previous else None,
+                "hot": effective_hot,
+                "web_restart_pending": bool(web_job),
+            }
+            self._record(journal)
             remove_candidate = False
             self._switch(target)
             try:
-                self._restart()
+                self._restart(web_job)
                 await self._healthy(self.state, expected_version=target_version)
             except UpdateUncertain:
                 raise
             except (RuntimeError, OSError, BridgeError):
                 try:
                     self._switch(previous)
-                    self._restart()
+                    self._restart(web_job)
                     await self._healthy(self.state, expected_version=previous_version)
                 except (RuntimeError, OSError, BridgeError) as error:
                     raise UpdateUncertain("Rollback health could not be confirmed") from error
                 remove_candidate = True
                 return {"status": "rolled_back", "reason": "new_broker_failed_health_check"}
+            if web_job:
+                self._record({**journal, "web_restart_pending": False})
             return {"status": "updated", "release": target.name, "hot": effective_hot}
         finally:
             # A timed-out restart may still be running; leave its lease to expire rather than admitting new work.
@@ -1522,6 +1543,80 @@ def _broker_service_spec(
             + f"<key>EnvironmentVariables</key><dict><key>PATH</key><string>{_launchd_path_env()}</string></dict></dict></plist>\n"
         )
     return resolved_root, kind, name, launcher, service_path, content
+
+
+def _web_service_spec(state: Path, settings: dict[str, Any]) -> tuple[Path, bytes]:
+    launcher = Path(settings["root"]) / "bin/agent-bridge"
+    args = [str(launcher), "--state", str(state), "monitor", "--web", "--host", "127.0.0.1", "--port", "8080"]
+    if settings["service_kind"] == "systemd":
+        name = settings["service_name"]
+        broker = name if name.endswith(".service") else f"{name}.service"
+        path = Path.home() / ".config/systemd/user/cli-agent-bridge-web.service"
+        content = (
+            f"[Unit]\nDescription=Agent Bridge Web monitor\nAfter={broker}\nPartOf={broker}\n\n"
+            f"[Service]\nExecStart={_systemd_exec_start(args)}\n"
+            "UMask=0077\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n"
+        ).encode()
+    else:
+        path = Path.home() / "Library/LaunchAgents/com.cli-agent-bridge.web.plist"
+        content = plistlib.dumps({
+            "Label": path.stem,
+            "ProgramArguments": args,
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "Umask": 0o077,
+        })
+    return path, content
+
+
+def _wait_for_web_service() -> None:
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", 8080, timeout=1)) as connection:
+            try:
+                # Check the listener without exposing the admin token to another app on this port.
+                connection.request("GET", "/auth/session")
+                with connection.getresponse() as response:
+                    if response.status == 401 and response.getheader("Server", "").startswith("AgentBridgeMonitor/"):
+                        return
+            except (OSError, http.client.HTTPException):
+                pass
+        time.sleep(0.2)
+    raise RuntimeError("Managed Web did not become ready on 127.0.0.1:8080")
+
+
+def install_web_service(state: Path, *, enable: bool = False) -> dict[str, object]:
+    settings = load_settings(state)
+    root = Path(settings["root"])
+    launcher = str(root / "bin/agent-bridge")
+    if not os.access(launcher, os.X_OK):
+        raise ValueError("Install the managed broker launcher before installing Web")
+    with _acquire_update_lock(root):
+        kind = settings["service_kind"]
+        path, content = _web_service_spec(state, settings)
+        _validate_write_target(path, label="Web service file")
+        if path.exists():
+            _private(path)
+            if path.read_bytes() != content:
+                raise ValueError("Refusing to overwrite an unrelated Web service")
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write_bytes(path, content)
+        if enable and kind == "systemd":
+            _run(["systemctl", "--user", "daemon-reload"], timeout=15)
+            _run(["systemctl", "--user", "enable", "--now", path.name], timeout=15)
+        elif enable:
+            status = _probe_broker_service_state(kind, path.stem, launcher)
+            domain = f"gui/{os.getuid()}"
+            if status.status == _SERVICE_ABSENT:
+                _run(["launchctl", "bootstrap", domain, str(path)], timeout=15)
+            elif not status[2]:
+                raise ValueError("An unrelated launchd job is using the Web service label")
+            elif not status[0]:
+                _run(["launchctl", "kickstart", f"{domain}/{path.stem}"], timeout=15)
+        if enable:
+            _wait_for_web_service()
+    return {"service_path": str(path), "enabled": enable}
 
 
 _SERVICE_ACTIVE = "active"
@@ -2190,7 +2285,7 @@ def main(argv=None):
         action="store_true",
         help="Wait until all live workers and active tasks stop before switching versions",
     )
-    parser.add_argument("action", choices=["check", "run", "install", "bootstrap", "source"])
+    parser.add_argument("action", choices=["check", "run", "install", "install-web", "bootstrap", "source"])
     args = parser.parse_args(argv)
     if args.action == "source" and not args.repository:
         parser.error(translate("update source requires --repository OWNER/REPO"))
@@ -2216,6 +2311,8 @@ def main(argv=None):
                 args.interval,
                 args.enable,
             )
+        elif args.action == "install-web":
+            result = install_web_service(state, enable=args.enable)
         elif args.action == "source":
             result = change_update_source(state, args.repository, clear_mirror=args.clear_mirror)
         elif args.action == "run":

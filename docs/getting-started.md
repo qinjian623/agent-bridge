@@ -20,6 +20,12 @@ It uses your existing `uv` or installs it to `~/.local/bin` and provisions Pytho
 
 `~/.local/bin/agent-bridge` points to the stable launcher. Add `$HOME/.local/bin` to `PATH` if your shell cannot find the command. Use `agent-bridge init` to configure profiles and [register MCP separately](#mcp-setup).
 
+Pass `--with-web` to also install the Web dashboard as a user service on `127.0.0.1:8080`. It restarts with the broker on Linux. On macOS, OTA also restarts the installed Web LaunchAgent when it is loaded.
+
+```bash
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh -s -- --with-web
+```
+
 To write the service files without starting them during setup, pass `--no-start`.
 
 ```bash
@@ -461,7 +467,7 @@ Successful events require review; unknown outcomes require inspection and resolv
 
 Terminal UI (`agent-bridge monitor`), web UI (`agent-bridge monitor --web`), and MCP `agent_monitor` unify `pi`, `claude`, `antigravity` (`agy`), and `codex` across both bridge-managed sessions and local native processes, prioritizing active, running, and approval-waiting sessions.
 
-After starting the broker, run `agent-bridge monitor --web` in another terminal. If you supplied a custom `--state`, use that same option before `monitor`. Open [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login) and enter the token from `admin.token` in that state directory. The default location is `~/.local/state/cli-agent-bridge/admin.token`. Keep the listener on loopback and the token private. The macOS native process list does not report the process working directory.
+On an existing managed install, `agent-bridge update --enable install-web` installs and starts the Web service. It refuses to replace a custom service file with the same name. For a foreground dashboard, start the broker and run `agent-bridge monitor --web` in another terminal. If you supplied a custom `--state`, use that same option before `monitor`. Open [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login) and enter the token from `admin.token` in that state directory. The default location is `~/.local/state/cli-agent-bridge/admin.token`. Keep the listener on loopback and the token private. The macOS native process list does not report the process working directory.
 
 - CLI filters: `agent-bridge monitor --once --format json --runtime agy --source all --active-only --session-limit 50` (supports `--no-native`).
 - MCP tool: `agent_monitor` supports `runtime` (including `agy`), `source` (`all`/`bridge`/`native`), `status` (`all`/`active`/`running`/`idle`/`waiting`/`waiting_input`/`stopped`), `session_limit`, `include_native`, and `after_seq`.

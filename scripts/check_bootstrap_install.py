@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import shlex
 import subprocess
 import sys
@@ -52,7 +53,7 @@ def main(dist: Path) -> None:
         }
         env.pop("PYTHONPATH", None)
         root = home / ".local/share/cli-agent-bridge"
-        installer = ["sh", str(dist / "install.sh"), "--no-start"]
+        installer = ["sh", str(dist / "install.sh"), "--no-start", "--with-web"]
         bad = subprocess.run(installer, cwd=work, env={**env, "BRIDGE_FIXTURE_CORRUPT": "1"},
                              capture_output=True, text=True, timeout=90)
         assert bad.returncode != 0 and "SHA-256 verification" in bad.stderr, bad.stderr
@@ -69,8 +70,16 @@ def main(dist: Path) -> None:
         assert (root / "current/skill/SKILL.md").is_file()
         if sys.platform == "darwin":
             timer = home / "Library/LaunchAgents/com.cli-agent-bridge.update.plist"
+            web = plistlib.loads(timer.with_name("com.cli-agent-bridge.web.plist").read_bytes())
+            assert web["ProgramArguments"] == [
+                str(root / "bin/agent-bridge"), "--state", str(state), "monitor", "--web",
+                "--host", "127.0.0.1", "--port", "8080",
+            ]
         else:
             timer = home / ".config/systemd/user/cli-agent-bridge-update.timer"
+            web = timer.with_name("cli-agent-bridge-web.service").read_text()
+            assert "PartOf=cli-agent-bridge.service\n" in web
+            assert '"--host" "127.0.0.1" "--port" "8080"' in web
         assert timer.is_file()
         subprocess.run([str(launcher), "doctor"], cwd=work, env=env,
                        stdout=subprocess.DEVNULL, check=True, timeout=25)
@@ -95,7 +104,7 @@ with patch('agent_bridge.updater._download_bytes', return_value=dumps({'tag_name
 """
         subprocess.run([str(root / "current/bin/python"), "-I", "-c", verify, str(state), tag],
                        cwd=work, env=env, check=True, timeout=25)
-    print(f"Release installer verified for {tag}: SHA-256, isolated install, repeat protection, and OTA discovery.")
+    print(f"Release installer verified for {tag}: SHA-256, isolated install with managed Web, repeat protection, and OTA discovery.")
 
 
 if __name__ == "__main__":

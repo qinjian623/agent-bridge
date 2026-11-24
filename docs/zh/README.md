@@ -28,7 +28,7 @@ agent-bridge call agent_inspect --json '{}'
 
 CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英文与简体中文。运行 `agent-bridge --lang zh-CN --help` 查看中文帮助；Web 仪表盘和登录页可单独选择语言，见[语言设置](getting-started.md#language)。
 
-需要查看 Web 仪表盘时，在另一个终端运行 `agent-bridge monitor --web`，打开[本机登录页](http://127.0.0.1:8080/login)，使用 Bridge 状态目录下 `admin.token` 中的令牌登录。见 [Web 设置](getting-started.md#监控与接入接口)。
+需要查看 Web 仪表盘时，安装时传入 `--with-web` 可将 Web 作为用户服务，并随 OTA 重启。也可在另一个终端运行 `agent-bridge monitor --web`，打开[本机登录页](http://127.0.0.1:8080/login)，使用 Bridge 状态目录下 `admin.token` 中的令牌登录。见 [Web 设置](getting-started.md#监控与接入接口)。
 
 ## 接入 MCP
 

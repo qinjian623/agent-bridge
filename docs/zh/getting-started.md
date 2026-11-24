@@ -20,6 +20,12 @@ curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/i
 
 `~/.local/bin/agent-bridge` 指向固定程序入口。如果找不到命令，把 `$HOME/.local/bin` 加入 `PATH`。用 `agent-bridge init` 配置 profile，再[单独登记 MCP](#mcp-setup)。
 
+传入 `--with-web` 会同时安装 Web 用户服务，只监听 `127.0.0.1:8080`。Linux 上 Web 随 Broker 重启。macOS 上 OTA 会同时重启已加载的 Web LaunchAgent。
+
+```bash
+curl -fsSL https://github.com/qinjian623/agent-bridge/releases/latest/download/install.sh | sh -s -- --with-web
+```
+
 只写入服务文件，暂不启动时，传入 `--no-start`。
 
 ```bash
@@ -506,7 +512,7 @@ Telegram 仍使用原来的话题和发送记录。配置 `telegram_database` �
 
 TUI（`agent-bridge monitor`）、Web（`agent-bridge monitor --web`）和 MCP `agent_monitor` 统一覆盖 `pi`、`claude`、`antigravity`（`agy`）、`codex` 四个运行时，分别统计 Bridge 托管会话与本机原生 CLI / worker 进程（包括 `presence/*.lock`、`codex resume`、独立 `pi` 与 `claude` 终端）。Web 与 Bridge 会话列表优先展示活跃 / 运行中 / 待审批会话，避免被大量历史已停止记录淹没。
 
-启动 Broker 后，在另一个终端运行 `agent-bridge monitor --web`。如果 Broker 使用了自定义 `--state`，在 `monitor` 之前传入同一个选项。打开 [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login)，输入该状态目录内 `admin.token` 的令牌，默认文件为 `~/.local/state/cli-agent-bridge/admin.token`。保持监听在回环地址并妥善保管令牌。macOS 的原生进程列表不显示进程工作目录。
+已有 OTA 安装可以用 `agent-bridge update --enable install-web` 安装并启动 Web 服务。若同名服务文件已有自定义配置，安装命令会拒绝覆盖。临时打开 Web 时，在启动 Broker 后于另一个终端运行 `agent-bridge monitor --web`。如果 Broker 使用了自定义 `--state`，在 `monitor` 之前传入同一个选项。打开 [http://127.0.0.1:8080/login](http://127.0.0.1:8080/login)，输入该状态目录内 `admin.token` 的令牌，默认文件为 `~/.local/state/cli-agent-bridge/admin.token`。保持监听在回环地址并妥善保管令牌。macOS 的原生进程列表不显示进程工作目录。
 
 
 - CLI 过滤：`agent-bridge monitor --once --format json --runtime agy --source all --active-only --session-limit 50`（也支持 `--no-native`；`--web` 不接受终端筛选参数）。

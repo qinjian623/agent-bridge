@@ -55,6 +55,9 @@ Linux `systemd --user`（也适用于旧 `install_local.py`）：
 
 ```bash
 systemctl --user cat cli-agent-bridge.service
+# 如已安装 Web 用户服务：
+systemctl --user disable --now cli-agent-bridge-web.service
+rm -f "$HOME/.config/systemd/user/cli-agent-bridge-web.service"
 systemctl --user disable --now cli-agent-bridge.service
 rm -f "$HOME/.config/systemd/user/cli-agent-bridge.service"
 rm -f "$HOME/.config/systemd/user/cli-agent-bridge-update.timer"
@@ -68,6 +71,9 @@ macOS `launchd`：
 
 ```bash
 launchctl print "gui/$(id -u)/com.cli-agent-bridge.broker"
+# 如已安装 Web 用户服务：
+launchctl bootout "gui/$(id -u)/com.cli-agent-bridge.web"
+rm -f "$HOME/Library/LaunchAgents/com.cli-agent-bridge.web.plist"
 launchctl bootout "gui/$(id -u)/com.cli-agent-bridge.broker"
 rm -f "$HOME/Library/LaunchAgents/com.cli-agent-bridge.broker.plist"
 rm -f "$HOME/Library/LaunchAgents/com.cli-agent-bridge.update.plist"

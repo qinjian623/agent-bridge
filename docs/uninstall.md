@@ -55,6 +55,9 @@ Linux `systemd --user` (including the legacy `install_local.py` helper):
 
 ```bash
 systemctl --user cat cli-agent-bridge.service
+# If the managed Web service was installed:
+systemctl --user disable --now cli-agent-bridge-web.service
+rm -f "$HOME/.config/systemd/user/cli-agent-bridge-web.service"
 systemctl --user disable --now cli-agent-bridge.service
 rm -f "$HOME/.config/systemd/user/cli-agent-bridge.service"
 rm -f "$HOME/.config/systemd/user/cli-agent-bridge-update.timer"
@@ -68,6 +71,9 @@ macOS `launchd`:
 
 ```bash
 launchctl print "gui/$(id -u)/com.cli-agent-bridge.broker"
+# If the managed Web service was installed:
+launchctl bootout "gui/$(id -u)/com.cli-agent-bridge.web"
+rm -f "$HOME/Library/LaunchAgents/com.cli-agent-bridge.web.plist"
 launchctl bootout "gui/$(id -u)/com.cli-agent-bridge.broker"
 rm -f "$HOME/Library/LaunchAgents/com.cli-agent-bridge.broker.plist"
 rm -f "$HOME/Library/LaunchAgents/com.cli-agent-bridge.update.plist"

@@ -779,6 +779,97 @@ class ActivationTests(UpdateFixture):
 
 
 class TimerAndLauncherTests(UpdateFixture):
+    def test_web_service_installs_alongside_managed_broker_without_replacing_custom_unit(self):
+        updater._ensure_launchers(self.root)
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run") as run,
+            patch.object(updater, "_wait_for_web_service") as ready,
+        ):
+            result = updater.install_web_service(self.state)
+            path = Path(result["service_path"])
+            text = path.read_text()
+            self.assertIn("PartOf=cli-agent-bridge.service\n", text)
+            self.assertIn("After=cli-agent-bridge.service\n", text)
+            self.assertIn(f'"{self.root / "bin/agent-bridge"}"', text)
+            self.assertIn('"monitor" "--web" "--host" "127.0.0.1" "--port" "8080"', text)
+            run.assert_not_called()
+            ready.assert_not_called()
+
+            updater.install_web_service(self.state, enable=True)
+            ready.assert_called_once_with()
+            self.assertEqual(run.call_args_list, [
+                call(["systemctl", "--user", "daemon-reload"], timeout=15),
+                call(["systemctl", "--user", "enable", "--now", path.name], timeout=15),
+            ])
+            path.write_text("custom unit")
+            run.reset_mock()
+            with self.assertRaisesRegex(ValueError, "unrelated Web service"):
+                updater.install_web_service(self.state, enable=True)
+            self.assertEqual(path.read_text(), "custom unit")
+            run.assert_not_called()
+
+    def test_launchd_ota_restarts_the_installed_web_job_alongside_broker(self):
+        settings = {**self.settings, "service_kind": "launchd", "service_name": "com.example.broker.plist"}
+        updater._write(self.state / "update.json", settings)
+        updater._ensure_launchers(self.root)
+        instance = updater.Updater(self.state)
+        launcher = str(self.root / "bin/agent-bridge")
+        domain = f"gui/{os.getuid()}"
+        broker = ["launchctl", "kickstart", "-k", f"{domain}/com.example.broker"]
+        label = "com.cli-agent-bridge.web"
+        web = f"{domain}/{label}"
+        absent = updater._ServiceCommandError("not loaded", returncode=113)
+        running = f"\tstate = running\n\tpid = 1234\n\tprogram = {launcher}\n"
+        with (
+            patch.object(updater.Path, "home", return_value=self.home),
+            patch.object(updater, "_run") as run,
+            patch.object(updater, "_wait_for_web_service") as ready,
+        ):
+            instance._restart(instance._managed_web_job())
+            run.assert_called_once_with(broker, timeout=45)
+            run.reset_mock()
+            run.side_effect = [absent, ""]
+            result = updater.install_web_service(self.state, enable=True)
+            ready.assert_called_once_with()
+            path = Path(result["service_path"])
+            self.assertEqual(plistlib.loads(path.read_bytes())["ProgramArguments"], [
+                launcher, "--state", str(self.state), "monitor", "--web", "--host", "127.0.0.1", "--port", "8080",
+            ])
+            self.assertEqual(run.call_args_list, [
+                call(["launchctl", "print", web], timeout=10),
+                call(["launchctl", "bootstrap", domain, str(path)], timeout=15),
+            ])
+            run.reset_mock()
+            run.side_effect = [running, "", ""]
+            instance._restart(instance._managed_web_job())
+            self.assertEqual(run.call_args_list, [
+                call(["launchctl", "print", web], timeout=10),
+                call(broker, timeout=45),
+                call(["launchctl", "kickstart", "-k", web], timeout=45),
+            ])
+            run.reset_mock()
+            run.side_effect = [absent, ""]
+            instance._restart(instance._managed_web_job())
+            self.assertEqual(run.call_args_list, [
+                call(["launchctl", "print", web], timeout=10),
+                call(broker, timeout=45),
+            ])
+
+    def test_web_readiness_rejects_an_unrelated_listener_without_sending_credentials(self):
+        with (
+            patch.object(updater.http.client, "HTTPConnection") as connect,
+            patch.object(updater.time, "monotonic", side_effect=[0, 1, 9]),
+            patch.object(updater.time, "sleep"),
+        ):
+            response = connect.return_value.getresponse.return_value.__enter__.return_value
+            response.status = 401
+            response.getheader.return_value = "AnotherService"
+            with self.assertRaisesRegex(RuntimeError, "Web did not become ready"):
+                updater._wait_for_web_service()
+            connect.assert_called_once_with("127.0.0.1", 8080, timeout=1)
+            connect.return_value.request.assert_called_once_with("GET", "/auth/session")
+
     def test_scheduled_updater_can_find_uv_from_an_external_install_directory(self):
         uv_path = self.home / "custom tools/bin/uv"
         for kind in ("systemd", "launchd"):
@@ -989,6 +1080,31 @@ class TimerAndLauncherTests(UpdateFixture):
 
 
 class CrashAndHealthTests(UpdateFixture):
+    def test_interrupted_web_restart_cannot_be_reported_as_an_updated_broker_only(self):
+        self.updater.settings["service_kind"] = "launchd"
+        web = f"gui/{os.getuid()}/com.cli-agent-bridge.web"
+        lease = {"token": "temporary-token", "expires_at": time.time() + 180, "broker_pid": 123}
+        with (
+            patch("agent_bridge.broker.request", new=AsyncMock(return_value=lease)),
+            patch.object(updater, "busy_snapshot", return_value={"busy": False}),
+            patch.object(self.updater, "_managed_web_job", return_value=web),
+            patch.object(updater, "_run", side_effect=["", updater.UpdateUncertain()]) as run,
+        ):
+            with self.assertRaises(updater.UpdateUncertain):
+                asyncio.run(self.updater._activate(self.new, self.digest))
+            self.assertEqual(run.call_args_list[-1], call(["launchctl", "kickstart", "-k", web], timeout=45))
+
+        with (
+            patch.object(self.updater, "_actual", new=AsyncMock(return_value={"version": "0.2.0", "maintenance": False})),
+            patch.object(self.updater, "_restart") as restart,
+        ):
+            result = self.updater.run()
+            self.assertEqual(result["reason"], "previous_web_restart_needs_checking")
+            self.assertEqual(result["status"], "uncertain")
+            self.assertTrue(json.loads((self.state / "update-status.json").read_text())["web_restart_pending"])
+            self.assertEqual(self.updater.run()["status"], "uncertain")
+            restart.assert_not_called()
+
     def test_interrupt_after_pointer_switch_keeps_a_journal_and_never_replays_restart(self):
         lease = {"token": "temporary-token", "expires_at": time.time() + 180, "broker_pid": 123}
         with (

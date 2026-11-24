@@ -2,11 +2,14 @@
 set -eu
 umask 077
 
-case ${1-} in
-    -h|--help) printf '%s\n' 'Usage: sh install.sh [--no-start]'; exit 0 ;;
-    ''|--no-start) [ "$#" -le 1 ] || exit 2 ;;
-    *) printf '%s\n' 'Usage: sh install.sh [--no-start]' >&2; exit 2 ;;
-esac
+usage='Usage: sh install.sh [--no-start] [--with-web]'
+for option do
+    case $option in
+        -h|--help) printf '%s\n' "$usage"; exit 0 ;;
+        --no-start|--with-web) ;;
+        *) printf '%s\n' "$usage" >&2; exit 2 ;;
+    esac
+done
 case $(uname -s) in
     Linux|Darwin) ;;
     *) printf '%s\n' 'Agent Bridge supports Linux and macOS.' >&2; exit 1 ;;
@@ -122,12 +125,20 @@ def install():
             raise
 
     start = "--no-start" not in sys.argv[1:]
+    web = "--with-web" in sys.argv[1:]
     command = [str(python), "-I", "-m", "agent_bridge.cli", "--state", str(state), "init", "--non-interactive",
                "--ota-repo", REPOSITORY, "--install-broker-service", "--install-updater"]
     if start:
-        command += ["--enable-broker-service", "--enable-updater"]
+        command += ["--enable-broker-service"]
+        if not web:
+            command += ["--enable-updater"]
     try:
         subprocess.run(command, check=True)
+        if web:
+            update = [str(python), "-I", "-m", "agent_bridge.updater", "--state", str(state)]
+            subprocess.run([*update, *(["--enable"] if start else []), "install-web"], check=True)
+            if start:
+                subprocess.run([*update, "--enable", "install"], check=True)
         launcher.parent.mkdir(parents=True, exist_ok=True)
         launcher.symlink_to(root / "bin/agent-bridge")
     except (OSError, subprocess.CalledProcessError):
@@ -135,6 +146,8 @@ def install():
         raise
     print(f"Installed Agent Bridge {tag} at {launcher}")
     print("Broker and scheduled OTA enabled." if start else "Service files installed; Broker and OTA timer are stopped.")
+    if web:
+        print("Managed Web enabled at http://127.0.0.1:8080/login." if start else "Managed Web service files installed without starting.")
     print("Run agent-bridge init to configure your agent profiles.")
 
 
