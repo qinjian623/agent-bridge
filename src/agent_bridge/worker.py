@@ -19,7 +19,7 @@ from . import __version__, update_guard
 from .config import Config, Profile, safe_error
 from .errors import BridgeError
 from .runtimes import runtime
-from .store import Store, identifier, validate_task_timeout
+from .store import Store, identifier, is_sqlite_busy, validate_task_timeout
 from .updater import release_change_detector
 from .usage import priced_usage
 from .workspace import capture_patch
@@ -182,9 +182,11 @@ def denial(data):
 
 
 class Worker:
-    def __init__(self, state: Path, config: Config, session_id: str, *, release_changed=None):
+    def __init__(
+        self, state: Path, config: Config, session_id: str, *, release_changed=None, database_initialized: bool = False,
+    ):
         self.state, self.config, self.session_id = state, config, session_id
-        self.store = Store(state)
+        self.store = Store(state, initialize=not database_initialized)
         self.generation = identifier()
         self.task = None
         self.agent = None
@@ -399,11 +401,18 @@ class Worker:
                     return
                 pid, start = os.getpid(), process_identity(os.getpid())
                 scope = process_scope(pid) if self.config.worker_launcher == "systemd" else None
-                if not self.store.worker_starting(
-                    self.session_id, self.generation, pid, start, scope, worker_version=__version__,
-                ):
+                for retry in (False, True):
+                    try:
+                        registered = self.store.worker_starting(
+                            self.session_id, self.generation, pid, start, scope, worker_version=__version__,
+                        )
+                        break
+                    except sqlite3.OperationalError as error:
+                        if retry or not is_sqlite_busy(error):
+                            raise
+                        await asyncio.sleep(0.1)
+                if not registered:
                     return
-                registered = True
                 session = self.store.get_session(self.session_id)
                 with self.store.connection() as db:
                     session["has_native_history"] = bool(

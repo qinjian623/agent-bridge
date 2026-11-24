@@ -2,6 +2,12 @@
 
 # 变更记录
 
+## 0.3.11 — 2026-11-24
+
+- 空闲 worker 退出后等新任务入队再启动，并限制同时启动的 worker 数量，直到原生 CLI 就绪。
+- 登记 PID 较慢时继续等待，确认进程已退出后才记录启动失败。
+- 托管 worker 直接复用 Broker 已初始化的 SQLite 数据库，登记遇到临时写锁时会重试。
+
 ## 0.3.10 — 2026-11-24
 
 - 新增 `agent-bridge integrate`，可为指定的 Codex、Claude Code、Pi 或 Antigravity CLI 安装配套 skill 并注册 Bridge MCP。

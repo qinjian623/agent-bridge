@@ -67,12 +67,14 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(first, self.store.claim(self.config)["task_id"])
         self.assertEqual("queued", self.store.get_task(second)["status"])
 
-    def test_scheduler_sessions_only_returns_workers_and_open_stopped_sessions(self):
+    def test_scheduler_sessions_keeps_active_workers_and_starts_retired_workers_only_for_work(self):
         active = self.session("scheduler-active")
         self.store.control(active, "pause", 0, "pause-active")
         stopped = self.store.open(self.profile, str(self.path), "read-only", "scheduler-stopped")["session_id"]
         closed = self.store.open(self.profile, str(self.path), "read-only", "scheduler-closed")["session_id"]
         self.store.control(closed, "close", 0, "close-stopped")
+        retired = self.session("scheduler-retired")
+        self.store.worker_stopped(retired, "generation")
 
         with self.store.connection() as reader:
             self.assertEqual(
@@ -84,6 +86,16 @@ class StoreTests(unittest.TestCase):
                 ],
                 self.store.scheduler_sessions(reuse=reader),
             )
+            self.store.dispatch(retired, "new work after OTA", "resume-retired-work")
+            self.assertEqual([active, stopped, retired], [row["id"] for row in self.store.scheduler_sessions(reuse=reader)])
+
+    def test_start_failure_after_session_control_preserves_new_revision(self):
+        sid = self.store.open(self.profile, str(self.path), "read-only", "scheduler-stale")["session_id"]
+        self.store.control(sid, "pause", 0, "scheduler-stale-pause")
+        self.store.control(sid, "resume", 1, "scheduler-stale-resume")
+        self.store.worker_start_failed(sid, "startup failure from old revision", expected_revision=0)
+        row = self.store.get_session(sid)
+        self.assertEqual((row["desired"], row["observed"], row["error"]), ("open", "stopped", None))
 
     def test_idle_worker_reads_during_assignment_and_sees_it_after_commit(self):
         sid = self.session("idle-attempt")

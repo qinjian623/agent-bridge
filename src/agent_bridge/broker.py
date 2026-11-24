@@ -40,7 +40,7 @@ from .peer_protocol import (
 )
 from .peer_transport import DefaultPeerClientFactory
 from .routing import choose
-from .store import Store, encode, task_input, validate_session_name, validate_task_timeout
+from .store import Store, encode, is_sqlite_busy, task_input, validate_session_name, validate_task_timeout
 from .worker import alive, owned_processes
 from .workspace import (
     MAX_WORKSPACE_FILE_BYTES,
@@ -72,6 +72,8 @@ _HOST_BLOCKING_CODES = {
 _SESSION_EFFORT_METHODS = {"agent_open", "agent_dispatch"}
 _SESSION_EFFORT_WIRE_SUFFIX = "_with_effort"
 _IDLE_POLLS_BEFORE_BACKOFF = 3
+_MAX_WORKER_STARTS = 4
+_WORKER_START_PROBE_DELAY = 10.0
 
 
 def _peer_poll_delay(interval, empty_polls):
@@ -1378,7 +1380,11 @@ class Broker:
     async def launch(self, session_id):
         if not await self._wait_worker_released(session_id):
             raise BridgeError("worker_busy", "Previous worker is still releasing session lock or unit")
-        args = [sys.executable, "-m", "agent_bridge.cli", "--state", str(self.state), "worker", session_id]
+        args = [
+            sys.executable, "-m", "agent_bridge.cli", "--state", str(self.state),
+            "worker", session_id, "--database-initialized",
+        ]
+        detached = None
         if self.config.worker_launcher == "systemd":
             cmd = [
                 "systemd-run",
@@ -1426,25 +1432,70 @@ class Broker:
             # shortcut: detached mode is for tests; systemd is required for crash descendant cleanup.
             log = (self.state / (session_id + ".log")).open("ab")
             try:
-                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+                detached = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             finally:
                 log.close()
-        for _ in range(100):
-            session = self.store.get_session(session_id)
-            if session["worker_pid"] or session["observed"] == "recovery_needed":
-                return
+        await self._wait_worker_registration(session_id, detached)
+
+    async def _systemd_worker_exited(self, session_id: str) -> bool:
+        """Check for a terminal unit state. A failed status query proves nothing about the worker."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "--user", "show", "-p", "LoadState", "-p", "ActiveState",
+                unit_name(self.state, session_id),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            output, _ = await proc.communicate()
+        except OSError:
+            return False
+        if proc.returncode:
+            return False
+        fields = dict(line.split("=", 1) for line in output.decode(errors="replace").splitlines() if "=" in line)
+        return fields.get("LoadState") == "not-found" or fields.get("ActiveState") in {"inactive", "failed"}
+
+    async def _wait_worker_registration(self, session_id: str, detached: subprocess.Popen | None = None):
+        loop = asyncio.get_running_loop()
+        next_probe = loop.time() + _WORKER_START_PROBE_DELAY
+        while not self.stopping.is_set():
+            try:
+                session = await asyncio.to_thread(self.store.get_session, session_id)
+            except sqlite3.OperationalError as error:
+                if not is_sqlite_busy(error):
+                    raise
+            else:
+                if session["worker_pid"] or session["observed"] == "recovery_needed" or session["desired"] != "open":
+                    return
+                exited = detached is not None and detached.poll() is not None
+                if detached is None and loop.time() >= next_probe:
+                    exited = await self._systemd_worker_exited(session_id)
+                    next_probe = loop.time() + 1.0
+                if exited:
+                    raise BridgeError("worker_start_failed", "Worker process exited before registering")
             await asyncio.sleep(0.1)
-        raise BridgeError("worker_start_failed", "Worker did not register within 10 seconds")
 
     async def ensure_worker(self, session_id):
         try:
             with update_guard.operation(self.state):
-                await self.launch(session_id)
+                session = await asyncio.to_thread(self.store.get_session, session_id)
+                if session["desired"] != "open" or session["observed"] != "stopped":
+                    return
+                try:
+                    await self.launch(session_id)
+                except Exception as error:
+                    if isinstance(error, BridgeError) and error.code in {"update_busy", "worker_busy"}:
+                        return
+                    if isinstance(error, sqlite3.Error) and is_sqlite_busy(error):
+                        return
+                    await asyncio.to_thread(
+                        self.store.worker_start_failed, session_id, safe_error(error) or type(error).__name__,
+                        expected_revision=session["revision"],
+                    )
         except BridgeError as error:
-            if error.code not in {"update_busy", "worker_busy"}:
-                self.store.worker_start_failed(session_id, safe_error(error))
-        except Exception as error:
-            self.store.worker_start_failed(session_id, safe_error(error) or type(error).__name__)
+            if error.code != "update_busy":
+                raise
+        except sqlite3.OperationalError as error:
+            if not is_sqlite_busy(error):
+                raise
         finally:
             self.launching.discard(session_id)
 
@@ -1459,15 +1510,21 @@ class Broker:
                     delay = 0.5
                     try:
                         with update_guard.operation(self.state):
-                            for session in self.store.scheduler_sessions(reuse=scheduler_db):
+                            sessions = self.store.scheduler_sessions(reuse=scheduler_db)
+                            # PID registration precedes native initialization, so both phases take a slot.
+                            starting = self.launching | {row["id"] for row in sessions if row["observed"] == "starting"}
+                            start_limit = min(self.config.parallel_limit, _MAX_WORKER_STARTS)
+                            for session in sessions:
                                 if session["worker_pid"] and not alive(session):
                                     self.store.worker_stopped(session["id"], session["generation"], "Worker process disappeared")
                                 elif (
                                     session["desired"] == "open"
                                     and session["observed"] == "stopped"
                                     and session["id"] not in self.launching
+                                    and len(starting) < start_limit
                                 ):
                                     self.launching.add(session["id"])
+                                    starting.add(session["id"])
                                     task = asyncio.create_task(self.ensure_worker(session["id"]))
                                     pending.add(task)
                                     task.add_done_callback(pending.discard)

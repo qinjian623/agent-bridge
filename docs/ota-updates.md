@@ -6,6 +6,8 @@
 
 The updater checks compatibility, drains short requests, switches the broker version, and retires compatible workers after their current turn.
 
+After an idle worker retires, an open session with no queued tasks stays stopped until new work arrives. The broker limits concurrent worker startups through native CLI readiness and initializes the database before launching workers. Slow PID registration alone does not mark a session as needing recovery.
+
 ### Compatibility Contract (`__init__.py`, `store.py`, `updater.py`)
 
 | Mechanism | Location | Description |

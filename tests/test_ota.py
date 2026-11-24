@@ -396,6 +396,97 @@ class WorkerRollingUpgradeTests(unittest.IsolatedAsyncioTestCase):
         self.root, self.old, self.new = _setup_managed_releases(self.state)
         self.config = Config.load(self.state / "config.json")
 
+    async def test_registration_stays_pending_while_the_worker_is_alive(self):
+        broker = Broker(self.state)
+        sid = self._open_session(self.config.profiles["fixture"])
+        busy = sqlite3.OperationalError("database is locked")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        get_session = broker.store.get_session
+        reads = 0
+
+        def session_state(session_id):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise busy
+            return get_session(session_id)
+
+        async def still_running(session_id):
+            broker.store.worker_starting(session_id, "late-worker", os.getpid(), "start")
+            return False
+
+        with (
+            patch.object(broker_mod, "_WORKER_START_PROBE_DELAY", 0),
+            patch.object(broker.store, "get_session", side_effect=session_state),
+            patch.object(broker, "_systemd_worker_exited", side_effect=still_running) as probe,
+        ):
+            await asyncio.wait_for(broker._wait_worker_registration(sid), 2)
+        probe.assert_awaited_once_with(sid)
+        self.assertEqual(("starting", os.getpid()), (get_session(sid)["observed"], get_session(sid)["worker_pid"]))
+
+    async def test_confirmed_worker_exit_keeps_the_task_queued_and_marks_startup_failed(self):
+        broker = Broker(self.state)
+        sid = self._open_session(self.config.profiles["fixture"])
+        task_id = broker.store.dispatch(sid, "never sent", "start-exited")["task_id"]
+        child = SimpleNamespace(poll=lambda: 1)
+
+        async def launch(session_id):
+            await broker._wait_worker_registration(session_id, child)
+
+        with patch.object(broker, "launch", side_effect=launch):
+            await broker.ensure_worker(sid)
+        self.assertEqual("recovery_needed", broker.store.get_session(sid)["observed"])
+        self.assertIn("exited before registering", broker.store.get_session(sid)["error"])
+        self.assertEqual("queued", broker.store.get_task(task_id)["status"])
+        self.assertEqual([], broker.store.get_task(task_id)["attempts"])
+
+    async def test_unavailable_systemd_status_is_not_proof_of_worker_exit(self):
+        broker = Broker(self.state)
+        for code, fields, expected in (
+            (1, b"", False),
+            (0, b"LoadState=loaded\nActiveState=activating\n", False),
+            (0, b"LoadState=not-found\nActiveState=inactive\n", True),
+        ):
+            with self.subTest(code=code, fields=fields):
+                proc = SimpleNamespace(returncode=code, communicate=AsyncMock(return_value=(fields, b"")))
+                with patch.object(broker_mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)):
+                    self.assertEqual(expected, await broker._systemd_worker_exited("fixture-session"))
+
+    async def test_launch_limit_includes_workers_connecting_to_the_native_cli(self):
+        broker = Broker(self.state)
+        profile = self.config.profiles["fixture"]
+        registered = [self._open_session(profile) for _ in range(2)]
+        for sid in registered:
+            broker.store.worker_starting(sid, sid, os.getpid(), "start")
+        pending = self._open_session(profile)
+        broker.launching.update({registered[0], pending})
+        queued = [self._open_session(profile) for _ in range(4)]
+        for sid in queued:
+            broker.store.dispatch(sid, "ready work", "dispatch-" + sid)
+
+        launched = AsyncMock()
+        sweeps = 0
+
+        async def wait(_):
+            nonlocal sweeps
+            sweeps += 1
+            await asyncio.sleep(0)
+            if sweeps == 1:
+                launched.assert_not_awaited()
+                sid = registered[0]
+                broker.store.worker_ready(sid, sid, os.getpid(), "start", "native-" + sid)
+                broker.launching.discard(sid)
+            else:
+                launched.assert_awaited_once_with(queued[0])
+                broker.stopping.set()
+
+        with (
+            patch.object(broker_mod, "alive", return_value=True),
+            patch.object(broker, "ensure_worker", launched),
+            patch.object(broker, "_loop_wait", side_effect=wait),
+        ):
+            await asyncio.wait_for(broker.scheduler(), 2)
+
     async def test_active_task_finishes_before_worker_retires_and_unstarted_assigned_task_requeues_cleanly(self):
         profile = self.config.profiles["fixture"]
         worker_v1 = Worker(self.state, self.config, sid := self._open_session(profile))

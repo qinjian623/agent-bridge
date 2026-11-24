@@ -2,6 +2,12 @@
 
 # Changes
 
+## 0.3.11 — 2026-11-24
+
+- Keep retired idle workers stopped until their sessions have new queued work, and limit concurrent worker startups through native CLI readiness.
+- Keep waiting for PID registration while the worker is alive or its status is unknown. Confirm exit before recording a startup failure.
+- Reuse the broker-initialized SQLite database in managed workers and retry transient write-lock contention during registration.
+
 ## 0.3.10 — 2026-11-24
 
 - Add `agent-bridge integrate` to install the bundled skill and register the Bridge MCP server for a selected Codex, Claude Code, Pi, or Antigravity CLI.

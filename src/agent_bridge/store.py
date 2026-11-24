@@ -26,6 +26,10 @@ from .peer_protocol import (
 )
 
 
+def is_sqlite_busy(error: sqlite3.Error) -> bool:
+    return getattr(error, "sqlite_errorcode", 0) & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
 def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -373,10 +377,14 @@ CREATE TABLE IF NOT EXISTS member_bindings (
 class Store:
     PEER_MIRROR_MIGRATION_BATCH = 500
 
-    def __init__(self, state: Path):
+    def __init__(self, state: Path, *, initialize: bool = True):
         self.state = state
-        state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = state / "bridge.sqlite"
+        if not initialize:
+            if not self.path.is_file():
+                raise BridgeError("database_not_initialized", "Start the broker to initialize the worker database")
+            return
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connection(timeout=30) as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
@@ -1094,7 +1102,10 @@ class Store:
         with self.connection(reuse=reuse) as db:
             return [dict(row) for row in db.execute(
                 "SELECT id,desired,observed,worker_pid,worker_start,generation FROM sessions "
-                "WHERE worker_pid IS NOT NULL OR (desired='open' AND observed='stopped') ORDER BY created"
+                # Explicitly opened sessions can start once. Idle workers retiring after an update
+                # have a generation already and should stay stopped until a task arrives.
+                "WHERE worker_pid IS NOT NULL OR (desired='open' AND observed='stopped' AND ("
+                "generation IS NULL OR id IN (SELECT session_id FROM tasks WHERE status='queued'))) ORDER BY created"
             )]
 
     def control(self, session_id, action, revision, request_id, continue_task_id=None):
@@ -1467,10 +1478,13 @@ class Store:
             )
             self.notify_parent(db, session, seq)
 
-    def worker_start_failed(self, session_id, error):
+    def worker_start_failed(self, session_id, error, *, expected_revision=None):
         with self.connection(write=True) as db:
             session = self.required(db, "sessions", session_id)
-            if session["worker_pid"] or session["observed"] == "recovery_needed":
+            if (
+                session["worker_pid"] or session["observed"] != "stopped" or session["desired"] != "open"
+                or (expected_revision is not None and session["revision"] != expected_revision)
+            ):
                 return
             db.execute("UPDATE sessions SET observed='recovery_needed',error=? WHERE id=?", (error, session_id))
             self.event(db, "worker_start_failed", {"error": error}, session_id)

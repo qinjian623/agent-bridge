@@ -139,6 +139,7 @@ def build_parser():
     relay.add_argument("--state", default=argparse.SUPPRESS)
     worker = commands.add_parser("worker", help=_('Internal worker command (managed automatically)'))
     worker.add_argument("session_id")
+    worker.add_argument("--database-initialized", action="store_true", help=argparse.SUPPRESS)
     monitor = commands.add_parser("monitor", help=_('Monitor active agents, tasks, and communications'))
     monitor.add_argument("--web", action="store_true", help=_('Launch local web-based monitor dashboard'))
     monitor.add_argument("--port", type=int, default=8080, help=_('Web monitor port (default: 8080)'))
@@ -316,7 +317,9 @@ def _main(argv: list[str]):
         elif args.command == "worker":
             from .worker import Worker
 
-            asyncio.run(Worker(state, Config.load(state / "config.json"), args.session_id).run())
+            asyncio.run(Worker(
+                state, Config.load(state / "config.json"), args.session_id, database_initialized=args.database_initialized,
+            ).run())
         elif args.command == "relay":
             from .broker import request
             from .discovery import ModelDirectory
