@@ -2,6 +2,10 @@
 
 # 变更记录
 
+## 0.3.9 — 2026-11-24
+
+- 新增 `agent-bridge integrate`，可为指定的 Codex、Claude Code、Pi 或 Antigravity CLI 安装配套 skill 并注册 Bridge MCP。
+
 ## 0.3.8 — 2026-11-24
 
 - 安装时传入 `--with-web` 可启用 Web 用户服务，只监听本机回环地址。

@@ -2,6 +2,10 @@
 
 # Changes
 
+## 0.3.9 — 2026-11-24
+
+- Add `agent-bridge integrate` to install the bundled skill and register the Bridge MCP server for a selected Codex, Claude Code, Pi, or Antigravity CLI.
+
 ## 0.3.8 — 2026-11-24
 
 - Install the loopback Web dashboard as a user service with `--with-web`.
