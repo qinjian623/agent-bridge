@@ -2,6 +2,11 @@
 
 # Changes
 
+## 0.3.8 — 2026-11-24
+
+- Install the loopback Web dashboard as a user service with `--with-web`.
+- Restart managed Web during OTA on Linux and macOS. Preserve an uncertain upgrade result if the macOS Web restart is interrupted.
+
 ## 0.3.7 — 2026-11-23
 
 - Pace native delivery retries and receipt checks, and skip redundant writes and capability probes.
