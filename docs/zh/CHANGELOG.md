@@ -2,9 +2,10 @@
 
 # 变更记录
 
-## 0.3.9 — 2026-11-24
+## 0.3.10 — 2026-11-24
 
 - 新增 `agent-bridge integrate`，可为指定的 Codex、Claude Code、Pi 或 Antigravity CLI 安装配套 skill 并注册 Bridge MCP。
+- 修复窄终端中主命令帮助超宽的问题。
 
 ## 0.3.8 — 2026-11-24
 

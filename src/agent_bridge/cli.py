@@ -117,7 +117,7 @@ def build_parser():
     parser = _ArgumentParser(description=_("Persistent local Codex / Claude Code / Pi / Antigravity sessions"))
     parser.add_argument("--state")
     parser.add_argument("--lang", "--language", type=validate_language, help=_("Display language: en, zh-CN or auto (default: English)"))
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command", metavar=_("COMMAND"), required=True)
     init_parser = commands.add_parser(
         "init",
         help=_('Interactively configure or idempotently update config.json, services, and GitHub OTA'),

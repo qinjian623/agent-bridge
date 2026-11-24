@@ -2,9 +2,10 @@
 
 # Changes
 
-## 0.3.9 — 2026-11-24
+## 0.3.10 — 2026-11-24
 
 - Add `agent-bridge integrate` to install the bundled skill and register the Bridge MCP server for a selected Codex, Claude Code, Pi, or Antigravity CLI.
+- Keep the main help command list readable in narrow terminals.
 
 ## 0.3.8 — 2026-11-24
 

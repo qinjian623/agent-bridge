@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-bridge"
-version = "0.3.9"
+version = "0.3.10"
 description = "Local and multi-host sessions and tasks across Codex, Claude Code, Pi and Antigravity"
 readme = "README.md"
 license = "Apache-2.0"

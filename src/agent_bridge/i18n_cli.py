@@ -28,6 +28,7 @@ MESSAGES: dict[str, str] = {
     "Interactively configure or idempotently update config.json, services, and GitHub OTA": "交互配置或更新 config.json、服务和 GitHub OTA；重复执行保留已有配置",
     "Run the persistent Unix socket broker": "运行持久 Unix socket 服务",
     "Run the MCP tools over stdio": "通过标准输入输出运行 MCP 工具",
+    "COMMAND": "命令",
     "Install the Bridge MCP server and skill for one agent": "为指定 agent 安装 Bridge MCP 和 skill",
     "Unsupported agent": "不支持该 agent",
     "The agent configuration directory must be absolute": "agent 配置目录必须使用绝对路径",

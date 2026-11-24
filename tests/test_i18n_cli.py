@@ -120,7 +120,7 @@ class CliLanguageTests(unittest.TestCase):
 
     def test_chinese_help_wraps_by_display_columns(self):
         for width in (80, 100):
-            for command in ((), ("monitor",), ("init",), ("update",)):
+            for command in ((), ("monitor",), ("init",), ("integrate",), ("update",)):
                 with self.subTest(width=width, command=command), patch.dict(os.environ, {"COLUMNS": str(width)}), patch.object(sys, "argv", ["agent-bridge"]):
                     code, output, _ = self.run_cli("--lang", "zh-CN", *command, "--help")
                     self.assertEqual(code, 0)
@@ -128,6 +128,7 @@ class CliLanguageTests(unittest.TestCase):
                     for line in output.splitlines():
                         if _display_width(line) > width:
                             # argparse treats the command alternatives in usage as one token.
+                            self.assertTrue(command)
                             self.assertIn(line, usage)
                             self.assertNotRegex(line, r"[\u4e00-\u9fff]")
 
