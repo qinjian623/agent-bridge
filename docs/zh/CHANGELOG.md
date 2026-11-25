@@ -2,6 +2,11 @@
 
 # 变更记录
 
+## 0.3.12 — 2026-11-25
+
+- 新增 `agent-bridge integrate list`，列出支持的客户端和各自的 Bridge 安装命令。
+- 补充 Pi 官方安装步骤和 Bridge skill、MCP 的接入命令。
+
 ## 0.3.11 — 2026-11-24
 
 - 空闲 worker 退出后等新任务入队再启动，并限制同时启动的 worker 数量，直到原生 CLI 就绪。

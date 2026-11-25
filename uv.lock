@@ -167,7 +167,7 @@ wheels = [
 
 [[package]]
 name = "cli-agent-bridge"
-version = "0.3.11"
+version = "0.3.12"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },

@@ -32,6 +32,8 @@ CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英
 
 ## 接入 MCP
 
+运行 `agent-bridge integrate list` 查看支持的客户端和安装命令。
+
 Codex 用户执行：
 
 ```bash

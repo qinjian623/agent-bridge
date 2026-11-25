@@ -17,6 +17,13 @@ from .i18n import LANGUAGE_ENV, resolve_language, use_language, validate_languag
 from .i18n import translate as _
 from .init_config import add_init_arguments, detect_environment, run_init
 
+INTEGRATION_TARGETS = {
+    "codex": "Codex",
+    "claude": "Claude Code",
+    "pi": "Pi",
+    "agy": "Antigravity",
+}
+
 
 class _HelpFormatter(argparse.HelpFormatter):
     def start_section(self, heading):
@@ -126,9 +133,12 @@ def build_parser():
     commands.add_parser("serve", help=_('Run the persistent Unix socket broker'))
     commands.add_parser("mcp", help=_('Run the MCP tools over stdio'))
     integration = commands.add_parser(
-        "integrate", help=_('Install the Bridge MCP server and skill for one agent'),
+        "integrate", help=_('List supported agents or install the Bridge MCP server and skill'),
     )
-    integration.add_argument("agent", choices=("codex", "claude", "claude-code", "pi", "antigravity", "agy"))
+    integration.add_argument(
+        "agent", choices=("list", *INTEGRATION_TARGETS, "claude-code", "antigravity"),
+        help=_("Use 'list' to show supported agents and their install commands"),
+    )
     commands.add_parser("doctor", help=_('Check local configuration and installed CLI paths'))
     commands.add_parser(
         "update",
@@ -271,6 +281,10 @@ def _main(argv: list[str]):
     args, update_args = parser.parse_known_args(argv)
     if args.command != "update" and update_args:
         parser.parse_args(argv)
+    if args.command == "integrate" and args.agent == "list":
+        for agent, label in INTEGRATION_TARGETS.items():
+            print(f"{label:<12}  agent-bridge integrate {agent}")
+        return
     try:
         state = state_directory(args.state)
         if args.command in {"doctor", "serve"}:

@@ -2,6 +2,11 @@
 
 # Changes
 
+## 0.3.12 — 2026-11-25
+
+- Add `agent-bridge integrate list` to show supported agent CLIs and their Bridge installation commands.
+- Document how to install Pi before registering the Bridge skill and MCP server.
+
 ## 0.3.11 — 2026-11-24
 
 - Keep retired idle workers stopped until their sessions have new queued work, and limit concurrent worker startups through native CLI readiness.

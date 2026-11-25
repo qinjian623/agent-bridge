@@ -4,10 +4,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_bridge import integration, updater
+from agent_bridge import cli, integration, updater
 from agent_bridge.errors import BridgeError
 
 
@@ -55,6 +57,20 @@ class AgentIntegrationTests(unittest.TestCase):
                 "mcpServers": {name: {"command": command, "args": self.args}},
             }))
 
+    def test_list_prints_all_install_commands_without_creating_state(self):
+        missing = self.home / "uninitialized"
+        output = StringIO()
+        with redirect_stdout(output), patch.object(integration, "install_integration") as install:
+            cli.main(["--state", str(missing), "integrate", "list"])
+        self.assertEqual(output.getvalue().splitlines(), [
+            "Codex         agent-bridge integrate codex",
+            "Claude Code   agent-bridge integrate claude",
+            "Pi            agent-bridge integrate pi",
+            "Antigravity   agent-bridge integrate agy",
+        ])
+        self.assertFalse(missing.exists())
+        install.assert_not_called()
+
     def test_each_client_gets_its_own_registration_and_stable_skill_link(self):
         cases = (
             ("codex", "codex", ".codex/config.toml", ".codex/skills", []),
@@ -62,7 +78,7 @@ class AgentIntegrationTests(unittest.TestCase):
             ("pi", "pi", ".pi/agent/mcp.json", ".pi/agent/skills", []),
             ("antigravity", "agy", ".gemini/config/mcp_config.json", ".gemini/antigravity-cli/skills", ["--type", "stdio"]),
         )
-        for agent, cli, config, directory, flags in cases:
+        for agent, executable, config, directory, flags in cases:
             with self.subTest(agent=agent):
                 def register(*_args, config=config, agent=agent, **_kwargs):
                     self.write_server(self.home / config, agent=agent)
@@ -73,7 +89,7 @@ class AgentIntegrationTests(unittest.TestCase):
                     self.assertEqual(link, Path(result["skill"]))
                     self.assertEqual(self.skill, link.readlink())
                     self.assertEqual(run.call_args.args[0], [
-                        f"/fixture/bin/{cli}", "mcp", "add", *flags, integration.NAME, "--", str(self.launcher), *self.args,
+                        f"/fixture/bin/{executable}", "mcp", "add", *flags, integration.NAME, "--", str(self.launcher), *self.args,
                     ])
                     self.assertTrue(run.call_args.kwargs["check"])
                     self.assertEqual(result, integration.install_integration(self.state, agent))

@@ -130,6 +130,8 @@ AGENT_BRIDGE_LANG=zh-CN agent-bridge init
 <a id="mcp-setup"></a>
 ## MCP 设置
 
+运行 `agent-bridge integrate list` 查看支持的客户端和安装命令。
+
 安装 Bridge 和目标 CLI 后，运行下面对应的命令，为当前用户在指定 agent 安装随包提供的 skill，并注册 Bridge MCP。
 
 ```bash
@@ -140,6 +142,13 @@ agent-bridge integrate agy
 ```
 
 每次只设置一个客户端。Pi 需要内置 `pi mcp add` 的版本。已有同名冲突或共享 skill 时，命令会保留原配置。在 `integrate` 前加 `--state /绝对路径` 可指定 Bridge 状态目录。使用 OTA 安装的 Bridge 时，MCP 和 skill 都通过固定路径加载新版。配置完成后重新打开或重载 agent，调用工具时 Broker 需要处于运行状态。
+
+Linux 或 macOS 上如果还没有 Pi，可以先运行 [Pi 官方安装器](https://pi.dev/)，再注册 Bridge。
+
+```bash
+curl -fsSL https://pi.dev/install.sh | sh
+agent-bridge integrate pi
+```
 
 如只想手动注册 MCP，先启动 Broker（`agent-bridge serve`），再为 Codex 注册：
 

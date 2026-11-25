@@ -32,6 +32,8 @@ To install Web as a background service that restarts with OTA, pass `--with-web`
 
 ## Connect MCP
 
+Run `agent-bridge integrate list` to see supported clients and their install commands.
+
 For Codex, run:
 
 ```bash
