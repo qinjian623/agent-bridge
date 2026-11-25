@@ -5,7 +5,7 @@
 > **Document status**: Final technical specification, 2026-11-04.
 > **Design scope**: CLI agents running across physical machines or servers, with one coordinator and multiple execution nodes.
 > **Review integration**: Incorporates the independent adversarial reviews by Antigravity (`gemini-4-argon-high`) and Pi (`deepseek-flash`): 16 key defects and their required protections.
-> **Implementation status**: SSH relay, cross-host dispatch, groups, workspaces, and event synchronization are connected to the code. This document retains architectural decisions and later plans; the [Interface Contract](multi-machine-interface.md) states current method support and unimplemented items. Requirements and verification scenarios below are not claims that every implementation has passed them. The original schema examples are design snapshots; the [Phase C specification](multi-machine-phase-c-design.md) provides the later ordered-delivery schema.
+> **Implementation status**: SSH relay, cross-host dispatch, groups, workspaces, and event synchronization are implemented in the codebase. This document retains architectural decisions and later plans; the [Interface Contract](multi-machine-interface.md) states current method support and unimplemented items. Requirements and verification scenarios below are not claims that every implementation has passed them. The original schema examples are design snapshots; the [Phase C specification](multi-machine-phase-c-design.md) provides the later ordered-delivery schema.
 
 ---
 
@@ -79,11 +79,11 @@ Before the specification was finalized, Antigravity (`gemini-4-argon-high`, revi
 | **ADR-02** | A2, D1 | An agent can claim another session's `native_id` | A controlled member MCP wrapper receives a short-lived opaque binding from the local Broker, which checks caller PID, `starttime` ticks, and write locks. |
 | **ADR-03** | A6, D2 | A database rollback also rolls back its generation and hides lost records | Keep an identity file and increasing acknowledgment counter outside SQLite backups. Compare generation and highest acknowledged sequence during handshakes; refuse new writes on rollback. |
 | **ADR-04** | D6 | Equal `request_id` values on different nodes collide and reconnects cannot reconcile them | Use the global `(node_id, state_generation, operation_id)` namespace and look up the persisted operation after reconnecting. |
-| **ADR-05** | D3 | SQLite and an external native process cannot commit together | Persist an intent, mark it `sending`, interact with the CLI, then save its receipt. Missing confirmation means `uncertain`, never an automatic resend. These are local stages, not distributed 2PC. |
+| **ADR-05** | D3 | SQLite and an external native process cannot commit together | Persist the intent, mark it `sending`, call the CLI, then save its receipt. Missing confirmation means `uncertain`, never an automatic resend. These are local stages, not distributed 2PC. |
 | **ADR-06** | A3 | Single-host caching can turn `operation_pending` into a permanent conflict | Save an operation reference in `api_requests` for cross-host work; inspect that operation after recovery and save the final response only when its outcome is known. |
 | **ADR-07** | A4, D8 | Remote members break local foreign keys and can share native UUIDs | Add `remote_group_members`, `peer_inbox`, and a `native_send_queue` without remote session foreign keys; include `(host_id, node_id, state_generation)` in identity keys. |
-| **ADR-08** | A5 | Later native messages overtake an earlier pending message | Serialize each physical target with increasing local sequences. An unknown head blocks following messages until an administrator supplies evidence. |
-| **ADR-09** | D7 | Deleting an unsent item leaves a permanent sequence hole | Send a Cancel Tombstone at the original `target_seq`; following items wait until the execution node acknowledges it. |
+| **ADR-08** | A5 | Later native messages overtake an earlier pending message | Serialize each physical target with increasing local sequences. An unknown head blocks subsequent messages until an administrator supplies evidence. |
+| **ADR-09** | D7 | Deleting an unsent item leaves a permanent sequence hole | Send a Cancel Tombstone at the original `target_seq`; subsequent items wait until the execution node acknowledges it. |
 | **ADR-10** | A7, D4 | A remote `event_seq` conflicts with the parent host's foreign keys | Use `parent_ref`, deduplicate on the coordinator, create a local mirror `events.seq`, then use existing `deliveries` and `parent_ack`. |
 | **ADR-11** | A8 | Source and destination directories are confused, and early cancellation lacks a task ID | Separate local source `cwd` from remote `project_id`; allow exactly one of `task_id`, `operation_id`, or `delivery_id` in `agent_cancel`. |
 | **ADR-12** | D5, D8 | A permissive relay can forward unauthorized commands | Restrict relay requests to the declared `peer.*` allowlist; do not forward arbitrary commands or allow arbitrary remote quota changes. |
@@ -101,7 +101,7 @@ Before the specification was finalized, Antigravity (`gemini-4-argon-high`, revi
 Each node is identified by these fields:
 
 - `host_id`: A stable administrator-configured coordinator alias, such as `gpu-a` or `cloud-node-1`.
-- `node_id`: A strongly random UUID created at installation and stored privately; service restarts preserve it.
+- `node_id`: A random UUID created at installation and stored privately; service restarts preserve it.
 - `state_generation`: A random string regenerated when rebuilding the database, restoring a cold backup, or reinitializing the node.
 - **Global object reference**: `host_id + node_id + state_generation + local resource ID`.
 
@@ -239,7 +239,7 @@ CREATE TABLE IF NOT EXISTS peer_outbox (
 
 1. **Strict order**: The coordinator allocates increasing `target_seq` values for each remote session target. It must not send the next item before the previous one reaches `accepted_remote`.
 2. **Cancel Tombstones**: Cancelling an unsent queued message requires sending a Cancel Tombstone carrying its original sequence. Release that sequence only after the execution node persists and acknowledges cancellation. Later messages cannot skip the hole, which would let a delayed cancelled instruction arrive after them.
-3. **Evidence-based resolution**: A head in `uncertain` after a disconnect or crash blocks subsequent messages. An administrator uses `agent_delivery_resolve` with inspected evidence and the required revision to resolve it. No silent automatic retry is allowed. The later [Phase C resolution specification](multi-machine-phase-c-design.md#38-manual-resolution-agent_delivery_resolve) defines the group and delivery revisions precisely.
+3. **Evidence-based resolution**: A head in `uncertain` after a disconnect or crash blocks subsequent messages. An administrator uses `agent_delivery_resolve` with inspection evidence and the required revision to resolve it. No silent automatic retry is allowed. The later [Phase C resolution specification](multi-machine-phase-c-design.md#38-manual-resolution-agent_delivery_resolve) defines the group and delivery revisions precisely.
 
 ### 7.2 Remote Native Recovery Is Decided Locally
 
@@ -273,7 +273,7 @@ CREATE TABLE IF NOT EXISTS peer_outbox (
 | **Remote offline; message remains on coordinator** | Has not received it | Mark `waiting_for_host` | Resume the same `delivery_id` and sequence after the same generation reconnects. |
 | **Remote accepted work; SSH ACK lost** | Task is saved and running | Outcome temporarily unconfirmed | Reconnect and call `peer.lookup_delivery` for the original record; never create another task. |
 | **SSH drops during execution** | Local background worker continues | Show disconnected and waiting to refresh | Pull from the durable remote `peer_event` cursor after reconnecting. |
-| **Process crashes after native input is written** | Preserve the send fact and mark `uncertain` | Mark `uncertain` | Stop following sends; require administrator evidence through `agent_delivery_resolve`. |
+| **Process crashes after native input is written** | Preserve the send record and mark `uncertain` | Mark `uncertain` | Block subsequent sends; require administrator evidence through `agent_delivery_resolve`. |
 | **Execution database rolls back inconsistently** | Detect sequence regression and enter `state_corrupted` | Refuse communication on generation/counter mismatch | Refuse new work until administrator inspection, generation replacement, and registration. |
 
 ---
@@ -320,7 +320,7 @@ flowchart LR
 4. **Concurrent restarts**: Restart both sides; delayed or reordered events must not move confirmed `received` or `completed` states back to `pending`.
 5. **Identity changes**: Reject new requests for forged `host_id`, changed `node_id`, inconsistent database rollback, or changed SSH host key.
 6. **Safe remote AGY locking**: Keep the broadcast pending while AGY is active. After its process exits, resume the original session and assert the new receipt has `index > baseline`.
-7. **Cancel Tombstones**: Cancel an unsent head, verify the execution node persists the tombstone, and verify later increasing sequences can proceed.
+7. **Cancel Tombstones**: Cancel an unsent head, verify the execution node persists the tombstone, and verify subsequent sequences can proceed.
 8. **Permission checks**: Reject member-role admin calls, forged `sender_native_id`, and use of an unauthorized group.
 9. **Large results**: Retrieve large logs and patches through paginated artifacts; do not put multi-megabyte raw output into notices and risk exhausting memory.
 10. **Single-host compatibility**: Without cross-host parameters, preserve existing scheduling, the then-existing 230-test suite, and Telegram status checks. That historical count does not prove current features pass.

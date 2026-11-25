@@ -24,7 +24,7 @@ After an idle worker retires, an open session with no queued tasks stays stopped
    - Wakes long polls early: `agent_wait` and `_operation(..., wait=...)` use `_sleep_step()` to return safely on `update_draining` instead of pinning locks for 20-60s.
    - Read/write gate: `Broker.api_call()` uses `_is_readonly_api_call()` to check the method and parameters: mutating RPCs immediately return `update_busy` while strictly read-only queries (`agent_hosts`, `agent_monitor`, `agent_capabilities`, `agent_groups`, `agent_group_inbox`, `agent_result`, `agent_inspect` without `parent_id`, `agent_operation` with zero `wait`, `agent_wait` with zero `timeout`, non-refresh `agent_catalog` / `agent_broadcast_status`, and `agent_update_status`) succeed without calling mutating helpers (`refresh_parent_usage()`). `DirectPeerService.handle()` participates via `update_guard.operation(..., readonly=...)`.
    - Runs `update_guard.prepare(...)` off the event loop via `asyncio.to_thread(...)`.
-   - Fails fast without waiting `drain_timeout` on un-drainable states (`update_state_unknown`, `incompatible_workers`, or non-hot live work when `hot=False`).
+   - Fails fast without waiting `drain_timeout` on non-drainable states (`update_state_unknown`, `incompatible_workers`, or non-hot live work when `hot=False`).
    - Always clears `self.update_draining` in `finally` on abort/timeout, or clears on `agent_update_finish`.
 2. **Short-transaction SQLite backfill (`src/agent_bridge/store.py`, `src/agent_bridge/worker.py`)**:
    - `Store.__init__()` adds nullable `origin_*` columns on `peer_event_mirrors`, then `_finish_peer_event_mirrors_migration()` builds indexes and backfills at most `PEER_MIRROR_MIGRATION_BATCH` (`500`) rows in `<= 50`-row short transactions to avoid blocking online workers.
@@ -34,14 +34,14 @@ After an idle worker retires, an open session with no queued tasks stays stopped
 
 - `broker.request(state, method, params, *, retry_timeout=10.0)` splits `_single_request()` and `_update_in_progress()`:
   - Non-`agent_update_*` methods retry `FileNotFoundError` / `ConnectionRefusedError` (with `min(0.15, remaining)` backoff) **only** when `update_guard.maintenance(state)` exists or `update-status.json` indicates an active transition (`status == "activating"` within `-30 <= now - checked_at <= 180`). Normal offline failures stay zero-delay.
-  - Idempotency safeguard: if disconnect occurs after write (`ConnectionResetError` / `BrokenPipeError` / `EOFError` / `json.JSONDecodeError`), retries **only** `_READONLY_RPC_METHODS` or writes carrying an explicit `request_id`; non-idempotent writes raise cleanly.
+  - Idempotency safeguard: if disconnect occurs after write (`ConnectionResetError` / `BrokenPipeError` / `EOFError` / `json.JSONDecodeError`), retries **only** `_READONLY_RPC_METHODS` or writes carrying an explicit `request_id`; non-idempotent writes raise without retrying.
   - Brief `BridgeError("update_busy")` also retries across active maintenance windows.
 - **Legacy fallback (`src/agent_bridge/updater.py`)**: If an older broker returns `invalid_request` for new `agent_update_prepare` options in non-hot mode, `_activate()` falls back to empty args `{}`.
 
 ### Worker / Relay Boundary Rolling Retire (`updater.py`, `cli.py`, `worker.py`, `broker.py`)
 
-1. **Shared detector**: `updater.release_change_detector(state)` compares `current` symlink target against `sys.prefix` (defensively returning `False` on corrupt `update.json`); shared cleanly between `cli._relay_release_changed()` and `Worker.__init__`.
+1. **Shared detector**: `updater.release_change_detector(state)` compares `current` symlink target against `sys.prefix` (defensively returning `False` on corrupt `update.json`); shared by `cli._relay_release_changed()` and `Worker.__init__`.
 2. **Dual exit condition (`_should_retire_for_release`)**: Live tasks never interrupt mid-turn; idle/post-turn workers retire only when `release_changed()` is `True` **and** `update_guard.maintenance(state) is None` (preventing premature exit before health checks settle/rollback).
-3. **Lossless requeue & lock-first exit**: Unstarted claimed tasks return cleanly to `queued` in `worker_stopped()` (`Continue the interrupted task...` triggers only when `attempt.started is not None`). `Worker.run()` unlocks `{session_id}.lock` before setting `observed='stopped'` / `worker_version=NULL`; `Broker.launch()` waits up to 2.0s via `_wait_worker_released()` (`O_RDWR | O_NOFOLLOW` + unit cleanup) and defers safely with `worker_busy` rather than misreporting `recovery_needed`.
+3. **Lossless requeue & lock-first exit**: Unstarted claimed tasks return to `queued` in `worker_stopped()` (`Continue the interrupted task...` triggers only when `attempt.started is not None`). `Worker.run()` unlocks `{session_id}.lock` before setting `observed='stopped'` / `worker_version=NULL`; `Broker.launch()` waits up to 2.0s via `_wait_worker_released()` (`O_RDWR | O_NOFOLLOW` + unit cleanup) and defers with `worker_busy` rather than misreporting `recovery_needed`.
 
 ---

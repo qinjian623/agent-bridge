@@ -25,7 +25,7 @@ This follows the [Multi-Machine Design](multi-machine-design.md), [Interface Con
 2. Remote members submit cluster broadcasts locally. The coordinator pulls them without granting execution nodes reverse SSH access.
 3. Remote writable tasks use explicitly selected uncommitted source changes in an isolated workspace, including when the destination lacks the source Git commit.
 4. Queries distinguish active and ended groups. Administrators can soft-delete old groups in batches only after safety checks pass.
-5. A new session has a readable name in its first visible database version. Web reads and approvals require authentication.
+5. A new session has a readable name as soon as it appears in the database. Web reads and approvals require authentication.
 
 ### 1.2 Implemented and Pending Work
 
@@ -90,7 +90,7 @@ flowchart TB
     B --> Local[Local Tasks and Native Send Queue]
 ```
 
-Each group has one authority: its creator coordinator. Execution hosts retain authorized member credentials and delivery records, not another independently writable roster. A source group_id is meaningful together with its authority NodeRef; equal names do not identify the same group.
+Each group has one authority: its creator coordinator. Execution hosts retain authorized member credentials and delivery records, not another independently writable roster. A `group_id` is meaningful only alongside its authority `NodeRef`; identical names under different authorities do not identify the same group.
 
 ### 2.2 Reference Definitions
 
@@ -103,10 +103,10 @@ TargetRef = destination NodeRef + {kind, runtime, target_id}
 
 - `host_id` is the coordinator's configured alias. A payload cannot change source identity; the handshaken connection determines it.
 - Bridge uses `kind=bridge, runtime='', target_id=session_id`; native uses `kind=native, runtime=codex|antigravity, target_id=native_id`.
-- Every global reference includes node_id and state_generation. A new generation cannot inherit old membership even if host_id and the local UUID are equal.
+- Every global reference includes node_id and state_generation. A new generation cannot inherit old membership even if host_id and the local UUID match.
 - User-facing `cwd` always names the caller's source directory. A remote member's cwd is display/verification information; execution uses the destination's verified session record.
 
-The coordinator must load its own NodeIdentity. Do not use the old `_peer_node()` fallback of `socket.gethostname()` and `coordinator_generation='local'` as an ordered-stream identity. After authority authorization, the execution host binds that NodeRef to the approved access. A changed coordinator generation requires registration, not merely a different authority_ref in JSON.
+The coordinator must load its own NodeIdentity. Do not use the old `_peer_node()` fallback of `socket.gethostname()` and `coordinator_generation='local'` as an ordered-stream identity. After authority authorization, the execution host binds that NodeRef to the approved access. A changed coordinator generation requires re-registration, not merely a different authority_ref in JSON.
 
 ### 2.3 Keep Three Sequences Separate
 
@@ -118,7 +118,7 @@ The coordinator must load its own NodeIdentity. Do not use the old `_peer_node()
 
 `stream_id = SHA256(canonical_json(authority NodeRef, TargetRef))`. Use canonical encoding, not ambiguous string concatenation. A target generation change creates a new stream; different groups addressing the same target share one stream to prevent overtaking through another group. The first compound open has no session_id: use `ordering_mode=bootstrap, target_seq=0, stream_id=NULL`, only for a Bridge creation request with empty target.id and complete open parameters. Deduplicate by operation ID. Its creation transaction marks the resulting target ordered-only and returns its TargetRef; the coordinator then starts that stream at 1. The initial task precedes every later stream task. Existing targets and tombstones cannot use bootstrap.
 
-Allocate ack_seq in the database transaction. After commit, call `NodeIdentityStore.advance(ack_seq)` and complete fsync before success. On startup compare the database's real maximum with the identity file; a peer's last_acked_seq is an extra lower bound, not a replacement for querying the database. A database behind either confirmed value enters state_corrupted and refuses writes. If the database is ahead of the file, inspect its committed log before advancing the file.
+Allocate ack_seq in the database transaction. After commit, call `NodeIdentityStore.advance(ack_seq)` and complete fsync before returning success. On startup compare the database's real maximum with the identity file; a peer's last_acked_seq is an extra lower bound, not a replacement for querying the database. A database behind either confirmed value enters state_corrupted and refuses writes. If the database is ahead of the file, inspect its committed log before advancing the file.
 
 Even a cached duplicate response must ensure its mutation's ack_seq reached the identity file before returning; an idempotency hit cannot bypass fsync. Keep the existing global operation_id primary key in peer_operations, but derive all new IDs from canonical full source identity, receiver generation, method, and business request ID. Do not use possibly colliding user request_id values directly. Every lookup also verifies receiver identity fields.
 
@@ -257,7 +257,7 @@ CREATE TABLE pulled_request_receipts (
 
 ### 3.3 Atomic Broadcast Fan-Out
 
-`agent_broadcast` success means the coordinator durably saved the broadcast and every recipient arrangement, not that every host executed it. Perform all of this in one coordinator transaction:
+`agent_broadcast` success means the coordinator durably saved the broadcast and every recipient record, not that every host executed it. Perform all of this in one coordinator transaction:
 
 ```text
 BEGIN IMMEDIATE
@@ -273,9 +273,9 @@ COMMIT
 After commit, wake local senders and DeliveryScheduler
 ```
 
-Keep network checks outside SQLite write transactions. An offline registered host does not prevent saving a broadcast: its deliveries wait_for_host. A changed identity retains the old reference and blocks sending. Reject the entire broadcast for no members, revision conflict, unauthorized sender, or unsupported budget before any fan-out; do not send part and then claim no broadcast was created. Keep existing skipped records for closed local sessions. A remote execution refusal fails that recipient without rolling back others already accepted.
+Keep network checks outside SQLite write transactions. An offline registered host does not prevent saving a broadcast: its deliveries stay in `waiting_for_host`. A changed identity retains the old reference and blocks sending. Reject the entire broadcast for no members, revision conflict, unauthorized sender, or unsupported budget before any fan-out; do not send part and then claim no broadcast was created. Keep existing skipped records for closed local sessions. A remote execution refusal fails that recipient without rolling back others already accepted.
 
-Budget remains `budget_scope=host`. With budgeting enabled, any remote native member rejects the whole broadcast with `peer_budget_scope`; local native retains `native_budget_unsupported`. Account reservation only on the host admitting the task. Do not add multiple host balances or promise a global hard limit.
+Budget remains `budget_scope=host`. With budgeting enabled, any remote native member rejects the whole broadcast with `peer_budget_scope`; local native retains `native_budget_unsupported`. Reserve budget only on the host admitting the task. Do not add multiple host balances or promise a global hard limit.
 
 ### 3.4 Ordered Admission and Native Send DDL
 
@@ -371,7 +371,7 @@ stateDiagram-v2
     resolving --> cancelled: Confirmed not_received and original sequence cancelled
 ```
 
-Add coordinator statuses tombstone_pending, sending, resolving, released, and failed to PeerDeliveryStatus. Add cancelled to native SendQueueStatus only for cancellation proven not to have written input. An explicit receiver refusal with no external effect becomes failed, but release its sequence only after same-sequence cancellation confirmation; failed alone does not erase a sequence. For following items, return blocked_by, head state, reason, and revision. New messages may queue but cannot pass the head.
+Add coordinator statuses tombstone_pending, sending, resolving, released, and failed to PeerDeliveryStatus. Add cancelled to native SendQueueStatus only for cancellation proven not to have written input. An explicit receiver refusal with no external effect becomes failed, but release its sequence only after same-sequence cancellation confirmation; failed alone does not erase a sequence. For subsequent items, return blocked_by, head state, reason, and revision. New messages may queue but cannot pass the head.
 
 An offline host affects only that host; target A's uncertain does not stop target B on the same host. Backoff, timeout, and restart never clear uncertain automatically. Claim at most one item per eligible target per round, with per-host concurrency limits. Do not serialize a whole group and delay unrelated targets.
 
@@ -383,7 +383,7 @@ Keep cancellation by exactly one of task_id, operation_id, or delivery_id. Cance
 - `peer.deliver(seq_kind=tombstone)` for a missing original delivery writes cancelled peer_inbox, advances admitted_seq, and saves its acknowledgment log in one transaction. It creates no task or native queue item.
 - Replay of an existing tombstone returns the original cancellation. A late message for the same cancelled delivery/stream/sequence returns cancelled regardless of operation ID and cannot execute its body.
 - Do not directly turn sending/uncertain into an unsent tombstone. First call peer.lookup_delivery. If the original is admitted, use peer.cancel on the execution host with the same transaction/CAS rules as queue claiming. Cancel only when no external write can be proven.
-- Cancelling native sending can record a request but cannot erase the send fact. A later native receipt remains received; an unknown outcome remains uncertain. Cancelling running work requests stopping and cannot undo file changes already made.
+- Cancelling native sending can record a request but cannot erase the recorded send. A later native receipt remains received; an unknown outcome remains uncertain. Cancelling running work requests stopping and cannot undo file changes already made.
 
 Recover a lost tombstone ACK by querying the original delivery or replaying its tombstone. Advance released_seq only after confirmed execution-host persistence. Keep tombstones and fingerprints at least as long as the whole stream's retry/deduplication period. Phase C does not automatically delete them.
 
@@ -438,7 +438,7 @@ sequenceDiagram
 
 Connect peer.pull_requests to existing pull_outbox. It may mark rows pulled, but pulled remains repeatable, not complete. Filter by the authenticated connection's authority_ref; ack_request may acknowledge only that authority's outbox. One coordinator cannot pull and reject another's requests. Start each full scan at after=0, advance only an in-memory cursor to the largest page sequence, and return to zero after the scan. Do not persist a cursor that skips unacknowledged rows. Process items independently; transient failures stay unacknowledged, while permanent refusal also gets a saved result and ACK.
 
-Bound pages and processing time per two-second check. Continue an unfinished scan from its in-memory after next cycle until reaching the maximum sequence fixed when that scan began; then return to zero to retry prior unacknowledged rows. Add scan_upper_seq to pull responses and keep it fixed through the scan. New requests wait for the next scan. Restart discards the temporary cursor and starts at zero. This preserves old failures without letting an unsuccessful first page block every later request.
+Bound pages and processing time per two-second check. Continue an unfinished scan from its in-memory `after` cursor on the next cycle until it reaches the upper sequence fixed when the scan began, then reset to zero to retry earlier unacknowledged rows. Add `scan_upper_seq` to pull responses and keep it fixed through the scan. New requests wait for the next scan. Restart discards the temporary cursor and starts at zero. This preserves old failures without letting an unsuccessful first page block every later request.
 
 Save pulled_request_receipts in the same transaction as broadcast creation. A matching fingerprint reuses outcome/result and resends ACK without rebroadcasting. A new node generation cannot match old receipts. peer.ack_request deduplicates naturally by source outbox operation_id: equal outcome/result succeeds on replay, changed results return operation_conflict. Actually persist result rather than ignoring it.
 
@@ -462,9 +462,9 @@ agent_delivery_resolve(
 ) -> {resolution_id, status, delivery_id, revision, blocked_by?, receipt?}
 ```
 
-Trim evidence and require nonempty content up to 16 KiB. It identifies the inspected object, time, native turn/queue receipt or controlled file location, and result. “It probably did not arrive” is not automatic proof. Record actor, time, and fingerprint; do not require raw chats or credentials in evidence.
+Trim evidence and require nonempty content up to 16 KiB. It identifies the inspected object, time, native turn/queue receipt or controlled file location, and result. “It probably did not arrive” is not valid evidence. Record actor, time, and fingerprint; do not require raw chats or credentials in evidence.
 
-1. Administrator only, for an uncertain head that blocks its target. Reject deleted group, changed identity, incorrect revisions, non-head, or contradictory known receipt with an identifiable error.
+1. Available to administrators only, for an uncertain head blocking its target. Reject deleted group, changed identity, incorrect revisions, non-head, or contradictory known receipt with an identifiable error.
 2. Persist a pending delivery_resolutions decision and CAS-claim the delivery in one transaction, then call the execution host outside that transaction.
 3. received repairs confirmed native receipt only. It neither marks processing completed nor writes the original message again.
 4. not_received **cancels the message**, without resending. Persist verified non-write and cancellation at the original sequence. Any later desired message needs a new request and sequence.
@@ -472,7 +472,7 @@ Trim evidence and require nonempty content up to 16 KiB. It identifies the inspe
 
 Add peer.resolve_delivery with operation, delivery_id, resolution, evidence, and expected_delivery_revision; that last parameter is the caller's expected_remote_revision. Use inbox.revision as the whole delivery's execution-side version. Increment it in the same transaction whenever associated native queue state, receipt, or a decision changes; an isolated queue-row version is insufficient. Atomically update queue/cancellation and persist the decision, returning final receipt state, execution revision, and receipt. Reject contradictory known facts and recheck after a concurrent sender finishes; never overwrite with stale revision. This is an admin operation distinct from peer.review task acceptance.
 
-Queries return both sides' revisions. Require the administrator's inspected execution revision and save it in resolution intent remote_revision/request_json; do not substitute the coordinator revision. After timeout, query the same resolution operation instead of creating another decision. Same request_id and parameters returns the old resolution_id; changing a decision under the same ID returns operation_conflict. This tool handles broadcast heads with group_id only. Ordinary uncertain dispatch still uses agent_operation; do not invent a group revision for it.
+Queries return both sides' revisions. Require the administrator's inspected execution revision and save it in resolution intent remote_revision/request_json; do not substitute the coordinator revision. After timeout, query the same resolution operation instead of creating another decision. Repeating the same request_id and parameters returns the existing resolution_id; changing a decision under the same ID returns operation_conflict. This tool handles broadcast heads with group_id only. Ordinary uncertain dispatch still uses agent_operation; do not invent a group revision for it.
 
 ### 3.9 EventMirror and Parent Wake
 
@@ -531,7 +531,7 @@ sequenceDiagram
 
 peer.notify_parent is a receiver handler, not reverse connectivity from execution host to coordinator. For a coordinator-local parent, EventMirror calls the same service function locally; for another parent host, the coordinator initiates that RPC. Its operation identifies the receiving host while event.ref retains the original source, never rewritten as the coordinator. Each parent host allocates its own mirror_seq.
 
-Mirror sequence plus route prevents duplicate deliveries for the same event. Reject routing an existing event to another parent. parent_ack acknowledges only local events.seq. Keep transport ACK, native queue submission, and parent-model processing separate in queries.
+Combining the mirror sequence with the route prevents duplicate deliveries for the same event. Reject routing an existing event to another parent. parent_ack acknowledges only local events.seq. Keep transport ACK, native queue submission, and parent-model processing separate in queries.
 
 ## 4. Topic Two: Cross-Host Projects and Incremental Workspace Sync
 
@@ -563,7 +563,7 @@ Neither requires git fetch, access to the source origin, or a central Git servic
 
 Before fixing the manifest, read `peer.inspect(kind='workspace',section='base',project_id,base_commit)` to choose Patch or Snapshot. Add project_id/base_commit fields and return base availability plus project configuration digest. This does not authorize arbitrary upload destinations. Once recorded in a manifest, delivery mode is immutable. If base/config disappears later, fail explicitly. A new request may reuse captured content and choose Snapshot; never alter the old manifest and call it the same retry.
 
-The destination proves a complete base through its object database, not a branch name. Snapshot creates a destination-local Git commit/tree and does not claim it is the source commit; source_base_commit is attribution. Both modes set workspace.snapshot_tree correctly so existing capture_patch computes task output relative to **delivered input**.
+The destination proves a complete base through its object database, not a branch name. Snapshot creates a destination-local Git commit/tree and does not claim it is the source commit; source_base_commit is recorded for provenance only. Both modes set workspace.snapshot_tree correctly so existing capture_patch computes task output relative to **delivered input**.
 
 Generate source input patch from fixed base to fixed selected snapshot, never from a task's final capture_patch. Patch transfer cannot expand scope: the manifest constrains every path, old/new digest, and mode. Apply binary patches with normal Git checks, without --unsafe-paths, fuzzy merging, or attached commands. Conflict returns workspace_conflict, without silently switching to three-way merge.
 
@@ -585,9 +585,9 @@ Generate source input patch from fixed base to fixed selected snapshot, never fr
 }
 ```
 
-This illustrates structure; digest placeholders are not valid requests. Hash canonical JSON without the manifest's own digest field for manifest_sha256. Verify chunks and file contents separately. Canonical encoding is existing encode: UTF-8, sort_keys=True, ensure_ascii=False, separators=(',',':'), no trailing newline, and no floating-point manifest values. Full input_digest hashes the `{path,sha256,size,mode}` array sorted by UTF-8 path bytes using the same encoding and SHA-256, including every allowed permission bit. Git SHA does not replace SHA-256. Preserve byte-for-byte line endings and do not normalize Unicode paths automatically.
+This illustrates structure; digest placeholders are not valid requests. Compute manifest_sha256 by hashing the canonical JSON without the manifest's own digest field. Verify chunks and file contents separately. Canonical encoding is existing encode: UTF-8, sort_keys=True, ensure_ascii=False, separators=(',',':'), no trailing newline, and no floating-point manifest values. Full input_digest hashes the `{path,sha256,size,mode}` array sorted by UTF-8 path bytes using the same encoding and SHA-256, including every allowed permission bit. Git SHA does not replace SHA-256. Preserve byte-for-byte line endings and do not normalize Unicode paths automatically.
 
-Patch files contains differences only, whose paths must be a subset of selected_files. Reject changes/deletions outside the manifest, and compute full input digest from a verified base-file manifest. Snapshot files describes complete final input; unselected base paths retain base bytes. Deletions describe provenance, not files to create. Transfer and verify the base-file manifest as a blob too, rather than deriving it only from a mutable destination checkout.
+In Patch mode, `files` lists differences only, and every path must be in `selected_files`. Reject changes or deletions outside the manifest, and compute the full input digest from a verified base-file manifest. In Snapshot mode, `files` describes the complete final input; unselected base paths retain base bytes. Deletions describe provenance, not files to create. Transfer and verify the base-file manifest as a blob too, rather than deriving it only from a mutable destination checkout.
 
 Reuse snapshot()'s explicit selection and capture-time change detection to save immutable source bytes/manifest. After request_id binds a snapshot, retries read it instead of rereading the source. Resolve base to a fixed commit on the first request, not a later HEAD on each retry. A file changing during capture returns snapshot_changed and requires a new request.
 
@@ -606,7 +606,7 @@ peer.result downloads task output and is not an upload entry point. Add allowlis
 
 Upload the manifest itself as a chunked SHA-256-protected blob; prepare contains only authorization/preflight headers. Validate the whole manifest before using file paths. prepare/seal/abort each have stable operation IDs. Derive chunk operation IDs from workspace_id, blob_sha256, and offset; do not generate new IDs on retry.
 
-After manifest upload, `peer.inspect(kind='workspace',id=workspace_id,section='missing',after=...,limit<=100)` returns missing blobs/chunk positions and current revision; add these optional pagination fields. An idempotent prepare returns its original application result; inspect provides current progress. Before manifest verification, missing describes manifest chunks only, not supposedly known file blobs.
+After manifest upload, `peer.inspect(kind='workspace',id=workspace_id,section='missing',after=...,limit<=100)` returns missing blobs/chunk positions and current revision; add these optional pagination fields. An idempotent prepare returns its original application result; inspect provides current progress. Before manifest verification, missing describes manifest chunks only, not unverified file blobs.
 
 ```sql
 CREATE TABLE workspace_transfers (
@@ -659,7 +659,7 @@ prepare fixes the destination project's canonical root, ownership, and relevant 
 
 Each upload/query/attach checks workspace_transfers.authority_ref. Guessing workspace_id cannot read or overwrite another authority's input. The Git tree used by native capture_patch represents contents and executable bits only; keep full ordinary permissions in workspace metadata and verify input_digest against actual mode. Report non-Git-representable permission changes separately in a result artifact; do not claim Git diff preserves them.
 
-seal/abort share a per-workspace preparation lock and transfer revision CAS. Save intent before claiming preparing, then recheck state/revision after slow work and before ready. Aborting preparing first records abort_requested and waits for preparation to stop; the same lock owner cleans up. Do not delete a directory while Git uses it. Final attach/abort updates exclude one another under the same SQLite write lock. Crash recovery also takes the preparation lock so two recoverers cannot publish together.
+seal/abort share a per-workspace preparation lock and transfer revision CAS. Save intent before claiming preparing, then recheck state/revision after slow work and before ready. Aborting a preparing workspace first records abort_requested and waits for preparation to stop; the lock owner then cleans up. Do not delete a directory while Git uses it. Final attach/abort updates exclude one another under the same SQLite write lock. Crash recovery also takes the preparation lock so two recoverers cannot publish together.
 
 Derive private paths from trusted workspace_id under state, not absolute destinations supplied in manifests. Patch creates its Git worktree at the final path and publishes via ready marker/database reference. **Do not directly rename a registered Git worktree**, whose metadata still points at its original location. Snapshot may build ordinary staging files, atomically rename to final, then git init and fix the input tree. No task is visible before ready.
 
@@ -667,7 +667,7 @@ Filesystem and SQLite have no shared transaction. “Atomic rollback” here mea
 
 - Crash in receiving/verified: retain verified chunks and resume; digest conflicts fail.
 - Crash in preparing: inspect journal/directory and remove/rebuild only this unattached private workspace. Remove Git worktrees through Git, without reset/clean on the host project.
-- Ready marker fsynced before database ready: on restart verify manifest/input digest and repair ready; do not execute a task yet.
+- Ready marker fsynced before the database records ready: on restart, verify the manifest and input digest and repair the ready state without starting a task.
 - Database attached but RPC ACK lost: look up the original session/task by the same operation, without recreation or input reapplication.
 - After attachment, prohibit abort, reseal, and overwriting. Session close and workspace cleanup are separate later administrator actions, never age-based automatic deletion.
 
@@ -677,14 +677,14 @@ Retain session.workspace kind/snapshot_tree and other capture_patch fields; add 
 
 ### 5.1 States and Queries
 
-session_groups.deleted remains the soft-delete fact. Derive activity from current members and unsettled work; idle groups do not delete themselves.
+session_groups.deleted remains the authoritative soft-delete flag. Derive activity from current members and unsettled work; idle groups do not delete themselves.
 
 | activity_state | Definition | active |
 |---|---|---|
 | active | An open Bridge session allowed to continue, a running native session, or unsettled work | true |
 | inactive | Paused/stopped members or an empty group, with no unsettled work but without completed proof | false |
 | completed | Every member verifiably closed/stopped and all work settled; empty groups remain inactive | false |
-| unknown | Offline host, identity change, stale check, or unreliable native process state, without a stronger active fact | true; conservatively include in active lists |
+| unknown | Offline host, identity change, stale check, or unreliable native process state, unless a stronger active signal is present | true; conservatively include in active lists |
 | deleted | Administrator soft-deleted it | false; omitted from default lists |
 
 Open but idle Bridge is active; paused with a live process is active too. Unknown is not stopped. completed is derived and returns to active if a member reopens; add no manual completed flag that can contradict task state.
@@ -697,7 +697,7 @@ Default False preserves listing all nondeleted groups. Add activity_state, activ
 
 Unsettled work includes at least Bridge queued/assigned/running/waiting_input/interrupted/recovery_needed or tasks requiring review, pending questions, native pending/sending/uncertain, received items with processing running/unknown, unacknowledged member outbox, unreleased/unfinished peer_outbox, unfinished cancellation/manual decisions, and parent notices. Accepted-but-running broadcasts are not settled. Only explicit skipped/failed/cancelled or a definite terminal result with required review may settle a recipient.
 
-Include **historical broadcast recipients**, not only current members. Removing a member must not hide old running work. Apply the same unsettled-work prohibition to ordinary group.delete so it cannot bypass prune checks.
+Include **historical broadcast recipients**, not only current members. Removing a member must not hide old running work. Enforce the same unsettled-work check on ordinary group.delete so it cannot bypass pruning safeguards.
 
 ### 5.2 Lifecycle DDL
 
@@ -730,7 +730,7 @@ agent-bridge group prune --older-than 7d --dry-run
 agent-bridge group prune --older-than 7d
 ```
 
-The second command is explicit administrator authorization for batch soft deletion; do not add another default confirmation. Show pruned/skipped and reasons per group. dry-run is read-only, creating neither holds nor deletion records. --older-than accepts a positive integer plus h/d/w; 7d=604800 seconds. Fix the UTC cutoff at command start and compare last_activity_at without moving it inside the loop.
+The second command explicitly authorizes batch soft deletion without adding another confirmation prompt by default. Show pruned/skipped and reasons per group. dry-run is read-only, creating neither holds nor deletion records. --older-than accepts a positive integer plus h/d/w; 7d=604800 seconds. Fix the UTC cutoff at command start and compare last_activity_at without moving it inside the loop.
 
 Add administrator tool `agent_group_prune(older_than, dry_run=True, request_id)` for the CLI; an applying command passes dry_run=False. Persist fixed candidates and each group's revision in one run and process independently; failure for one does not undo others. A repeated request_id returns the same run without expanding candidates. There is no force option to skip these conditions:
 
@@ -755,7 +755,7 @@ Use **Authoritative Coordinator Verification (ACV)**, retaining ADR-01's prohibi
    - OutboxPuller rejects later execution-node requests for that group with group_deleted.
    - Do not introduce peer.group_guard two-phase locks, distributed deadlocks, orphan leases, or split leadership for pruning.
 
-Soft-delete retains remote/local member rows, broadcasts, tasks, reviews, and delivery records; queries filter deleted. Unlike the earlier delete that removed members, preserve the deletion-time snapshot, while not inventing members already removed by old versions. Prune closes no session, removes no workspace, and deletes no deduplication records. Skip a group that gains activity before deletion; later additions/broadcasts return group_deleted.
+Soft-delete retains remote/local member rows, broadcasts, tasks, reviews, and delivery records; queries filter deleted. Unlike the earlier delete that removed members, preserve the deletion-time snapshot, while not inventing members already removed by old versions. Pruning does not close sessions, remove workspaces, or delete deduplication records. Skip a group that gains activity before deletion; later additions/broadcasts return group_deleted.
 
 ```mermaid
 flowchart TD
@@ -780,7 +780,7 @@ agent_open(..., name: str | None = None)
 agent_dispatch(..., name: str | None = None)
 ```
 
-name applies only when this operation creates a new Bridge session. It is not native_id, does not force a CLI title change, and does not rename a group. Non-None name with existing session_id returns invalid_request; use the independent rename entry point. None keeps no custom name. Trim strings to 1–128 Unicode characters, rejecting NUL, newlines, and control characters while allowing Chinese text and duplicates. IDs remain unique identity.
+`name` applies only when this operation creates a new Bridge session. It is not `native_id`, does not force a CLI title change, and does not rename a group. Passing a non-None `name` with an existing `session_id` returns `invalid_request`; use the separate rename command instead. Passing `None` leaves the session unnamed. Trim strings to 1–128 Unicode characters, rejecting NUL, newlines, and control characters while allowing Chinese text and duplicates. IDs remain unique identity.
 
 Include name in the request fingerprint: same request_id with a changed name conflicts and cannot silently rename an existing session. None and omission are equivalent. Before Broker.api_call, Store.open, and remote stable-operation-ID hashing, remove newly added name=None fields so MCP locals() defaults do not break retries of pre-upgrade requests. Use the validated canonical string for nonempty names. Both hosts validate, without trusting the client alone. Include name when present in session_opened.data so the first monitor view need not infer instruction text or wait for rename.
 
@@ -798,7 +798,7 @@ Keep monitor's existing table shape, without a sessions foreign key, for histori
 
 Add name to Store.open and Store.create_session. In the same database connection/transaction, write sessions, optional session_names, session_opened, and the idempotent response. Local Broker open, internally created dispatch sessions, and execution compound dispatch must all call the shared logic.
 
-For remote creation, add name to Broker._remote_open_spec and write it inside the execution compound transaction. Return session_id/name. Cache remote display names by ObjectRef without creating a fake local session. If remote task creation fails, session and name roll back together; a ready workspace may remain. Local dispatch currently opens in a separate agent_open transaction before queuing work. This requirement makes session/name atomic, not the subsequent dispatch: if that dispatch fails, truthfully show the already-open empty session.
+For remote creation, add name to Broker._remote_open_spec and write it inside the execution compound transaction. Return session_id/name. Cache remote display names by ObjectRef without creating a fake local session. If remote task creation fails, session and name roll back together; a ready workspace may remain. Local dispatch currently opens in a separate agent_open transaction before queuing work. This requirement makes session/name atomic, not the subsequent dispatch: if that dispatch fails, report the already-open empty session accurately.
 
 ## 7. Topic Five: Web Monitor Authentication and Approval Safety
 
@@ -808,7 +808,7 @@ Keep default `127.0.0.1:8080`. --host 0.0.0.0 explicitly enables LAN access and 
 
 Reuse state/admin.token without another permanent password. Before reading, require a nonempty regular file owned by the current UID with mode 0600. Refuse Web startup when missing/invalid and direct the user to existing init/Broker initialization. Do not create a different token just to start Web. Never place it in command arguments, URL queries, HTML, localStorage, Referer, or access logs.
 
-This token grants existing administrator permission, without multi-user separation or read-only guests. Except the static login entry, authenticate before collecting runtime data, reading business bodies, or calling Broker. Login reads only a tightly size-limited body.
+This token grants the existing administrator permission. This design has a single administrator role. Serve the static login page without authentication. For `POST /auth/login`, read only a tightly size-limited body to check the token. Authenticate other requests before collecting runtime data, reading their bodies, or calling the Broker.
 
 Protect against unauthenticated LAN access, cross-site request forgery, and approval triggered by page content. Do not claim protection against same-UID/root access or HTTP sniffing. Raw HTTP can expose tokens/cookies to someone able to observe that network. State this limit for LAN HTTP; use SSH forwarding or HTTPS reverse proxy when confidentiality is required. Do not implement TLS inside Python http.server in this phase or confuse token checks with encryption.
 
@@ -878,7 +878,7 @@ Keep the 14 existing allowlisted methods and add peer.workspace plus peer.resolv
 | peer.workspace | prepare/chunk/seal/abort | Authorized coordinator and allowed project only; operation/natural chunk-key deduplication. |
 | peer.resolve_delivery | Evidence-based head decision | Admin, execution delivery revision, plus group/coordinator delivery CAS in the public tool. |
 
-Group membership, pruning, and manual decisions are administrative. Pin allowed coordinator identities and management permissions in trusted SSH access configuration. OperationKey node_id/state_generation identifies the **receiver**, providing deduplication/generation checks rather than caller-admin proof. A relay using the local socket cannot obtain admin permission merely from user method=peer.control. Use a separately authorized peer entry/credential and existing Unix caller-process checks. Do not let member channels call management RPC before those restrictions exist.
+Group membership, pruning, and manual decisions are administrative. Pin allowed coordinator identities and management permissions in trusted SSH access configuration. OperationKey node_id/state_generation identifies the **receiver**, providing deduplication/generation checks rather than caller-admin proof. A relay using the local socket cannot obtain admin permission merely by sending method=peer.control. Use a separately authorized peer entry/credential and existing Unix caller-process checks. Do not let member channels call management RPC before those restrictions exist.
 
 peer.bind_member cannot issue a valid sender merely from a coordinator-supplied arbitrary PID. After group authorization, the execution member wrapper must still check the real process before granting a binding, subject to top directive 2's infrastructure reduction. Existing peer.control/review/inbox definitions require real handlers and capabilities before Phase C paths may use them; do not ignore peer_not_implemented.
 
@@ -913,7 +913,7 @@ The three rows explicitly marked superseded preserve the source document's older
 | Duplicate/reordered events | NodeRef+remote_seq mapping, monotonic cursor | Reuse mirror_seq; keep definite state monotonic | Use remote seq as local foreign key. |
 | Parent notice ACK lost | Per-parent operation and mirror | Retry same notify_parent; deduplicate on parent host | Treat transport ACK as parent-model processing. |
 | New dispatch/resume during prune — superseded hold wording | Original draft: hold, revision, candidate snapshot | Original draft: skip on acquire/recheck failure; approved ACV rechecks local state/revision | Stop sessions merely to make prune pass. |
-| Prune remote unavailable/acquire expired — superseded | Original draft: skipped reason | Original draft: save aborted, finalize other holds, keep group; approved ACV skips unavailable groups | Call unreachable stopped. |
+| Prune remote unavailable/acquire expired — superseded | Original draft: skipped reason | Original draft: save aborted, finalize other holds, keep group; approved ACV skips unavailable groups | Treat an unreachable host as stopped. |
 | Prepared prune with coordinator disconnected — superseded | Original draft: durable prepared and run/item identity | Original draft: keep stopped and finalize recovered decision; no such distributed hold is approved | Automatically resume on prepared expiry. |
 | Name or compound dispatch failure | sessions/name/task in one transaction | Roll back together; retry same request | Create name before an asynchronous session. |
 | Token missing/rotated | Current file state | Deny; rotation invalidates old cookies | Retain old token or allow anonymous access. |
@@ -936,7 +936,7 @@ Disaster recovery needs consistent database/identity backup instructions. This d
 | ADR-25 | Derived activity, conservative unknown, read-only authority verification plus local CAS soft-delete | No distributed 2PC locks; deletion rejects new broadcasts/outbound requests and avoids cross-host lock recovery. |
 | ADR-26 | Optional name in session creation transaction; retain session_names shape | Visible immediately and stable on retry; display name is neither identity nor native rename. |
 | ADR-27 | Reuse admin.token, short cookie plus CSRF, approvals through Broker | Remove unauthenticated approval and Store bypass; HTTP confidentiality still needs TLS/SSH. |
-| ADR-28 | Capabilities and explicit allowlisted RPC additions | Old nodes cannot pretend support; update protocol/client/Relay/permission tests together. |
+| ADR-28 | Capabilities and explicit allowlisted RPC additions | Old nodes cannot claim support they lack; update protocol/client/Relay/permission tests together. |
 
 ## 11. Implementation Order and Required Checks
 
@@ -953,9 +953,9 @@ Disaster recovery needs consistent database/identity backup instructions. This d
 | C6 | name parameter and formal schema | Store.open/create_session, Broker creation branches, MCP, monitor; independent work. |
 | C7 | Web Token/Cookie, source checks, DOM escaping, Broker approvals | web_monitor.py, cli.py; independent work. |
 
-Back up local database/identity before migration. Stop writes, migrate and check constraints, then start senders. Upgrade scripts never resend uncertain work. Keep native_broadcast_deliveries query compatibility and import once by durable source ID. Preserve received/sending/uncertain facts rather than resetting everything pending. When historical order cannot be proven, block that target for inspection instead of inventing UUID sort order.
+Back up local database/identity before migration. Stop writes, migrate and check constraints, then start senders. Upgrade scripts never resend uncertain work. Keep native_broadcast_deliveries query compatibility and import once by durable source ID. Preserve received, sending, and uncertain states rather than resetting them to pending. When historical order cannot be proven, block that target for inspection instead of inventing UUID sort order.
 
-Rebuild provable historical broadcast/recipient records from group_broadcast events, requests receipts, tasks.details, and native_broadcast_deliveries. Never infer old members from today's roster. If reconstruction is incomplete, keep legacy queries and make pruning inspect old tables. Skip unverifiably settled history; empty new tables do not prove a group deletable.
+Rebuild provable historical broadcast/recipient records from group_broadcast events, requests receipts, tasks.details, and native_broadcast_deliveries. Never infer old members from today's roster. If reconstruction is incomplete, keep legacy queries and make pruning inspect old tables. Skip unverifiably settled history; empty new tables do not prove a group is safe to delete.
 
 Broker manages separate DeliveryScheduler, OutboxPuller, and EventMirror background tasks. During shutdown stop claiming and persist unfinished state. Isolate one host's network errors rather than exiting the Broker. Monitor backlog, oldest wait, head ID/reason, unacknowledged outbox, event cursors, and workspace preparation, without bindings/tokens or raw chats.
 
@@ -964,7 +964,7 @@ Broker manages separate DeliveryScheduler, OutboxPuller, and EventMirror backgro
 | Category | Checks |
 |---|---|
 | Migration | Upgrade current SCHEMA and a database whose name table was created only by monitor; rerun migration safely; retain old sequences as legacy; two targets may each start at 1; ack_seq never regresses; foreign-key checks pass. |
-| Groups/transactions | Fail any mixed local/two-remote fan-out step without partial arrangement; retry retains recipients; equal UUIDs across host/generation remain distinct; history remains after member removal. |
+| Groups/transactions | Fail any mixed local/two-remote fan-out step without leaving partial state; retry retains recipients; equal UUIDs across host/generation remain distinct; history remains after member removal. |
 | Order/cancel | Same-target cross-group/ordinary work cannot overtake; native local/remote sends share queue; uncertain blocks only its target; lost tombstone ACK, late message, and sending races do not duplicate work. |
 | Manual decisions | Reject nonadmin, empty evidence, any stale revision, non-head, conflicting receipt; offline resolving does not release; not_received never resends; repeated request saves one decision. |
 | Outbox pulling | Broadcast without reverse SSH; lost ACK/re-pull creates one broadcast; a transient first failure is not lost; duplicate/conflicting ACK, removed sender, forged identity, and expired process are handled. |

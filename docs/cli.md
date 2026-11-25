@@ -26,7 +26,7 @@ agent-bridge call agent_inspect --json '{}'
 
 ### Configure Bridge with init
 
-Run `agent-bridge init` in a terminal for the wizard. Choose **6) Advanced settings** for the saved language, routing rules, notification paths, OTA mirror, and managed Web. Use `agent-bridge init --help` to see the scriptable options. Only the settings supplied on the command line are changed in non-interactive mode.
+Run `agent-bridge init` in a terminal to open the setup wizard. Choose **6) Advanced settings** for the saved language, routing rules, notification paths, OTA mirror, and managed Web. Use `agent-bridge init --help` to see the scriptable options. Only the settings supplied on the command line are changed in non-interactive mode.
 
 | Settings | Flags |
 | --- | --- |
@@ -54,7 +54,7 @@ To install Web as a background service that restarts with OTA, pass `--with-web`
 
 Run `agent-bridge integrate list` to see supported clients and their install commands.
 
-Run the line for your client:
+Run the command for your client:
 
 ```bash
 agent-bridge integrate codex
@@ -98,14 +98,14 @@ Cancel just one task:
 agent-bridge call agent_cancel --json '{"task_id":"<task_id>","request_id":"quickstart-cancel-1"}'
 ```
 
-To close its session and cancel unstarted work, inspect it, then replace `0` below with the returned **current `revision`**:
+To close the session and cancel unstarted work, inspect it first, then replace `0` below with the returned **current `revision`**:
 
 ```bash
 agent-bridge call agent_inspect --json '{"session_id":"<session_id>"}'
 agent-bridge call agent_control --json '{"session_id":"<session_id>","action":"close","expected_revision":0,"request_id":"quickstart-close-1"}'
 ```
 
-Check the session again until its worker has exited. Pressing Ctrl+C in the broker terminal stops the broker; independent workers require their own cancellation or close. Closing a session preserves its history and working directory.
+Check the session again until its worker has exited. Pressing Ctrl+C in the broker terminal stops the broker; independent workers must be cancelled or closed separately. Closing a session preserves its history and working directory.
 
 ## More command-line operations
 

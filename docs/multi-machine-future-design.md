@@ -10,7 +10,7 @@ This continues the [Multi-Machine Design](multi-machine-design.md), [Interface C
 
 The implementation baseline examined for this proposal had SSH Relay, node identity, HostRegistry, and remote dispatch. Phase C specified cross-host groups, ordered delivery, workspaces, event mirrors, and Web authentication; a design alone did not prove all those features existed. `peer_transport.py` already contained real SSH transport and a client, while some background components in `peer_api.py` were still Protocol definitions. Earlier claims of “no runtime wiring” or a “currently single-host” system were historical descriptions. Check individual implementation status against [Phase C Section 1.2](multi-machine-phase-c-design.md#12-implemented-and-pending-work), current code, and the current interface contract. An existing test count does not prove this proposal works.
 
-Six problems motivate the next stage: maintaining temporary nodes through static hosts; continuously viewing incremental usage and progress; regional autonomy beyond one coordinator; safe takeover after coordinator failure; limiting a shared account beyond host-local budgets; and relating errors across processes. These problems are related, but they do not justify introducing a complete distributed control system at once.
+Six problems motivate the next stage: maintaining temporary nodes through static hosts; continuously viewing incremental usage and progress; regional autonomy beyond one coordinator; safe takeover after coordinator failure; limiting a shared account beyond host-local budgets; and correlating errors across processes. These problems are related, but they do not justify introducing a complete distributed control system at once.
 
 Complete Phase C and D failure checks before adding streaming telemetry, shared tracing, and controlled discovery. Enable federation and quota pooling only when the actual deployment needs them; implement automatic standby failover last. Keep recovery manual until state replication and execution-host rejection of old leaders are sufficient.
 
@@ -60,13 +60,13 @@ Discovery must not automatically accept SSH host keys, generate arbitrary SSH co
 
 ### 3.2 Leases and State Changes
 
-Suggested initial values are a 10-second heartbeat, suspect after 30 seconds, and a 60-second lease, with random jitter and configuration support. Use the local monotonic clock for leases within the current run. Persisted wall-clock times are for display; after restart, handshake again instead of preserving the old online judgment.
+Suggested initial values are a 10-second heartbeat, suspect after 30 seconds, and a 60-second lease, with random jitter and configuration support. Use the local monotonic clock for leases within the current run. Persisted wall-clock times are for display; after restart, handshake again instead of carrying over the previous online status.
 
 States are `discovered -> pending_approval -> verified -> online -> suspect -> offline`; record `revoked` and `identity_changed` separately. Expiry stops new dispatches and retains the queue; it neither moves running work nor removes group members. Static configuration takes precedence over discovery, and manual revocation takes precedence over new beacons. Limit candidate count, message size, and rate per source address so forged beacons cannot exhaust storage.
 
 ### 3.3 What No Public RPC Exposure Means
 
-Bridge RPC remains on SSH/Unix sockets with no new public listener. LAN mDNS/beacons are new local UDP traffic: they require explicit enablement, binding to a chosen interface, and no public forwarding. This supplements the older “no cluster TCP listener” rule; it must not be described as having no network ports at all. If even VPN UDP cannot be publicly reachable, use an existing private VPN or tunnel and leave unreachable nodes offline. This project does not automatically open ports or configure public relays.
+Bridge RPC remains on SSH/Unix sockets with no new public listener. LAN mDNS/beacons are new local UDP traffic: they require explicit enablement, binding to a chosen interface, and no public forwarding. This supplements the older “no cluster TCP listener” rule; it must not be described as having no network ports at all. If policy also forbids public VPN UDP access, use an existing private VPN or tunnel and leave unreachable nodes offline. This project does not automatically open ports or configure public relays.
 
 ## 4. Streaming Usage and Progress Telemetry
 
@@ -92,7 +92,7 @@ Usage uses cumulative snapshots per attempt, provider, and metering category. Re
 
 The source saves recoverable events before sending. The coordinator saves mirrors and cursor in one transaction, then ACKs. Limit each subscription's window and bytes; a slow subscriber affects only itself. Rotate fairly across hosts, and use a separate connection and allowance for control RPCs. Cancelling a subscription does not cancel a task.
 
-Start with a configurable 128 MiB telemetry disk allowance per node and 24-hour retention for ordinary deltas. Under pressure, combine progress/usage before assigning sequences; numbered events remain immutable. Retention may delete ordinary deltas only with a returned gap. Keep task terminal states, approvals, delivery receipts, and budget ledgers in separate reliable tables that telemetry cleanup cannot delete. When reliable storage is full, refuse new tasks while reserving space for cancellation and inspection; an offline monitor does not stop a running CLI. On reconnect, inspect the earliest available sequence; after a gap, import a current snapshot before continuing and mark the displayed history incomplete.
+Start with a configurable 128 MiB telemetry disk allowance per node and 24-hour retention for ordinary deltas. Under pressure, combine progress/usage before assigning sequences; numbered events remain immutable. Retention may prune ordinary deltas only if queries return a gap record. Keep task terminal states, approvals, delivery receipts, and budget ledgers in separate reliable tables that telemetry cleanup cannot delete. When reliable storage is full, refuse new tasks while reserving space for cancellation and inspection; an offline monitor does not stop a running CLI. On reconnect, inspect the earliest available sequence; after a gap, import a current snapshot before continuing and mark the displayed history incomplete.
 
 ```mermaid
 sequenceDiagram
@@ -116,7 +116,7 @@ Each region owns its local tasks, workspaces, approvals, and quotas. A parent co
 
 Proposed capability `federation_v1` adds `peer.federation_catalog`, `peer.delegate`, `peer.lookup_delegation`, and `peer.delegation_events`. Mutations require OperationKey, request_hash, delegation_id, authority_ref, path, hop_limit, deadline, a budget sublease, and explicit permissions. These method names are proposals; update the interface and allowlist when implementing them.
 
-The parent first persists a delegation outbox. In one local transaction, the child deduplicates, freezes its recipients, arranges local deliveries, and saves a delegation receipt before returning accepted. If the parent's ACK is lost, look up the original delegation_id. Cancellation follows the original delegation through every level, saving requests and outcomes. A timeout proves neither non-execution nor permission to dispatch again in another region.
+The parent first persists a delegation outbox entry. In one local transaction, the child deduplicates, freezes its recipients, queues local deliveries, and saves a delegation receipt before returning accepted. If the parent's ACK is lost, look up the original delegation_id. Cancellation follows the original delegation through every level, saving requests and outcomes. A timeout proves neither non-execution nor permission to dispatch again in another region.
 
 For cascading groups, the parent freezes direct members plus child-group references and revisions. Each child freezes its own members at that revision and returns a snapshot digest. Reject only a branch whose revision differs; other accepted branches continue. Do not promise simultaneous delivery across regions or all-or-nothing success. The full recipient list is available only after each branch accepts; show `awaiting_expansion` separately from `accepted`. Work that needs a complete list at submission must first fetch and fix all member references, then dispatch individually; this still is not a cross-host atomic commit.
 
@@ -130,7 +130,7 @@ Keep local SQLite WAL. Use a consistent backup API to create snapshots and send 
 
 Automatic standby uses one writer, sequential replay of a logical commit log, and an independent quorum service holding leadership epoch and committed position. Raft election alone does not preserve SQLite contents: before an external RPC, its intent, operation, stream sequence, and request fingerprint must be durably applied on the standby and marked committed by the quorum. Writes acknowledged externally need the same protection. Stop new writes when no synchronous replica is available; do not silently fall back to asynchronous replication.
 
-This costs substantially more than local transactions. A suggested arrangement is two data replicas and an independent witness, giving three voters. The witness is not a data copy: after losing the primary, verify the surviving replica has reached the committed position. If deterministic log replay cannot bind transaction results to identity-file confirmation, keep takeover manual; periodic WAL copies are not a substitute.
+This adds substantial overhead compared to local transactions. A suggested arrangement is two data replicas and an independent witness, giving three voters. The witness is not a data copy: after losing the primary, verify the surviving replica has reached the committed position. If deterministic log replay cannot bind transaction results to identity-file confirmation, keep takeover manual; periodic WAL copies are not a substitute.
 
 ### 6.2 Leader Leases and Rejecting Stale Leaders
 
@@ -173,7 +173,7 @@ Proposed capability `quota_lease_v1` adds `peer.quota_reserve/renew/settle/relea
 
 ### 7.2 Disconnects, Expiry, and Lending
 
-Lease expiry prohibits starting new work; it does not prove an existing CLI stopped. Return a concurrency slot only after a verifiable stop/completion record; disconnected slots become `held_unknown`. Do not release the full money reservation merely because time elapsed. Hard budgets require an interface that can limit maximum output and stop additional calls, plus worst-case allowance for unreported spending. Where a native CLI's provider spending cannot be controlled, label the budget soft and make no account-wide hard-limit promise. Keep existing `budget_scope=host` and `peer_budget_scope` behavior until the new mode is explicitly selected and its conditions hold.
+Lease expiry prohibits starting new work; it does not prove an existing CLI stopped. Return a concurrency slot only after a verifiable stop/completion record; disconnected slots become `held_unknown`. Do not release the full spending reservation merely because the lease expired. Hard budgets require an interface that can limit maximum output and stop additional calls, plus worst-case allowance for unreported spending. Where a native CLI's provider spending cannot be controlled, label the budget soft and make no account-wide hard-limit promise. Keep existing `budget_scope=host` and `peer_budget_scope` behavior until the new mode is explicitly selected and its conditions hold.
 
 Implement lending within one pool authority first: move lendable reserves into borrower reservations and record lender, borrower, amount, return rules, expiry, approvals, and limits. Cross-pool lending uses prepaid sub-allowances, never a transfer that lets both sides spend the same amount at once. Revocation affects future launches; a running task does not become unspent because revocation arrived late. On provider 429 responses, honor the provider's wait requirement and lower concurrency; a lease is no guarantee from the provider.
 
@@ -183,7 +183,7 @@ Create trace_id at entry and separate span_id values for Broker, SSH Relay, remo
 
 If a native CLI cannot carry context, its local wrapper records the observed call span and native turn ID. Do not modify raw chats or invent internal CLI spans. For approvals that span days, retain the wait span and request_id; a response creates a linked span recording stale-revision or expiry outcomes, never approval tokens.
 
-Use structured fields: cluster_id, NodeRef, authority_id, leader_epoch, operation_id, delivery_id, stream_id, target_seq, attempt_id, trace/span, event_seq, error_code, and duration_ms. Cross-host wall clocks are approximate display information. Measure duration with each host's monotonic clock, and determine ordering from messages and sequences, not timestamps alone.
+Use structured fields: cluster_id, NodeRef, authority_id, leader_epoch, operation_id, delivery_id, stream_id, target_seq, attempt_id, trace/span, event_seq, error_code, and duration_ms. Cross-host wall clocks are approximate and for display only. Measure duration with each host's monotonic clock, and determine ordering from messages and sequences, not timestamps alone.
 
 By default save tool name, state, size, and summary, not prompts, tool argument bodies, command output, environment variables, keys, or raw database contents. Redact at source and filter aggregation by cluster/project permission. Normal spans may be sampled; retain errors and delivery-state changes. Diagnostic sampling never deletes business ledgers. Start aggregation through the same coordinator-pull channel; a later optional local collector may export data, but no unconfigured public service is added.
 
@@ -312,7 +312,7 @@ CREATE INDEX quota_lease_state ON quota_leases(pool_id, state, expires_at);
 CREATE INDEX spans_operation ON diagnostic_spans(operation_id);
 ```
 
-Allocate sequences in the same transaction as events. Do not use `MAX(seq)+1` after deletions; use durable counters or an existing safe counter facility. Fix a subscription's filters at filter_revision; changed filters require a new subscription so an old ACK cannot skip data. Record gaps in retention-range metadata; an empty query page is not proof of no loss. Store latest usage separately under `(full task_ref, attempt_id, provider, category)`, replacing by revision.
+Allocate sequences in the same transaction as events. Do not use `MAX(seq)+1` after deletions; use durable counters or an existing safe counter facility. Fix a subscription's filters at filter_revision; changed filters require a new subscription so an old ACK cannot skip data. Record gaps in retention-range metadata; an empty query page does not prove no events were lost. Store latest usage separately under `(full task_ref, attempt_id, provider, category)`, replacing by revision.
 
 Check quota_pools balance and update lease/ledger in the same `BEGIN IMMEDIATE` transaction. Preserve lending-source subleases separately, without foreign keys across databases. Replication entries contain fixed business IDs, results, and counter changes: the standby cannot regenerate UUIDs, timestamps, or send sequences. Sensitive lease credentials belong in restricted files or process memory; tables keep digests only.
 
@@ -330,11 +330,11 @@ Upgrade by schema_version in steps. Back up database and identity file, stop loc
 | Repeated delegation or lost ACK | request_hash and receipt | Look up the original delegation | Create new child work |
 | Changed child-group revision or regional disconnect | Original branch snapshot and admission state | Refuse or wait for that branch; accepted branches continue | Claim whole-group atomic failure |
 | Cycle or elevated permissions | path, hop_limit, granted scope | Reject with a specific reason | Recursively broadcast to every discovered node |
-| Primary fails while standby log is behind | committed_index and digests | Pause takeover; catch up or recover manually | Send merely because an election was won |
+| Primary fails while standby log is behind | committed_index and digests | Pause takeover; catch up or recover manually | Start sending solely because an election was won |
 | Partition with old leader still alive | Epoch and verifiable lease | Refuse unverifiable writes and wait for safe replacement | Claim outbox on both leaders |
 | Unknown native-send outcome during takeover | Original inbox/outbox, operation, sequences | Look up on the original host; retain uncertain pause | Generate a new delivery ID for the new epoch |
 | Identity file ahead of database | ack_seq lower bound | state_corrupted; inspect and change generation manually | Skip checks in standby mode |
-| Expired quota lease with offline worker | Unsettled reservations and held_unknown slots | Retain reservation until stopping is confirmed | Immediately allocate it again |
+| Expired quota lease with offline worker | Unsettled reservations and held_unknown slots | Retain reservation until worker stop is confirmed | Immediately allocate it again |
 | Repeated settlement or provider correction | Metering revision and ledger | Deduplicate or append a difference entry | Overwrite history and charge again |
 | Lost trace or clock skew | State tables and message sequences | Show incomplete diagnostics and query business state | Decide task success from span timing |
 | Duplicate or late approval after takeover | request_id, revision, original authority | Return original result or reject stale revision | Fetch a fresh revision and approve automatically |
@@ -352,7 +352,7 @@ Upgrade by schema_version in steps. Back up database and identity file, stop loc
 | ADR-35 | Logical authority stays stable; epochs do not alter business idempotency keys | Changing streams at takeover would bypass old uncertain records. |
 | ADR-36 | One pool authority reserves allowance and grants subleases | Extending ADR-14 requires explicit selection; uncontrolled native CLI spending remains a soft budget. |
 | ADR-37 | Expiry does not prove a resource is reclaimable | Holding unknown reservations lowers utilization but prevents over-allocation and overspend. |
-| ADR-38 | Traces relate diagnostics; business records decide state and permission | Keep no raw chats and do not use trace ID as authority or completion proof. |
+| ADR-38 | Traces correlate diagnostics; business records are authoritative for state and permissions | Keep no raw chats and do not use trace ID as authority or completion proof. |
 
 ## 12. Staged Implementation and Verification
 

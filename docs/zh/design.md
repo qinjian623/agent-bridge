@@ -2,7 +2,7 @@
 
 # 程序结构
 
-Bridge 在本机或受信任的 SSH 主机上运行 Codex、Claude Code、Pi 和 Antigravity 独立会话。调用它的 agent 决定任务和检查结果；Broker 管理队列和保存的状态，不需要另一个模型管理 Broker。
+Bridge 在本机或受信任的 SSH 主机上运行 Codex、Claude Code、Pi 和 Antigravity 独立会话。调用方 agent 负责决定任务和检查结果；Broker 只管理队列和状态保存，不需要再引入另一个模型来管理 Broker。
 
 ## 组成与通信
 

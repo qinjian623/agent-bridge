@@ -4,7 +4,7 @@
 
 > **文档状态**：已定稿（技术规范）。2026-11-04 正式版。  
 > **设计对象**：跨物理机/服务器的分布式 CLI Agent 协同系统（协调端与多执行节点）。  
-> **审查集成**：本文已全面整合 Antigravity (`gemini-4-argon-high`) 与 Pi (`deepseek-flash`) 对初稿的对抗性审查结论（共 16 项关键缺陷与防护方案）。  
+> **审查集成**：本文整合了 Antigravity (`gemini-4-argon-high`) 与 Pi (`deepseek-flash`) 对初稿的对抗审查结论（共 16 项关键缺陷及应对方案）。
 > **实现状态**：SSH relay、跨机派单、分组、工作区和事件同步已接入代码。本文保留架构决策与后续计划，当前接口和未实现项以 [接口说明](multi-machine-interface.md) 为准。
 
 ---
@@ -12,16 +12,16 @@
 ## 1. 目标、范围与设计原则
 
 ### 1.1 首版实现目标
-1. **单一入口透明调度**：主 Agent（如 Codex、Claude 或 Antigravity）通过协调机器（Coordinator）的 MCP 接口，统筹查询各机器模型目录、指定目标服务器派发任务、按需流式提取执行结果。
-2. **跨机分组与广播协同**：会话组可跨多台机器纳管 Bridge 子会话或原生会话（Codex、Antigravity）；广播消息仅投递给指定成员快照，严格支持 CAS 版本校验（`expected_revision`）。
-3. **原生会话平滑接入**：
+1. **单一入口统一调度**：主 Agent（如 Codex、Claude 或 Antigravity）通过协调机器（Coordinator）的 MCP 接口，统一查询各机器模型目录、向指定目标服务器派发任务，并按需增量读取执行结果。
+2. **跨机分组与广播**：会话组可跨多台机器包含 Bridge 子会话或原生会话（Codex、Antigravity）；广播消息只投递给指定成员快照，并执行 CAS 版本校验（`expected_revision`）。
+3. **原生会话接入**：
    - 远端 Codex 使用原机持久队列（`thread/queue/add`），不强行接管会话终端；
-   - 远端 Antigravity 原生会话严格在其完全关闭后，才由远端本地 Bridge 恢复同一原生 ID 注入消息，不侵入运行中的控制台。
-4. **强容灾与断网幂等**：网络闪断或协调机重启时，远端已接收的任务继续独立执行；网络恢复后凭持久化 `operation_id` 与两阶段回执对齐状态，**绝不因断网重跑任务或更换机器**。
+   - 远端 Antigravity 原生会话必须在其完全关闭后，才由远端本地 Bridge 恢复同一原生 ID 注入消息，不干扰运行中的终端。
+4. **断网恢复与幂等**：网络闪断或协调机重启时，远端已接收的任务继续独立执行；网络恢复后凭持久化 `operation_id` 与两阶段回执对齐状态，**绝不因断网重跑任务或更换机器**。
 
 ### 1.2 边界与非目标
 - **信任域假设**：面向同一管理者控制的 Linux 机器集群，节点间保持隔离，但非针对恶意 root/同 UID 攻击的沙箱。
-- **暂不做**：公网暴露的 TCP/HTTP 端口、跨物理机迁移原生会话内存/上下文、跨机任务依赖 DAG（`dependencies` 跨机传递）、全量工程代码自动全量同步、分布式事务（如 2PC/Raft）。
+- **暂不做**：公网暴露的 TCP/HTTP 端口、跨物理机迁移原生会话内存/上下文、跨机任务依赖 DAG（`dependencies` 跨机传递）、自动同步全部工程代码、分布式事务（如 2PC/Raft）。
 
 ---
 
@@ -58,7 +58,7 @@ flowchart TD
 4. **Relay 进程**：`agent-bridge relay` 通过 `DirectPeerService` 处理 SSH stdin/stdout 请求，直接访问远端本地 SQLite；Broker 从同一数据库领取任务并启动 Worker。SSH 进程中断、Relay 退出不停止远端已在运行的任务。
 
 ### 2.2 单向主动 RPC 与拉取流（审查决策 A1/D5/D6）
-为防止远端服务器拥有对协调机器的反向 SSH 权限造成横向越权，系统**全面采用单向 RPC 架构**：
+为防止远端服务器拥有对协调机器的反向 SSH 权限造成横向越权，系统采用**单向 RPC 架构**：
 - **正向调用**：由协调机发起请求，经 Relay 调用 `DirectPeerService`，提交到远端本地数据库。
 - **反向出站（拉取模式）**：当远端原生主会话调用跨机组广播时，远端 Broker 仅将操作写入本机的 `node_outbox` 表。协调机后台任务默认每 2 秒发起一次 `peer.pull_requests` 拉取一页出站请求，校验发送权限并完成派发后，调用 `peer.ack_request` 持久化确认。**远端服务器无须反向 SSH 连接协调机器**。
 
@@ -66,18 +66,18 @@ flowchart TD
 
 ## 3. 架构决策记录（双模型对抗审查结论）
 
-在技术方案定稿前，系统通过 Antigravity (`gemini-4-argon-high`, 代号 A) 与 Pi (`deepseek-flash`, 代号 D) 进行了两轮独立对抗审查，共提炼 16 项关键缺陷并落实至本规范：
+在技术方案定稿前，系统通过 Antigravity (`gemini-4-argon-high`, 代号 A) 与 Pi (`deepseek-flash`, 代号 D) 进行了两轮独立对抗审查，整理出 16 项关键缺陷并写入本规范：
 
 | 编号 | 问题来源 | 核心风险 | 正式架构规范解决方案 |
 |---|---|---|---|
 | **ADR-01** | A1, D5, D6 | 反向推送与单机 Unix Socket 短连接不兼容 | 放弃双向长连接通道方案；改为协调机主动定时 `peer.pull_requests` 拉取，Relay 对本机 Broker 保持标准短连接。 |
-| **ADR-02** | A2, D1 | 原生 Agent 自报 `native_id` 存在身份伪造风险 | 增加受控 Member MCP 包装器，由本机 Broker 签发短期不透明 Binding，严格校验调用者 PID、`starttime` 滴答数与写锁，杜绝假冒发送者。 |
+| **ADR-02** | A2, D1 | 原生 Agent 自报 `native_id` 存在身份伪造风险 | 增加受控 Member MCP 包装器，由本机 Broker 签发短期不透明 Binding，校验调用者 PID、`starttime` 滴答数与写锁，防止冒充发送者。 |
 | **ADR-03** | A6, D2 | 数据库回滚时 Generation 一同回滚，旧数据丢失无法感知 | 引入独立于 SQLite 备份的持久化身份文件与递增确认序号；握手时校对双方 Generation 与最大确认序号，回滚立即报警并拒绝新请求。 |
 | **ADR-04** | D6 | 两节点相同 `request_id` 造成冲突，断网重连无处排空 | 引入全局唯一的 `(node_id, state_generation, operation_id)` 命名空间，节点重连直接比对持久化 Operation 记录。 |
 | **ADR-05** | D3 | SQLite 事务与外部原生进程写入无法做原子提交 | 实行两阶段提交：先本地落盘持久化 Intent，再将状态标记为 `sending`，最后执行 CLI 交互并写入 Receipt；未确认 Receipt 记为 `uncertain`，绝不盲目重发。 |
 | **ADR-06** | A3 | `operation_pending` 被原单机缓存误判为冲突死锁 | `api_requests` 针对跨机操作只记录 Operation 引用；恢复后先查关联 Operation，直到终端结果明确才写回最终响应。 |
 | **ADR-07** | A4, D8 | 远端成员记录违反本地组外键约束，UUID 发生冲突 | 新建独立的 `remote_group_members`、`peer_inbox` 与去外键化的 `native_send_queue`，唯一键强制包含 `(host_id, node_id, state_generation)`。 |
-| **ADR-08** | A5 | 等待中的原生消息被后续消息插队超车 | 发送队列实行按目标串行化排队；建立严格的队头顺序与本地递增序号，遇到前序状态不明时阻断后续发送，必须通过人工 Evidence 解除。 |
+| **ADR-08** | A5 | 等待中的原生消息被后续消息插队 | 发送队列按目标串行排队，建立严格的队头顺序与本地递增序号；遇到前序状态不明时阻断后续发送，必须通过人工 Evidence 解除。 |
 | **ADR-09** | D7 | 前序未转交消息直接删除造成永久序号空洞 | 新增带原序号的 Cancel Tombstone（取消墓碑）；后续消息必须等待取消墓碑在执行端确认后才能继续递增。 |
 | **ADR-10** | A7, D4 | 远端 `event_seq` 与父机器外键冲突导致通知丢失 | 引入跨机 `parent_ref`；协调机去重后生成父机器本地镜像 `events.seq`，再接入既有的 `deliveries` / `parent_ack` 状态流。 |
 | **ADR-11** | A8 | 跨机源目录与目标目录混淆、取消目标缺失 | 严格分离本地源目录 `cwd` 与远端托管工程 `project_id`；`agent_cancel` 扩展支持 `operation_id` / `delivery_id`。 |
@@ -237,7 +237,7 @@ CREATE TABLE IF NOT EXISTS peer_outbox (
   - 执行端严格检查本地 `/proc/locks` 与 `presence/<native_id>.lock`；
   - 只有确认原终端实例完全退出、且没有其他活跃进程持有会话时，才在远端启动独立 Stream-JSON 进程，将消息注入原生 `--conversation`；
   - 严格读取执行端本地数据库 `MAX(idx)` 作为基线，只确认 `index > baseline` 的新 `user_input/DONE` 回执；
-  - 协调端绝不能跨机持有远端进程锁，所有锁判断与进程回收全部在原机闭环执行。
+  - 协调端绝不能跨机持有远端进程锁，所有锁判断与进程回收都在原机本地完成。
 
 ---
 
@@ -299,16 +299,16 @@ flowchart LR
 
 ## 11. 完备验证矩阵（必须通过的 13 种关键场景）
 
-1. **同名资源隔离**：两台机器拥有相同的 Profile 名称或完全相同的原生 UUID 时，消息严格路由给指定机器的目标，绝不跨机串标。
+1. **同名资源隔离**：两台机器拥有相同的 Profile 名称或完全相同的原生 UUID 时，消息只路由给指定机器的目标，不会跨机混用。
 2. **组快照不变性**：组内包含跨机成员，广播时仅快照内成员收件；组 Revision 变更后，已发出的广播请求严格按原快照执行。
-3. **精准断网切断**：分别在协调端保存前、远端接单前、原生写入前及任务执行中切断 SSH，重连后同一任务只执行一次，未确认状态绝不伪报为失败。
+3. **分阶段断网**：分别在协调端保存前、远端接单前、原生写入前及任务执行中切断 SSH，重连后同一任务只执行一次，未确认状态绝不伪报为失败。
 4. **两端并发重启**：两端同时重启，事件乱序或迟到时，已确认的 `received` 与 `completed` 状态绝不倒退回 `pending`。
-5. **身份篡改防护**：伪造 `host_id`、篡改 `node_id`、数据库非一致性回滚或更换 SSH Host Key 时，新请求被强行阻断。
-6. **远端 AGY 安全锁闭环**：远端 AGY 运行时广播保持 Pending；原进程退出后自动拉起原会话恢复，精确断言 `index > baseline` 的新接收步骤。
+5. **身份篡改防护**：伪造 `host_id`、篡改 `node_id`、数据库非一致性回滚或更换 SSH Host Key 时，新请求被拒绝。
+6. **远端 AGY 进程锁检查**：远端 AGY 运行时广播保持 Pending；原进程退出后自动拉起原会话恢复，并只确认 `index > baseline` 的新接收步骤。
 7. **取消墓碑实测**：取消队头未转交消息，确认远端成功落盘 Cancel Tombstone，后续递增序号消息正常流转。
-8. **鉴权越权防御**：普通 Member 角色尝试调用 Admin 接口、伪造 `sender_native_id`、越权使用未授权 Group 时，均被强制拦截。
-9. **大体积文件防护**：大日志与大补丁回传通过 Artifact 按页切片拉取，禁止将超出几兆的原始输出塞进通知造成 OOM。
+8. **越权拦截**：普通 Member 角色尝试调用 Admin 接口、伪造 `sender_native_id`、越权使用未授权 Group 时，均被拒绝。
+9. **大体积文件防护**：大日志与大补丁回传通过 Artifact 按页切片拉取，避免把数 MB 的原始输出直接塞进通知导致内存暴涨。
 10. **单机功能向后兼容**：不涉及跨机参数时，现有单机调度、测试套件（230 项用例）及 Telegram 状态拦截完全保持原有逻辑。
-11. **复合指令断网自愈**：无 `session_id` 的远端派单在执行中途断网，重连后凭稳定 `operation_id` 找回同一会话，不泄露孤儿子进程。
+11. **复合派单断网恢复**：无 `session_id` 的远端派单在执行中途断网，重连后凭稳定 `operation_id` 找回同一会话，不泄露孤儿子进程。
 12. **人工 Evidence 解除**：对处于 `uncertain` 的队头投递，验证必须提供非空证据与准确 Revision 方可解除，不自动静默重试。
 13. **多节点事件镜像去重**：不同节点相同数值的 `event_seq` 回传至父机器时，分别映射为独立的本地镜像事件，Parent ACK 不串联。

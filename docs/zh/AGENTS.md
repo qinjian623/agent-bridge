@@ -11,7 +11,7 @@
 
 ## 安装、运行与检查
 
-需要 Python 3.11+ 和 `uv`；运行本机托管服务还需要 Linux 用户级 `systemd`（或 macOS `launchd`），调用真实模型需要对应 CLI 已完成登录。
+需要 Python 3.11+ 和 `uv`；运行本机托管服务另需 Linux 用户级 `systemd`（或 macOS `launchd`），调用真实模型前应先登录对应 CLI。
 
 ```bash
 uv sync --locked                         # 按 uv.lock 安装依赖
@@ -26,7 +26,7 @@ uv run ruff check src tests scripts
 
 ## 代码风格与命名
 
-使用四空格缩进。模块、函数和变量采用 `snake_case`，类采用 `PascalCase`；保持现有类型标注和错误处理写法。Ruff 配置位于 `pyproject.toml`，目标版本为 Python 3.11，行长参考值为 120，未启用行长错误检查。沿用已有模块中的函数，避免为单次用途增加包装。
+使用四空格缩进。模块、函数和变量采用 `snake_case`，类采用 `PascalCase`；保持现有类型标注和错误处理写法。Ruff 配置位于 `pyproject.toml`，目标版本为 Python 3.11，行长参考值为 120，未启用行长错误检查。沿用已有模块中的函数，不要为一次性用途额外加包装函数。
 
 ## 测试要求
 
@@ -36,7 +36,7 @@ uv run ruff check src tests scripts
 uv run python -m unittest discover -s tests -p 'test_store.py' -v
 ```
 
-修复缺陷时补充能重现问题的测试。涉及请求重试、并发或进程退出时，检查重复执行和结果保存行为。使用临时状态目录、模拟 CLI 与 mock；项目未设置覆盖率百分比要求。真实 CLI smoke 可能产生费用或操作会话，运行前核实脚本行为和目标。
+修复缺陷时补充能重现问题的测试。涉及请求重试、并发或进程退出时，检查幂等性和状态保存行为。使用临时状态目录、模拟 CLI 与 mock；项目未设置覆盖率百分比要求。真实 CLI smoke 可能产生费用或影响真实会话，运行前核实脚本行为和目标。
 
 ## 提交与 Pull Request
 

@@ -34,4 +34,4 @@ uv run python -m unittest discover -s tests -v
 - 生产 SQLite 数据迁移和跨版本恢复，需要为该次升级准备备份并检查结果。软件包安装成功不表示数据迁移成功。
 - 手动运行 `scripts/*_smoke.py` 和 `scripts/benchmark.py` 会调用真实模型。任何真实服务、会话或通知操作，都需要指定目标并获得授权。
 
-模型回复完成、模拟任务通过或 CI 成功，只能说明各自执行过的检查，不代表工业认证，也不能保证未检查环境的结果。见[安装与使用](getting-started.md)、[CI 与发布](ci-release.md)和[隐私检查](privacy.md)。
+模型回复完成只说明该轮已经结束。模拟任务和 CI 的结果只适用于各自执行的检查。工业认证和其他环境需要另行验证。见[安装与使用](getting-started.md)、[CI 与发布](ci-release.md)和[隐私检查](privacy.md)。

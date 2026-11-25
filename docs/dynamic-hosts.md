@@ -4,7 +4,7 @@
 
 ## Live Runtime Configuration Reloads
 
-The broker polls `config.json.hosts` and `host_pins.json` in the state directory every 0.5 seconds. Adding, editing, or removing entries under `hosts` takes effect immediately without restarting the broker, Web monitor, or running workers (applying host registry changes only without modifying runtimes, models, permissions, or quotas). Write changes atomically via temporary file rename to prevent partial reads.
+The broker polls `config.json.hosts` and `host_pins.json` in the state directory every 0.5 seconds. Adding, editing, or removing entries under `hosts` takes effect without restarting the broker, Web monitor, or running workers. Only host registry entries are reloaded; runtimes, models, permissions, and quotas are unchanged. Write updates atomically by renaming a temporary file so the broker never reads a partial file.
 
 To force an immediate reload via MCP/CLI:
 
@@ -13,7 +13,7 @@ agent-bridge call agent_hosts_reload --json '{}'
 agent-bridge call agent_hosts --json '{}'
 ```
 
-`agent_hosts_reload` returns `{added, updated, removed}` (empty lists when unchanged). It takes no parameters, requires local same-UID coordinator admin token auth, and is excluded from restricted member and `peer.*` paths. Existing MCP clients do not need re-discovery unless listing newly registered tools.
+`agent_hosts_reload` returns `{added, updated, removed}` (empty lists when unchanged). It takes no parameters, requires local same-UID coordinator admin token authentication, and is excluded from restricted member and `peer.*` paths. Existing MCP clients do not need re-discovery unless listing newly registered tools.
 
 Example `hosts` entry using a synthetic SSH alias:
 
@@ -29,18 +29,18 @@ Example `hosts` entry using a synthetic SSH alias:
 }
 ```
 
-Inspect `peer.hello` and `peer.inspect(kind=node)` over an explicit SSH target before pinning rather than auto-trusting first-contact responses; matching entries in `host_pins.json` override inline `config.json` pins. Keep existing host entries isolated without copying credentials or SQLite DBs across nodes.
+Inspect `peer.hello` and `peer.inspect(kind=node)` over an explicit SSH target before pinning rather than trusting first-contact responses automatically. Matching entries in `host_pins.json` override inline `config.json` pins. Keep host entries isolated and never copy credentials or SQLite databases across nodes.
 
 ## Continuity Guarantees on Registry Edits
 
-- Unchanged hosts retain existing SSH connections and online status. Modified hosts stop admitting new requests, drain active API operations, poller loops, ACKs, and cursor writes, and retire old SSH clients cleanly without re-opening retired clients in callers.
-- Malformed JSON, missing files, or invalid host schemas are never treated as empty registries: the entire candidate batch is ignored, `agent_hosts.config_error` records the reason, and valid fixes reload automatically.
-- Nodes referenced by active group members, non-terminal `peer_outbox` deliveries, or unresolved operations reject removal or target changes (even if a separate submit operation completed while downstream tasks remain active).
-- Historical parent notification routes undergo read-only remote verification: sessions must be `closed/stopped`, tasks must be finished and reviewed (`accepted`/`rejected`) or in terminal failure/cancel/interrupt states. Offline/missing/active/unreviewed/mismatched-identity states block edits while retaining historical routes and cursors.
-- Registry removal never cancels remote tasks, closes remote native sessions, flushes queues, mutates `uncertain` records, or migrates work. Stale poll loops exit cleanly; temporary identity/cursor caches clear upon re-registration.
+- Unchanged hosts retain their existing SSH connections and online status. Modified hosts stop accepting new requests, drain active API operations, poller loops, ACKs, and cursor writes, and retire old SSH clients so callers cannot reopen them.
+- Malformed JSON, missing files, or invalid host schemas are never treated as an empty registry: the entire candidate batch is ignored, `agent_hosts.config_error` records the reason, and valid fixes reload automatically.
+- You cannot remove or retarget a host referenced by active group members, unfinished `peer_outbox` deliveries, or unresolved operations—even if a separate submit operation completed while downstream tasks remain active.
+- The broker checks historical parent notification routes with read-only requests to the remote host. A session must have `desired=closed` and `observed=stopped`. A task must be `completed` with an `accepted` or `rejected` review, or have status `failed`, `cancelled`, or `interrupted`. The broker blocks edits if the host is offline, a record is missing, work is still active or unreviewed, or the node identity differs. Existing routes and cursors are retained.
+- Registry removal never cancels remote tasks, closes remote native sessions, flushes queues, mutates `uncertain` records, or migrates work. Stale poll loops exit, and temporary identity or cursor caches clear upon re-registration.
 - Changing only SSH connection fields for the same identity does not bypass an `EventMirror` fingerprint-conflict pause; explicit re-pinning or removal clears transient pause flags while keeping historical fingerprints and durable cursors intact.
 
-Known limitation: historical parent routes from a retired `state_generation` lack explicit retirement proofs and may block later removal if reusing the exact same `host_id` for a different `node_id`—assign a fresh `host_id` when provisioning replacement nodes rather than force-deleting safety checks.
+Known limitation: historical parent routes from a retired `state_generation` have no explicit retirement proof, so reusing the same `host_id` for a different `node_id` may block later removal. Assign a fresh `host_id` to replacement nodes rather than bypassing safety checks.
 
 ## Remote event history
 

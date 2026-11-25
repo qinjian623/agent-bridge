@@ -36,7 +36,7 @@ agent-bridge call agent_inspect --json '{}'
 | 默认语言与路由规则 | `--config-language en\|zh-CN\|auto\|none`、`--routing-file PATH`、`--clear-routing` |
 | 父会话通知 | `--codex-async-python PATH`、`--telegram-database PATH`。用空字符串清除对应路径。 |
 | Broker 服务和更新 | `--service-kind`、`--service-name`、`--install-broker-service`、`--enable-broker-service`、`--force-broker-service`、`--ota-repo`、`--ota-root`、`--ota-interval`、`--ota-release-url`、`--install-updater`、`--enable-updater` |
-| 托管 Web | `--install-web` 写入服务文件，`--enable-web` 同时启动。需要托管更新设置，可在同一条命令中配置。 |
+| 托管 Web | `--install-web` 写入服务文件，`--enable-web` 同时启动。依赖托管更新设置，可在同一条命令里一并配置。 |
 
 例如，把默认语言设为中文，并从文件加载[路由规则](getting-started.md#off-peak-routing)。
 
@@ -44,11 +44,11 @@ agent-bridge call agent_inspect --json '{}'
 agent-bridge init --non-interactive --config-language zh-CN --routing-file routing.json
 ```
 
-文件填写包含 `calendars`、`windows` 和 `preferences` 的路由对象。导入会整项替换路由规则，`--clear-routing` 可以清除。用 `--ota-release-url URL` 设置镜像，用 `--ota-release-url ''` 切回 GitHub。OTA 参数会准备更新程序的文件。启动服务或启用定时器时，请用相应的 `--enable-*` 参数或菜单选项。
+文件内容为包含 `calendars`、`windows` 和 `preferences` 的路由对象。导入会整体替换路由规则，`--clear-routing` 用于清除。用 `--ota-release-url URL` 设置镜像，用 `--ota-release-url ''` 切回 GitHub。OTA 参数只准备更新程序所需文件；要启动服务或启用定时器，请加上对应的 `--enable-*` 参数或在菜单里开启。
 
 CLI 帮助、配置向导、终端监控、Web 页面和父任务通知支持英文与简体中文。运行 `agent-bridge --lang zh-CN --help` 查看中文帮助；Web 仪表盘和登录页可单独选择语言，见[语言设置](getting-started.md#language)。
 
-需要查看 Web 仪表盘时，安装时传入 `--with-web` 可将 Web 作为用户服务，并随 OTA 重启。也可在另一个终端运行 `agent-bridge monitor --web`，打开[本机登录页](http://127.0.0.1:8080/login)，使用 Bridge 状态目录下 `admin.token` 中的令牌登录。见 [Web 设置](getting-started.md#监控与接入接口)。
+想用 Web 仪表盘，可以在安装时传入 `--with-web`，把 Web 装成用户服务并随 OTA 一起重启。也可在另一个终端运行 `agent-bridge monitor --web`，打开[本机登录页](http://127.0.0.1:8080/login)，使用 Bridge 状态目录下 `admin.token` 中的令牌登录。见 [Web 设置](getting-started.md#监控与接入接口)。
 
 ## 接入 MCP
 

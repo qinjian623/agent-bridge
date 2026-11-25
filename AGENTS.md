@@ -11,7 +11,7 @@
 
 ## Installation, Running, and Checks
 
-Requires Python 3.11+ and `uv`; managed user service features require Linux user-level `systemd` (or macOS `launchd`), and calling real models requires logging in via the target CLI beforehand.
+Requires Python 3.11+ and `uv`. Managed user services need Linux `systemd --user` or macOS `launchd`, and real model calls need an existing login in the target CLI.
 
 ```bash
 uv sync --locked                         # Install dependencies pinned in uv.lock
@@ -36,7 +36,7 @@ Use `unittest.TestCase`, and `unittest.IsolatedAsyncioTestCase` for async tests.
 uv run python -m unittest discover -s tests -p 'test_store.py' -v
 ```
 
-Add regression tests reproducing bugs when fixing defects. For request retry, concurrency, or process exit changes, verify idempotency and state persistence. Use temporary state directories, mock CLIs, and mocks; no percentage coverage threshold is enforced. Real CLI smoke scripts may incur model API charges or affect real sessions—verify script arguments and targets before running them.
+Add a regression test for every bug fix. For request retry, concurrency, or process exit changes, verify idempotency and state persistence. Use temporary state directories, mock CLIs, and mocks; no percentage coverage threshold is enforced. Real CLI smoke scripts may incur model API charges or affect real sessions—verify script arguments and targets before running them.
 
 ## Commits and Pull Requests
 
@@ -46,4 +46,4 @@ Pull requests should describe the problem, updated behavior, checks executed, an
 
 ## Configuration and Private Data
 
-The default state directory is `~/.local/state/cli-agent-bridge`; use `agent-bridge --state /tmp/bridge-check ...` for isolated checks. Never commit API keys, credential files, runtime SQLite databases, raw chat transcripts, or screen recordings. Referenced `env_file` files must be owner-only readable/writable (`0600`). Installation helpers create command links and user services; do not casually restart already-running user services or message real sessions while editing code.
+The default state directory is `~/.local/state/cli-agent-bridge`; use `agent-bridge --state /tmp/bridge-check ...` for isolated checks. Never commit API keys, credential files, runtime SQLite databases, raw chat transcripts, or screen recordings. Referenced `env_file` files must be readable and writable only by the owner (`0600`). Installation helpers create command links and user services. Avoid restarting running user services or messaging real sessions while editing code.

@@ -45,11 +45,11 @@ agent-bridge call agent_control --json '{"session_id":"<session_id>","action":"c
 agent-bridge call agent_inspect --json '{"session_id":"<session_id>"}'
 ```
 
-每个会话使用不同的 `request_id`。等待活动任务达到终态、各 worker 退出（`worker_alive=false`）。遇到 `recovery_needed` 要检查，不能当作已经停止。close 会取消排队任务并请求中断活动任务，保留历史与文件；它不会停止在 worker 管理的进程范围以外启动的工作，也不会停止远端 broker。需要时在远端所属节点关闭会话；移除主机配置不会卸载远端程序。
+每个会话使用不同的 `request_id`。等待活动任务达到终态、各 worker 退出（`worker_alive=false`）。遇到 `recovery_needed` 要检查，不能当作已经停止。close 会取消排队任务并请求中断活动任务，同时保留历史与文件；但它不会停止超出 worker 管理范围的外部进程，也不会停止远端 broker。需要时在远端所属节点关闭会话；移除主机配置不会卸载远端程序。
 
 ## 2. 停止 broker，移除用户服务文件
 
-前台 broker 在运行终端按 Ctrl+C。服务安装按对应系统操作；先查看服务文件，确认属于本次安装。自定义服务名需修改命令。
+前台运行的 broker 直接在对应终端按 Ctrl+C 停止。服务安装按操作系统分别处理，删除前先查看服务文件，确认它属于本次安装；如果自定义过服务名，相应替换命令里的名称。
 
 Linux `systemd --user`（也适用于旧 `install_local.py`）：
 
@@ -90,7 +90,7 @@ codex mcp remove cli-agent-bridge
 codex mcp list
 ```
 
-用过 `agent-bridge integrate` 时，确认该命令输出的 skill 链接指向 Bridge 随包技能，再移除该链接。在其他配置过的 MCP 客户端中移除对应条目，再重载或退出客户端，让其 stdio MCP 进程退出。这不会删除模型 CLI 的登录凭据。
+用过 `agent-bridge integrate` 时，确认该命令输出的 skill 链接指向 Bridge 随包 skill，再移除该链接。在其他配置过的 MCP 客户端中移除对应条目，再重载或退出客户端，让其 stdio MCP 进程退出。这不会删除模型 CLI 的登录凭据。
 
 使用过 `scripts/install_local.py` 时，检查它创建的链接：
 
@@ -120,7 +120,7 @@ uv tool uninstall cli-agent-bridge
 
 用一键脚本安装时，确认 `~/.local/bin/agent-bridge` 是指向 `~/.local/share/cli-agent-bridge/bin/agent-bridge` 的符号链接，再移除该链接。
 
-托管服务和 OTA 默认另建 `~/.local/share/cli-agent-bridge`，含 `bin`、`current`、`releases`，与 uv 工具环境分开。确认所有服务、worker、更新进程、MCP 进程都已停止后，移除自己加入 shell 的托管 `bin` PATH 设置，再用文件工具将此目录移走或删除。自定义过 `root` 时使用实际目录。托管入口仍依赖安装时 Python 的情况下，不要先删除该 Python 环境。
+托管服务和 OTA 默认另建 `~/.local/share/cli-agent-bridge`，含 `bin`、`current`、`releases`，与 uv 工具环境分开。确认所有服务、worker、更新进程、MCP 进程都已停止后，移除自己加入 shell 的托管 `bin` PATH 设置，再用文件工具将此目录移走或删除。自定义过 `root` 时使用实际目录。如果托管入口仍依赖安装时所用的 Python，不要先删掉那个 Python 环境。
 
 ## 5. 单独决定是否删除本地数据
 

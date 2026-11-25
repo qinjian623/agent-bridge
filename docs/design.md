@@ -44,16 +44,16 @@ Each host owns its database and processes. Remote execution does not use a share
 - `agent_dispatch` enqueues work and returns IDs. It does not wait for model completion. A worker runs one turn per session; other sessions can run concurrently within configured limits.
 - Repeating a `request_id` with identical parameters returns the original operation. Reusing it for different content is rejected. This prevents duplicate queue entries, not arbitrary external side effects.
 - `completed` means the native turn finished. The calling agent checks files and actual test results before `agent_review`; dependent tasks wait for an accepted review.
-- Workers run independently of the requesting MCP client. A disconnected client does not cancel their tasks. Unexpected process exits or unconfirmed external outcomes can require manual investigation through `recovery_needed`.
+- Workers run independently of the requesting MCP client. A disconnected client does not cancel their tasks. Unexpected process exits or unconfirmed external outcomes can leave tasks in `recovery_needed` for manual inspection.
 - Registered parent notifications preserve receipt/processing state. Group broadcasts target only explicit members. Unknown delivery outcomes must be inspected before resending.
 
 Task/session controls, model discovery, selection, budgets, and optional Telegram integration are described in the [user guide](getting-started.md).
 
 ## Configuration and trust
 
-Profiles reference existing native logins or private environment files. Model discovery does not perform inference; a listed model is not proof that the account can execute it. Explicit runtime/model choices are preserved.
+Profiles reference existing native logins or private environment files. Model discovery does not perform inference; a listed model does not prove the account can run it. Explicit runtime/model choices are preserved.
 
-Host entries and identity pins can [reload while the broker runs](dynamic-hosts.md). Profiles are loaded at broker startup; existing sessions retain their original configuration. [OTA updates](ota-updates.md) preserve compatible work and stop after uncertain restart outcomes.
+Host entries and identity pins can be [reloaded while the broker runs](dynamic-hosts.md). Profiles are loaded at broker startup; existing sessions retain their original configuration. [OTA updates](ota-updates.md) preserve compatible work and stop after uncertain restart outcomes.
 
 Bridge is intended for one operating-system user and explicitly trusted peers. Worktrees separate file edits; they do not isolate malicious programs running under the same user. See [security](../SECURITY.md) and [checks and limits](production-readiness.md).
 

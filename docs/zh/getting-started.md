@@ -195,7 +195,7 @@ agent-bridge call agent_result --json '{"task_id":"<task_id>"}'
 agent-bridge call agent_review --json '{"task_id":"<task_id>","attempt_id":"<attempt_id>","decision":"accepted","evidence":"<what you inspected and the actual check results>","expected_revision":0,"request_id":"review-task-1"}'
 ```
 
-依赖任务等待前项的当前已完成 attempt 被接受后才运行。被拒绝的 attempt 需要明确重试或新任务。`agent_result` 默认只显示简短回答；出现 `answer_truncated` 或结果文件时，用返回的 `artifact_id`、`offset`、`next_offset` 分页读取。每页按 UTF-8 字节计数，最多 65,536 字节，不能按字符计算。出现 `files.error`、`statistics_error` 时分别检查；有回答不证明文件记录和用量查询都成功。
+依赖任务要等前置任务当前的已完成 attempt 被接受后才会运行。被拒绝的 attempt 需要明确重试或新任务。`agent_result` 默认只显示简短回答；出现 `answer_truncated` 或结果文件时，用返回的 `artifact_id`、`offset`、`next_offset` 分页读取。每页按 UTF-8 字节计数，最多 65,536 字节，不能按字符计算。出现 `files.error`、`statistics_error` 时分别检查；有回答不证明文件记录和用量查询都成功。
 
 交互查看用 `agent-bridge monitor`，一次快照用 `agent-bridge monitor --once --format json --no-native`。新安装默认不发送父通知。保存任务 ID，通过 `agent_result` 读取状态和回答；需要等待事件时，可以调用一次 `agent_wait(task_id=..., timeout=20)`，再查看结果。最长等待 50 秒，超时不代表任务失败。
 
@@ -423,7 +423,7 @@ agent-bridge call agent_dispatch --json '{"profile":"agy","model":"gemini-4-neon
 
 明确指定的配置从不自动替换。自动选择检查输入类型、工具、上下文大小、供应商许可、账户等待状态、推理验证状态和已有质量记录。默认 `default_strategy=balanced`，质量达标后，费用和耗时各赋 0.5 权重。单任务可传 `requirements.strategy=cost/speed/balanced`。没有可比价格时统一采用 token。数据不足时默认按配置顺序选择并返回 `Unmeasured`。[低峰时段规则](#off-peak-routing)可以调整符合要求的配置之间的优先顺序。
 
-选择依据是任务的全部 attempt 加主会话开销，不使用只有子会话用量的部分样本。目前只有一个父记录对应一个任务、其计数已停止且结果已检查时，才能作为完整费用/耗时样本；并行任务共享父会话时不猜测如何分摊。`requirements.learn_from_result=false` 可以保留测试结果而不用于后续选择，固定比较中的验证任务采用此设置。
+选择依据是任务的全部 attempt 加主会话开销，不使用只有子会话用量的部分样本。目前只有当一个父记录仅对应单个任务、其计数已停止且结果已检查时，才作为完整费用和耗时样本；并行任务共享父会话时不猜测如何分摊。`requirements.learn_from_result=false` 可以保留测试结果而不用于后续选择，固定比较中的验证任务采用此设置。
 
 换模型重试尚未开始或被取消时，原模型的失败样本仍保留。任务换到另一父会话后，旧父会话处理过它的记录仍参与判断，不能把共享开销全部计入剩余的单个任务。
 
@@ -613,9 +613,9 @@ agent-bridge update --drain-workers run
 
 已有私有 `release_url` 设置会继续生效：从 `<base>/latest.json` 获取发布信息，从 `<base>/releases/<tag>/` 获取附件。再次运行 `init` 或修改检查间隔会保留原来源。镜像支持 HTTPS，HTTP 仅限回环地址及 Tailscale，并检查 DNS 地址。重定向必须保持原来源的协议、主机和端口。镜像请求失败不会改用 GitHub。
 
-更新下载经过 SHA256 检查的 wheel，在新版本专用虚拟环境中安装，先运行配置与隔离服务检查。默认启用 OTA 热更新：不中断运行中的任务和兼容 worker，进入维护前仅排空短在途请求、通知与非 SSH helper；兼容 Worker 与 SSH relay 在当前轮次结束或空闲后自行退场由新版拉起（仅当目标版声明不兼容、或指定 `--drain-workers` 时才等待全部任务与 Worker 清空）；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录禁止新派单和发送，其他节点也不能在此时投递新工作；CLI 在维护和重启短暂窗口内对只读与带 `request_id` 的幂等请求自动重试。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。详情参见 [OTA 热更新设计](ota-updates.md)。
+更新会下载经过 SHA256 校验的 wheel，安装到新版本专用虚拟环境，并先运行配置与隔离服务检查。默认启用 OTA 热更新：不中断运行中的任务和兼容 worker，进入维护前只排空短在途请求、通知与非 SSH helper；兼容 Worker 与 SSH relay 在当前轮次结束或空闲后自行退出，再由新版拉起。只有目标版本声明不兼容，或显式指定 `--drain-workers` 时，才会等待全部任务和 Worker 清空；暂停会话里的历史排队任务原样保留。切换版本前，Broker 的短期维护记录会禁止新派单和发送，其他节点也不能在此时投递新工作；CLI 在维护和重启的短暂窗口内，会对只读请求和带 `request_id` 的幂等请求自动重试。服务启动后核对实际版本和 PID，明确失败时恢复上一程序版本，不还原数据库、不重放任务；重启结果不明时保持 `uncertain`，停止自动重试。详情参见 [OTA 热更新设计](ota-updates.md)。
 
-`~/.local/share/cli-agent-bridge/bin/agent-bridge` 是固定入口，Broker、CLI、MCP、远端 relay 和 skill 应使用该入口或 `current/skill`，不能只改 Broker 而让其它入口仍指向旧 checkout。版本目录保留，源仓库及其未提交修改不被更新程序覆盖。正在运行的原生终端不被重启，MCP 配置修改在下次加载时生效。定时器只更新 Bridge，不更新 Codex、Claude、Pi 或 AGY 本身。
+`~/.local/share/cli-agent-bridge/bin/agent-bridge` 是固定入口，Broker、CLI、MCP、远端 relay 和 skill 应使用该入口或 `current/skill`，不能只改 Broker 而让其他入口仍指向旧 checkout。版本目录保留，源仓库及其未提交修改不被更新程序覆盖。正在运行的原生终端不被重启，MCP 配置修改在下次加载时生效。定时器只更新 Bridge，不更新 Codex、Claude、Pi 或 AGY 本身。
 
 最近结果保存在状态目录的 `update-status.json`；下载或校验失败会记录失败类型。核对实际运行版本和健康检查结果，不能将定时器已安装当作升级成功。
 

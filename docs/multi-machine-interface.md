@@ -22,14 +22,14 @@ All components above are wired into live code. Each host owns an independent SQL
 
 The broker watches `config.json.hosts` and `host_pins.json` periodically and supports immediate zero-arg refresh via `agent_hosts_reload`, returning `{added, updated, removed}` (while `agent_hosts` preserves `hosts` and exposes `config_error`). Reload adds no `peer.*` methods and never weakens member restrictions.
 
-`HostRegistry.read_configured_hosts()` validates candidate host configs without side effects; `replace_hosts()` applies in place. `PeerClientFactory.retire(host_ids)` blocks new traffic on stale handles while waiting for in-flight RPCs/pollers/ACKs; `release_retired(host_ids)` closes retired connections cleanly once replaced. Invalid batches or referenced active hosts reject changes atomically without affecting unchanged hosts. See [Dynamic host configuration](dynamic-hosts.md).
+`HostRegistry.read_configured_hosts()` validates candidate host configs without side effects; `replace_hosts()` applies in place. `PeerClientFactory.retire(host_ids)` blocks new traffic on stale handles while waiting for in-flight RPCs/pollers/ACKs; `release_retired(host_ids)` closes retired connections once replaced. Invalid batches or changes to referenced active hosts are rejected atomically without affecting unchanged hosts. See [Dynamic host configuration](dynamic-hosts.md).
 
 - Transport: `ssh <target> <remote_executable> relay`, one UTF-8 JSON line per frame, max `MAX_FRAME_BYTES` (1 MiB).
 - Request: `{"v":1,"id":"<frame id>","method":"peer.x","params":{...}}`; response: `{"v":1,"id":...,"ok":true,"result":{...}}` or `"ok":false,"error":{code,message}`.
 - Frame `id` correlates messages only—it is **not** an idempotency key; idempotency uses `OperationKey = (node_id, state_generation, operation_id)`.
 - Relay and node handlers validate `require_method` first and return `peer_method_not_allowed` for unknown methods.
 - Broken transports return `peer_host_offline` and **never** mark remote tasks `failed`; inspect true state via `peer.lookup_delivery`.
-- `relay` revalidates on-disk config each frame and refuses requests if missing or corrupt. `peer.catalog` returns sanitized `entries`, `profiles`, and `discovery` (`refresh=true` queries provider catalogs; failures report `stale`/`error`).
+- `relay` revalidates on-disk config each frame and refuses requests if it is missing or corrupt. `peer.catalog` returns sanitized `entries`, `profiles`, and `discovery` (`refresh=true` queries provider catalogs; failures report `stale`/`error`).
 - After three empty outbox or event polls, that poller waits up to two extra seconds between checks (2 → 4 seconds with the default `pull_interval`). Activity or a polling error restores the configured interval. The preliminary `peer.hello` can send `identity_only: true` to skip dynamic capability checks while still verifying node identity and the database's confirmed sequence.
 - An exhausted `peer.events` page can return `scanned_through`, the highest sequence examined in the same SQLite snapshot. Coordinators advance to it only after validating and processing the complete page, including empty pages. A partial page or a peer that omits the field continues to use the last processed event.
 - Event polling omits `tool_started` and `tool_completed` by default. Set `mirror_tool_events: true` on an individual host to keep copying its future tool details. The wire parameter `include_tool_events` defaults to true when omitted by older and on-demand clients. New coordinators also discard tool details from older peers when mirroring is off. Tool detail history remains readable on its source node, for example through `agent_wait` with a local task ID and cursor.
@@ -69,10 +69,10 @@ Mutating handlers (`PeerService`):
 
 Deliveries (`DeliveryScheduler`):
 - Strictly monotonic `target_seq` per target stream; head-of-line `uncertain` returns `delivery_blocked` until cleared via `agent_delivery_resolve` (non-empty `evidence` + exact revision).
-- Cancelling un-sent messages transmits `seq_kind=tombstone` preserving `target_seq`; followers wait until tombstone confirmation.
+- Cancelling unsent messages transmits `seq_kind=tombstone` preserving `target_seq`; followers wait until tombstone confirmation.
 - Retries reuse identical `delivery_id` and `target_seq` and never blindly resend `uncertain`.
 - Native targets settle to `accepted_remote` upon local enqueue; periodic lookups match node, target, sequence, receipt, and turn before releasing `target_seq`.
-- `peer.lookup_delivery` checks live `native_send_queue` read-only without launching or resuming Codex/AGY sessions; non-empty `cwd` persists cleanly for native wake checks.
+- `peer.lookup_delivery` checks live `native_send_queue` read-only without launching or resuming Codex/AGY sessions; a non-empty `cwd` is persisted for native wake checks.
 - Automatic receipt checks for unresolved native deliveries back off from 1 second to 30 seconds. A healthy enqueued or running delivery is checked at most two seconds apart after the initial lookup. Explicit status refresh runs immediately. A status check verifies peer identity and skips the dynamic capability probe.
 - Remote Antigravity rejects `read-only` prior to session creation identically to local hosts.
 
@@ -92,7 +92,7 @@ Events & payloads: `EventMirror.mirror` deduplicates via `(NodeRef, event.seq)` 
 | `agent_group` | Extended | `remote_members: list[RemoteMember]` |
 | `agent_cancel` | Extended | Mutually exclusive `task_id` / `operation_id` / `delivery_id` |
 
-Budgets stay scoped per host (`budget_scope=host`); metered broadcasts containing remote native members fail cleanly with `peer_budget_scope`.
+Budgets stay scoped per host (`budget_scope=host`); metered broadcasts containing remote native members fail with `peer_budget_scope`.
 
 ## 6. Error Codes
 

@@ -4,7 +4,7 @@
 
 ## 1. Scope of v1
 
-The primary agent dispatches a task, the execution agent edits files inside an isolated worktree, a validation script checks tests and file modifications, the primary agent accepts or rejects the attempt, and execution metadata is logged to inspect pass rates and turnaround times.
+The primary agent dispatches a task, and the execution agent edits files inside an isolated worktree. A validation script then checks tests and modified files, the primary agent accepts or rejects the attempt, and execution metadata is logged to track pass rates and turnaround times.
 
 v1 connects to a single bridge instance executing one round per task. The primary agent explicitly picks an existing profile without automatic retries, automatic model switching, or metrics-driven auto-selection.
 
@@ -42,23 +42,23 @@ stop_if:
   - Changes required outside allowed_files or undocumented public interface changes discovered
 ```
 
-Pass the specification directly inside `agent_dispatch.instruction`. Before parallel multi-task dispatch, lock `shared_decisions` and pairwise-disambiguate `out_of_scope` per [router-prompt.md](../skills/cli-agent-bridge/resources/router-prompt.md).
+Pass the specification directly inside `agent_dispatch.instruction`. Before dispatching parallel tasks, lock `shared_decisions`, check each pair of tasks for overlap, and record what is `out_of_scope` for each task. See [router-prompt.md](../skills/cli-agent-bridge/resources/router-prompt.md).
 
-Select `profile` upfront and inspect resolved session model and effort rather than guessing from profile names; isolate runtime/provider/option adjustments under separate profile names for clean metrics. Open writable Git worktrees via `agent_open`, persist `workspace.snapshot_tree`, and pass dirty/untracked dependencies explicitly in `snapshot_files`.
+Select `profile` upfront and inspect the resolved session model and effort rather than guessing from profile names. Give runtime, provider, or option changes separate profile names so metrics stay comparable. Open writable Git worktrees via `agent_open`, persist `workspace.snapshot_tree`, and pass dirty or untracked dependencies explicitly in `snapshot_files`.
 
 ## 4. End-to-End Task Lifecycle
 
 1. **Dispatch**: Author the spec, call `agent_open` and `agent_dispatch`, then append an initial `task` JSONL record containing `task_id`, requirements, profile, and `snapshot_tree`.
-2. **Execute**: Worker edits and self-tests; await via `agent_wait` and read state plus `attempt_id` via `agent_result`/`agent_inspect`, then append an updated `task` line.
-3. **Independent Verification**: Once `completed` and writes quiesced, re-run tests and scope checks cleanly (restart checks if files mutate during checking). Before calling `agent_review(accepted)` for any `workspace-write` change, parallel task merge, or high-risk output, **must** open a **zero-history isolated read-only session (`access="read-only"`)** following Checker/evaluator rules in [router-prompt.md](../skills/cli-agent-bridge/resources/router-prompt.md) (selecting a verified heterogeneous model preferring a different runtime—excluding Antigravity because it lacks `read-only`, and falling back to fresh same-model read-only only if no heterogeneous read-only candidate exists), verifying original spec, workspace diff, independent test runs, worker handoff fields (`deviations`/`assumptions`/`unverified`/`unresolved` treated as leads only), and cross-task `conflicts`; trivial read-only queries may be verified directly by the coordinator.
-4. **Review Verdict**: Inspect actual diff and independent evidence, then submit `accepted` or `rejected` via `agent_review` (fail on test failures, out-of-scope edits, or missed acceptance items).
-5. **Log**: Append a `review` JSONL record after Bridge confirms persistence; compute counts, pass rate, and durations cleanly without altering `agent_review` RPC signatures or JSONL schema below.
+2. **Execute**: The worker edits files and runs self-tests; wait via `agent_wait`, read the state and `attempt_id` via `agent_result`/`agent_inspect`, and append an updated `task` line.
+3. **Independent Verification**: Once the task is `completed` and writes have stopped, re-run tests and scope checks (restart if files change mid-check). Before calling `agent_review(accepted)` on any `workspace-write` change, parallel merge, or high-risk output, the coordinator **must** open a **zero-history isolated read-only session (`access="read-only"`)** following the Checker/evaluator rules in [router-prompt.md](../skills/cli-agent-bridge/resources/router-prompt.md). Pick a verified heterogeneous model—preferring a different runtime and excluding Antigravity, which lacks `read-only`—and fall back to a fresh same-model read-only session only if no heterogeneous candidate exists. Check the original spec, workspace diff, independent test output, worker handoff fields (`deviations`/`assumptions`/`unverified`/`unresolved`, treated as leads only), and cross-task `conflicts`. Trivial read-only queries may be verified directly by the coordinator.
+4. **Review Verdict**: Inspect the actual diff and independent evidence, then submit `accepted` or `rejected` via `agent_review` (reject on test failures, out-of-scope edits, or missed acceptance items).
+5. **Log**: Append a `review` JSONL record after Bridge confirms persistence, then compute counts, pass rate, and durations without altering `agent_review` RPC signatures or the JSONL schema below.
 
-`completed` strictly denotes runtime turn completion, not acceptance; never skip reading the actual diff even when tests pass.
+`completed` only means the runtime turn finished, not that the work is accepted; never skip reading the actual diff even when tests pass.
 
-On execution `failed`, `interrupted`, or `cancelled`, append final `task` status and halt without calling `agent_review` or appending `review`. Preserve `recovery_needed` for manual inspection.
+On execution `failed`, `interrupted`, or `cancelled`, append the final `task` status and stop without calling `agent_review` or appending `review`. Preserve `recovery_needed` for manual inspection.
 
-Single-round v1 ledgers record one task per run (`task_id`); retries or spec edits create a new task (`task_id`) explicitly decided by an operator while retaining failed/rejected predecessors. In standard multi-agent collaboration workflows, the primary agent may dispatch at most 1 targeted fix pass per [router-prompt.md](../skills/cli-agent-bridge/resources/router-prompt.md) (handing over exact worktree root + relative `snapshot_files` verifying `workspace.snapshot_tree` in Git mode, or prior copy dir + surviving files excluding deleted paths verifying `workspace.manifest` in `copy` mode, followed by full read-only re-review).
+Single-round v1 ledgers record one task per run (`task_id`); retries or spec edits create a new `task_id` by operator decision while keeping failed or rejected predecessors. In standard multi-agent workflows, the primary agent may dispatch at most 1 targeted fix pass per [router-prompt.md](../skills/cli-agent-bridge/resources/router-prompt.md). Hand over the unmerged state explicitly—using the prior worktree root, relative `snapshot_files`, and `workspace.snapshot_tree` in Git mode, or the prior copy directory, surviving files (excluding deleted paths), and `workspace.manifest` in `copy` mode—then run a full read-only re-review.
 
 `agent_review` parameters ([MCP interface](../src/agent_bridge/mcp_server.py), [review rules](../src/agent_bridge/store.py)):
 - `task_id`, `attempt_id`: active completed attempt.
@@ -69,11 +69,11 @@ Single-round v1 ledgers record one task per run (`task_id`); retries or spec edi
 
 ## 5. What Automated Check Scripts Verify
 
-Check files left directly in the workspace rather than worker summaries:
-- Run specified tests independently inside the permitted environment capturing commands and exit codes.
-- Diff strictly against `snapshot_tree` rather than `HEAD` so caller-provided dirty snapshots are excluded cleanly.
-- Cover tracked, untracked, and Git-ignored paths across adds, deletes, renames (verify both old and new paths), permissions, binaries, and symlinks.
-- Snapshot directory state before and after test commands; invalidate results if files mutate mid-check.
+Check files directly in the workspace rather than trusting worker summaries:
+- Run the specified tests independently in the permitted environment, capturing commands and exit codes.
+- Diff against `snapshot_tree` rather than `HEAD` so caller-provided dirty snapshots are excluded.
+- Cover tracked, untracked, and Git-ignored paths across adds, deletes, renames (checking both old and new paths), permissions, binaries, and symlinks.
+- Snapshot directory state before and after test commands; invalidate results if files change mid-check.
 
 Inside the worktree root:
 
@@ -82,7 +82,7 @@ git diff --name-status --no-renames "$snapshot_tree" --
 git ls-files --others -z
 ```
 
-Disabling rename folding prevents hiding old paths; `-z` handles non-ASCII/special paths cleanly. Still inspect raw byte/mode diffs and avoid writing caches/artifacts inside the worktree unless explicitly allowed before dispatch. Worktrees isolate paths rather than providing an OS security sandbox.
+Disabling rename folding prevents hiding old paths, and `-z` preserves non-ASCII or special filenames. Still inspect raw byte and mode diffs, and avoid writing caches or artifacts inside the worktree unless explicitly allowed before dispatch. Worktrees isolate paths rather than providing an OS security sandbox.
 
 ## 6. JSONL Record Schema
 
@@ -131,16 +131,16 @@ Filter by dispatch timestamp range, specify cutoff time, and break down by profi
 | Pass rate | `accepted / decided_total` where `decided_total = accepted + rejected + failed + interrupted/cancelled` (display waiting/pending/unverified counts separately). |
 | Mean duration | Arithmetic mean from `task.time` at dispatch to resolved `review.time` (accepted/rejected) or terminal `task.time` (failed/cancelled/interrupted), covering queue + run + check + review wait across all decided tasks. |
 
-For example: 6 accepted, 2 rejected, 1 failed, 1 cancelled, plus 2 pending review -> `6 / 10 = 60%` alongside `2 pending review`. Leave ratios empty cleanly when `decided_total == 0`, avoid comparisons under `n < 10`, do not apply synthetic Bayesian weights or decay in v1, and never conflate Bridge's internal `quality` with task pass rates.
+For example: 6 accepted, 2 rejected, 1 failed, 1 cancelled, plus 2 pending review -> `6 / 10 = 60%` alongside `2 pending review`. Leave ratios empty when `decided_total == 0`, avoid comparisons under `n < 10`, do not apply synthetic Bayesian weights or decay in v1, and never conflate Bridge's internal `quality` with task pass rates.
 
 ## 8. Implementation Milestones & Guardrails
 
 **P0 (Complete end-to-end single-task path)**:
 - Dispatch, verify independently, review, log `task`/`review` JSONL rows, and summarize raw counts, pass rate, and duration.
-- Validate accepted, test-failed, and startup-failed paths cleanly without dropping failures or passing unreviewed work.
+- Validate accepted, test-failed, and startup-failed paths without dropping failures or passing unreviewed work.
 - Set directory permissions to `0700` and log/lock files to `0600`; exclude secrets, credentials, raw chats, and database paths.
 
 **P1 (Ergonomics)**:
 - Wrap dispatch/wait/check/append steps in scripts (keeping primary-agent diff review required) and add date/profile filtering, pending-review listings, and CSV/Markdown exports using identical definitions.
 
-Log retention and manual deletion remain user-managed; retries management, fixed-task calibration suites, auto-tiering, and cost modeling stay deferred outside P0/P1.
+Log retention and manual deletion remain user-managed; retry management, fixed-task calibration suites, auto-tiering, and cost modeling stay deferred outside P0/P1.

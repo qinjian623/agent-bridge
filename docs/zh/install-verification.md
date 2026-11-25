@@ -12,7 +12,7 @@
 
 临时 `codex` 包装命令只通过已安装工具的 Python 启动仓库 RPC fixture；profile 也明确指定该包装命令。临时 `systemctl` 命令返回不可用，保存的 worker 启动方式为 `detached`。没有向真实客户端注册 MCP；独立 stdio MCP 客户端完成初始化、工具列表和 fixture 模型目录查询。
 
-wheel 与源码分发包都包含 Apache-2.0 元数据、LICENSE、NOTICE 和配套 skill。wheel 共 46 个条目，其中三个为 skill 文件。归档内每个文本文件均通过仓库检查脚本，未命中所查私人目录、凭据、邮箱或会话标识格式，也未发现禁止公开的运行文件。格式匹配不能代替完整隐私检查。新 uv 工具安装中的 CLI 帮助可以正常运行。
+wheel 与源码分发包都包含 Apache-2.0 元数据、LICENSE、NOTICE 和配套 skill。wheel 共 46 个条目，其中三个为 skill 文件。归档内每个文本文件均通过仓库检查脚本，未命中所查私人目录、凭据、邮箱或会话标识格式，也未发现禁止公开的运行文件。格式匹配不能代替完整隐私检查。通过 uv tool 新安装的 CLI 帮助命令运行正常。
 
 实测 wheel 的 SHA256 为 `df3f7cfcf364f91b4e815987aceb9d91627dc1d7e024234d84eb7aee959aa0d4`。前几轮安装结果另行保留；本文描述最后一轮代码快照。之后重新构建源码分发包可以加入文档更新，无需改变本次测试的 wheel 代码。
 
@@ -42,7 +42,7 @@ agent-bridge call agent_dispatch --json '{"profile":"local","cwd":"/example/proj
 agent-bridge call agent_result --json '{"task_id":"<task_id>"}'
 ```
 
-完全相同的派单请求重复提交后，两个响应仍指向同一任务和会话。Python 内的限时等待读取结果直到完成；数据库中只有一个任务、一个 attempt，fixture 只执行一次。检查到预期的 `fixture complete` 结果。临时 README 未变；fixture 自己生成的 `invocations.txt` 记录了一次模拟轮次。
+完全相同的派单请求重复提交后，两个响应仍指向同一任务和会话。通过 Python 在限定时间内读取结果，直到任务完成；数据库中只有一个任务、一个 attempt，fixture 只执行一次。检查到预期的 `fixture complete` 结果。临时 README 未变；fixture 自己生成的 `invocations.txt` 记录了一次模拟轮次。
 
 随后使用实际返回的当前 revision 审查结果并关闭会话：
 

@@ -45,7 +45,7 @@ agent-bridge call agent_control --json '{"session_id":"<session_id>","action":"c
 agent-bridge call agent_inspect --json '{"session_id":"<session_id>"}'
 ```
 
-Use a different `request_id` for each session. Wait until active tasks reach a final state and each worker has exited (`worker_alive=false`). Investigate `recovery_needed` rather than treating it as stopped. Close cancels queued work and requests interruption of an active turn; it preserves history and files. It does not stop jobs launched outside the worker's process scope, or remote brokers. Close remote sessions on their owning nodes as needed; removing a host entry never uninstalls that host.
+Use a different `request_id` for each session. Wait until active tasks reach a final state and each worker has exited (`worker_alive=false`). Investigate `recovery_needed` rather than treating it as stopped. Closing a session cancels queued work and requests interruption of any active turn, while preserving history and files. It does not stop jobs launched outside the worker's process scope or stop remote brokers. Close remote sessions on their owning nodes as needed; removing a host entry never uninstalls that host.
 
 ## 2. Stop the broker and remove user service files
 
@@ -116,7 +116,7 @@ uv tool list
 uv tool uninstall cli-agent-bridge
 ```
 
-For `uv sync` in a source checkout, there is no global package to uninstall. Once services, MCP registrations, and source helper links have been removed, the checkout and its `.venv` can be retained or removed using your normal file tools. Check `git status` and preserve your edits first. If you installed the checkout through `uv tool install`, use `uv tool uninstall` as above as well.
+For `uv sync` in a source checkout, there is no global package to uninstall. Once services, MCP registrations, and source helper links have been removed, the checkout and its `.venv` can be retained or removed using your normal file tools. Check `git status` and preserve your edits first. If you also installed the checkout through `uv tool install`, remove it with `uv tool uninstall` as shown above.
 
 For a one-command release install, remove `~/.local/bin/agent-bridge` after confirming it is a symlink to `~/.local/share/cli-agent-bridge/bin/agent-bridge`.
 
@@ -132,6 +132,6 @@ Managed services/OTA also create `~/.local/share/cli-agent-bridge` by default, c
 | Referenced `env_file`, model CLI login files | Separate credentials: keep; Bridge uninstall does not revoke the account |
 | Remote installations | Remain installed; repeat these steps on each host only when intended |
 
-To remove history later, stop every process using that state directory, inspect its workspaces and artifacts, and keep a private backup of anything needed. The state directory can contain prompts and credentials references; do not upload it as an issue attachment. Deletion commands for runtime data are intentionally omitted.
+To remove history later, stop every process using that state directory, inspect its workspaces and artifacts, and keep a private backup of anything needed. The state directory can contain prompts and credential references; do not upload it as an issue attachment. Deletion commands for runtime data are intentionally omitted.
 
 Open a new shell and check `command -v agent-bridge` and `uv tool list`. If a command remains, inspect its location: another uv installation, source helper link, or managed launcher may still exist. Check that the removed service is no longer active. A remaining history directory alone does not mean a process is still running.

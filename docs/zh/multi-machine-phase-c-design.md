@@ -2,14 +2,14 @@
 
 # Phase C 设计规范：跨机群组、工作区同步、历史组修剪、会话命名与 Web 鉴权
 
-> **架构师审核与过滤状态**：经 Antigravity 全面技术评审与精简过滤（2026-11-05）。
+> **架构师审核与过滤状态**：经 Antigravity 技术评审与修订（2026-11-05）。
 >
 > **过滤与调整裁定（Antigravity Filter Directives）**：
-> 1. **拒绝群组修剪的两阶段分布式锁（No Distributed 2PC for Prune）**：否决 Sol 6.1 设计的 `peer.group_guard(acquire/validate/prepare/finalize)` 与远端 `group_prune_holds`。协调端是群组的唯一权威源（Sole Authority）。历史组修剪坚持 ADR-01 无分布式事务原则：由协调端通过标准 `peer.inspect` 执行只读安全门禁核查（所有成员已 closed/stopped、全部广播投递在 `broadcast_recipients` 达到终态）。核查通过后在协调端单机事务内 CAS 软删除（`deleted=1`）。此后任何拉取到的该组出站请求直接拒绝（`group_deleted`）。完全避免分布式死锁与孤儿租期恢复难题。
+> 1. **拒绝群组修剪的两阶段分布式锁（No Distributed 2PC for Prune）**：否决 Sol 6.1 设计的 `peer.group_guard(acquire/validate/prepare/finalize)` 与远端 `group_prune_holds`。协调端是群组的唯一权威源（Sole Authority）。历史组修剪坚持 ADR-01 无分布式事务原则：由协调端通过标准 `peer.inspect` 执行只读安全门禁核查（所有成员已 closed/stopped、全部广播投递在 `broadcast_recipients` 达到终态）。核查通过后在协调端单机事务内 CAS 软删除（`deleted=1`）。此后任何拉取到的该组出站请求直接拒绝（`group_deleted`），从而避免分布式死锁与孤儿租约恢复问题。
 > 2. **精简出站拉取验证（Streamlined Outbox Verification）**：远端 Agent 发起广播时直接由执行端本地 Broker 写入 `node_outbox`；协调端 `OutboxPuller` 主动拉取时，在协调端侧严格比对 `remote_group_members` 白名单与当前组 revision，无需在远端维护复杂的短期 token binding 基础设施。
-> 3. **保留并实施严格保序核心（Strict Ordering Core Approved）**：完全批准并保留 `target_streams`、单调递增 `target_seq`、Cancel Tombstone 墓碑机制、`agent_delivery_resolve` 证据化人工解除契约，以及执行端 `peer_inbox` 迁移为按 `stream_id` 联合唯一约束。
-> 4. **保留不可变工作区增量（Immutable Workspace Delivery Approved）**：完全批准 Patch / Snapshot 双模方案与不可变 Manifest 分块校验。执行端始终在私有 worktree 路径准备与绑定，绝不污染宿主目录。
-> 5. **会话原生命名与 Web 鉴权（Session Naming & Web Security Approved）**：完全批准创建事务同写入 `session_names` 以及 Web Monitor 基于 Token/Cookie/CSRF 的安全加固和经 Broker 审批流。
+> 3. **保留并实施严格保序核心（Strict Ordering Core Approved）**：批准并保留 `target_streams`、单调递增 `target_seq`、Cancel Tombstone 墓碑机制、`agent_delivery_resolve` 带证据的人工解除规则，以及执行端 `peer_inbox` 迁移为按 `stream_id` 联合唯一约束。
+> 4. **保留不可变工作区增量（Immutable Workspace Delivery Approved）**：批准 Patch / Snapshot 双模方案与不可变 Manifest 分块校验。执行端始终在私有 worktree 路径准备与绑定，不改动宿主工程目录。
+> 5. **会话原生命名与 Web 鉴权（Session Naming & Web Security Approved）**：批准在创建会话的同一事务内写入 `session_names`，以及为 Web Monitor 增加 Token/Cookie/CSRF 校验并改为经 Broker 审批。
 
 文档日期：2026-11-05。状态：经审核批准的设计规范（Approved Specification）。
 
@@ -253,7 +253,7 @@ CREATE TABLE pulled_request_receipts (
 );
 ```
 
-`broadcast_recipients.task_id` 不设本地 tasks 外键，因为它也可能引用远端任务；必须结合 target_ref 解释。本地收件也保存在该表，使状态查询及 prune 不再仅依赖易变名册或 requests.result。peer_outbox 不以远端资源 ID 建本地外键。
+`broadcast_recipients.task_id` 不设本地 tasks 外键，因为它也可能引用远端任务；必须结合 target_ref 解释。本地收件也保存在该表，让状态查询和 prune 不必只依赖会变化的成员名册或 requests.result。peer_outbox 不以远端资源 ID 建本地外键。
 
 ### 3.3 广播原子拆分
 
@@ -335,7 +335,7 @@ CREATE TABLE native_target_counters (
 );
 ```
 
-代码迁移脚本必须使表名与索引目标一致：上例索引写在新表上，重命名由 SQLite 更新引用，不能同时对不存在的 peer_inbox 再建同名索引。peer_commit_log.mutation_key 包含接收端代际、方法及完整操作身份，自然键方法还包含其业务键。迁移前必须按旧规则检查数据库已提交确认值不低于身份文件或对端确认值；发现回滚立即标 state_corrupted，不能用较大 floor 掩盖它。检查通过后插入一条 migration_floor 记录，将 ack_seq 设置为经核实的旧最大确认值，之后由 AUTOINCREMENT 继续。
+代码迁移脚本必须使表名与索引目标一致：上例索引写在新表上，重命名由 SQLite 更新引用，不能同时对不存在的 peer_inbox 再建同名索引。peer_commit_log.mutation_key 包含接收端代际、方法及完整操作身份，自然键方法还包含其业务键。迁移前必须按旧规则检查数据库已提交确认值不低于身份文件或对端确认值；发现回滚立即标 state_corrupted，不能用较大的基准值掩盖它。检查通过后插入一条 migration_floor 记录，将 ack_seq 设置为经核实的旧最大确认值，之后由 AUTOINCREMENT 继续。
 
 执行端只接受 `target_seq=admitted_seq+1` 的新消息；相同 delivery、序号和原始参数重放返回已有结果，不再排任务；序号已占但 ID/参数不同返回 `operation_conflict`。大于下一序号返回 `peer_sequence_gap` 并带 expected_seq；小于等于已收序号但没有可核实原记录则拒绝，不能猜测“已经做过”。不能删除仍用于去重的收件记录。
 
@@ -529,7 +529,7 @@ sequenceDiagram
     P->>P: 原生发送队列 / 既有 parent_ack
 ```
 
-`peer.notify_parent` 是接收父通知的 handler，不意味着远端主动反向连接协调端。父在协调端时，EventMirror 使用同一服务函数本机调用；父在远端时由协调端主动调用父宿主。RPC 中的 operation 指向接收宿主身份，event.ref 保留原事件来源，不能用协调端身份重写原来源。每个父宿主各自分配 mirror_seq。
+`peer.notify_parent` 是接收父通知的 handler，不意味着远端主动反向连接协调端。父会话在协调端时，EventMirror 使用同一服务函数本机调用；父会话在远端时由协调端主动调用父宿主。RPC 中的 operation 指向接收宿主身份，event.ref 保留原事件来源，不能用协调端身份重写原来源。每个父宿主各自分配 mirror_seq。
 
 本地镜像序号和父路由共同保证不给同一事件重复建 deliveries；已有事件要求通知给不同父记录时必须拒绝路由冲突。parent_ack 仍只确认本机 events.seq；接收通知的 ACK、通知已写入原生队列、父模型已处理是三个不同结果，查询必须分别呈现。
 
@@ -659,7 +659,7 @@ prepare 固定执行端 project 的规范目录、目录归属和相关配置摘
 
 每次上传/查询/绑定都核对 workspace_transfers.authority_ref，不能仅凭猜到 workspace_id 读取或覆盖另一 authority 的输入。输入内容读取用于原生 capture_patch 的 Git tree 只能表示文件内容和 executable；完整普通权限另外保存在工作区元数据中，最终输入摘要按实际 mode 验证。若结果包含 Git patch 无法表达的权限变化，结果 Artifact 另附模式变更清单，不能声称纯 Git diff 已保留它们。
 
-seal/abort 使用每 workspace 准备锁和传输 revision CAS。seal 领取 preparing 前保存 intent；耗时文件准备后提交 ready 前再次检查状态与 revision。abort 对 preparing 先登记 abort_requested，等待准备器停止，再由同一持锁处理者清理；不能并发删除 Git 正在使用的目录。attached 与 abort 的最终状态更新也在同一 SQLite 写锁下互斥。崩溃恢复同样先取得准备锁，防止两个恢复者同时发布。
+seal/abort 使用每 workspace 准备锁和传输 revision CAS。seal 领取 preparing 前保存 intent；耗时文件准备后提交 ready 前再次检查状态与 revision。abort 对 preparing 先登记 abort_requested，等待准备器停止，再由同一持锁逻辑清理；不能并发删除 Git 正在使用的目录。attached 与 abort 的最终状态更新也在同一 SQLite 写锁下互斥。崩溃恢复同样先取得准备锁，防止两个恢复者同时发布。
 
 私有路径由可信的 workspace_id 派生，位于 state 下，不能从清单传入绝对目标。Patch 模式在最终私有路径创建 Git worktree，以 ready 标记和数据库引用发布；已注册的 Git worktree **不得直接 rename**，否则其 Git 元数据仍指向原位置。Snapshot 可先建立普通暂存目录、原子 rename 至最终位置，再 git init/建立输入 tree；未 ready 时任务完全不可见。
 
@@ -742,7 +742,7 @@ agent-bridge group prune --older-than 7d
 
 门禁核查机制采用**协调端权威核验（Authoritative Coordinator Verification, ACV）**，坚持 ADR-01 无分布式事务的原则：
 
-1. **只读状态探测**：协调端对每个成员发起探测。本地成员查 Store，远端成员调用 `peer.inspect` 查询对应会话与任务状态。任何节点离线、超时或返回仍在运行（或无法证实已停止）时，跳过该组并记录 `group_prune_blocked`。
+1. **只读状态探测**：协调端对每个成员发起探测。本地成员查 Store，远端成员调用 `peer.inspect` 查询对应会话与任务状态。只要任一节点离线、超时、仍在运行或无法证实已停止，就跳过该组并记录 `group_prune_blocked`。
 2. **结算事实核查**：协调端在本地 `broadcast_recipients`、`peer_outbox` 中校验该组名下所有投递均已达终态（`released`、`cancelled`、`failed`），且无任何 `uncertain`、`pending`、`sending` 阻塞项。
 3. **单机原子 CAS 软删除**：协调端开启写事务，校验组 `deleted=0` 与 `revision` 未变，随后原子写入：
    ```sql
@@ -751,9 +751,9 @@ agent-bridge group prune --older-than 7d
    WHERE id=:group_id AND revision=:expected_revision AND deleted=0;
    ```
 4. **权威防御保证（Authority Invariant）**：由于协调端是组名册与广播派发的唯一权威源，一旦 `session_groups.deleted=1` 提交生效：
-   - 协调端彻底封死该组所有新广播、新派单与成员变更；
+   - 协调端会拒绝该组的所有新广播、新派单与成员变更；
    - 远端若在修剪后仍产生针对该 `group_id` 的反向出站请求，协调端 `OutboxPuller` 在拉取时依据 `session_groups.deleted=1` 直接拒绝并回传 `group_deleted`；
-   - 彻底避免了引入远端两阶段锁（`peer.group_guard`）所带来的跨机死锁、孤儿租期悬挂与脑裂难题。
+   - 从而避免引入远端两阶段锁（`peer.group_guard`）带来的跨机死锁、孤儿租约残留和状态分歧问题。
 
 软删除保留 remote_group_members 和本地成员行、广播、任务、审查与投递记录，后续查询按 deleted 过滤；与当前 delete 会清空名册不同，本阶段统一保留删除时成员快照，旧 delete 已删掉的成员不能凭空恢复。prune 不关闭任何会话、不删除工作区、不清理去重记录。出现新活动的组在删除前跳过；已删除后新入组/广播返回 group_deleted。
 
@@ -782,7 +782,7 @@ agent_dispatch(..., name: str | None = None)
 
 name 只在本次操作创建新 Bridge session 时生效，不把它当 native_id，不强制修改原生 CLI 内部标题，也不自动改组名。对已有 session_id 传非 None name 返回 `invalid_request`，要改名仍使用独立命名入口。None 保持原有无自定义名行为；字符串去除首尾空白后 1～128 个 Unicode 字符，拒绝 NUL、换行和控制字符，允许中文和重复名称。ID 仍是唯一标识。
 
-名称必须进入请求 fingerprint；相同 request_id 改 name 返回冲突，不能重试时给已有会话悄悄改名。None 与省略等价，Broker.api_call、Store.open 以及远端 stable operation ID 计算前均移除新增的 name=None 字段，避免 MCP locals() 带默认值导致升级前无 name 的请求重试失效；非空名使用验证后的规范字符串。两端都验证 name，不能只信客户端检查。事件 session_opened.data 包含 name（若存在），首轮监视器不需猜测 instruction 或等待后续改名。
+名称必须进入请求 fingerprint；相同 request_id 改 name 返回冲突，不能在重试时暗中改掉已有会话的名称。None 与省略等价，Broker.api_call、Store.open 以及远端 stable operation ID 计算前均移除新增的 name=None 字段，避免 MCP locals() 带默认值导致升级前无 name 的请求重试失效；非空名使用验证后的规范字符串。两端都验证 name，不能只信客户端检查。事件 session_opened.data 包含 name（若存在），首轮监视器不需猜测 instruction 或等待后续改名。
 
 ### 6.2 表与事务
 
@@ -806,7 +806,7 @@ CREATE TABLE IF NOT EXISTS session_names (
 
 继续默认监听 `127.0.0.1:8080`。`--host 0.0.0.0` 是用户明确启用局域网访问，必须启用鉴权；loopback 上的敏感读写也使用相同规则，防止浏览器恶意页面直接调用本机审批。
 
-复用 state/admin.token，不另建长期口令。读取前检查文件为当前 UID 所有、权限 0600、普通文件且非空；不存在/不合规时拒绝启动 Web，提示通过既有 init/Broker 初始化。Web 不为方便启动而生成另一个与 Broker 不同的 token。不得把 token 放在命令行参数、URL 查询、页面 HTML、localStorage、Referer 或访问日志。
+复用 state/admin.token，不另建长期口令。读取前检查文件为当前 UID 所有、权限 0600、普通文件且非空；不存在/不合规时拒绝启动 Web，提示通过既有 init/Broker 初始化。Web 不会为了方便启动而另行生成一个与 Broker 不同的 token。不得把 token 放在命令行参数、URL 查询、页面 HTML、localStorage、Referer 或访问日志。
 
 该 token 代表现有管理权限，不提供多用户隔离或只读访客角色。除静态登录入口外，handler 必须在收集数据、读取业务 body 或调用 Broker 前完成鉴权；登录只读取受严格大小限制的 body。
 
@@ -859,7 +859,7 @@ sequenceDiagram
     W-->>U: 200 / 409，冲突要求刷新，不自动重试批准
 ```
 
-不再用毫秒时间戳临时生成审批 request_id；前端一次用户动作生成随机 UUID，并在响应未知时复用。页面必须展示实际审批选项，handler 不以缺省 decision=allow 自动同意。Broker 不可达返回 503；不退回直接 Store 写入。错误返回经过现有 safe_error 处理的简短信息，不把 token、配置或完整异常堆栈传给浏览器。
+不再用毫秒时间戳临时生成审批 request_id；前端一次用户动作生成随机 UUID，并在响应未知时复用。页面必须展示实际审批选项，handler 不会把缺省的 decision=allow 当作自动同意。Broker 不可达返回 503；不退回直接 Store 写入。错误返回经过现有 safe_error 处理的简短信息，不把 token、配置或完整异常堆栈传给浏览器。
 
 ## 8. RPC 变更清单与权限
 
@@ -931,7 +931,7 @@ sequenceDiagram
 | ADR-22 | 远端事件映射为各父宿主本地 seq，父通知仍由协调端主动发起 | 保留既有 parent_ack 外键，事件去重与父通知去重各自明确 |
 | ADR-23 | 工作区采用不可变清单、内容分块、Patch/Snapshot 双方式 | 不依赖中央 Git；首次无 base 时可能传完整输入，必须控制大小 |
 | ADR-24 | 只向私有工作区应用输入，准备日志与 ready 发布隔离执行 | 文件系统与 SQLite 无共同事务；失败可清除未绑定目录，宿主工程不被覆盖 |
-| ADR-25 | 活跃状态派生，unknown 保守纳入；协调端权威只读核验 + 单机原子 CAS 软删除 | 坚决不使用分布式 2PC 锁；协调端软删除后封死新广播并拒绝对该组的出站请求，杜绝跨机死锁 |
+| ADR-25 | 活跃状态派生，unknown 保守纳入；协调端权威只读核验 + 单机原子 CAS 软删除 | 不使用分布式 2PC 锁；协调端软删除后拒绝该组的新广播和出站请求，避免跨机死锁 |
 | ADR-26 | 名称属于会话创建事务的可选字段，保留现有 session_names 形状 | 首轮可见、重试不漂移；显示名不承担唯一标识或原生改名职责 |
 | ADR-27 | Web 复用 admin.token，短期 Cookie + CSRF，审批经 Broker | 消除未登录审批与直接 Store 绕过；HTTP 保密性仍需 TLS/SSH |
 | ADR-28 | 新功能通过 capability 协商及显式新增白名单 RPC | 老节点不假支持；新增方法需同步更新协议、客户端、Relay 和权限测试 |
@@ -963,7 +963,7 @@ Broker 为 DeliveryScheduler、OutboxPuller、EventMirror 管理独立后台任�
 |---|---|
 | 数据迁移 | 从当前 SCHEMA 与仅 monitor 建过名称表的数据库升级；迁移重复执行安全；旧 target_seq 保留 legacy；两个不同目标可各自 seq=1；ack_seq 不倒退；外键检查通过 |
 | 群组与事务 | 本地/两远端混合广播事务任一点失败均无部分安排；同 request 重试收件列表不变；相同 UUID 跨 Host/代际不会串用；移除后旧广播仍可查 |
-| 排序与取消 | 同目标跨组/普通派单无插队；native 本地与跨机共用队列；队头 uncertain 阻止后续、无关目标继续；取消墓碑 ACK 丢失、迟到 message、sending 竞争均不重复执行 |
+| 排序与取消 | 同目标跨组/普通派单无插队；native 本地与跨机共用队列；队头 uncertain 仅阻塞当前目标，不影响其他目标；取消墓碑 ACK 丢失、迟到 message、sending 竞争均不重复执行 |
 | 人工决定 | 非管理员、空证据、任一陈旧 revision、非队头、相反 receipt 均拒绝；离线 resolving 不放行；not_received 不重发；同 request 重试只一条决定 |
 | 出站拉取 | 远端无反向 SSH 仍可广播；ACK 丢失重拉只创建一次广播；首条临时失败不丢失；重复 ACK、冲突 ACK、撤销成员、伪 sender/过期进程均正确处理 |
 | 事件/父通知 | 两节点 remote_seq 相同产生不同本地事件；同事件重拉无重复唤醒；父在本地/另一节点均无需反向 SSH；父 ACK 不混用远端 seq；终态不倒退 |

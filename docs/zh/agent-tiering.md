@@ -52,7 +52,7 @@ stop_if:
 
 1. **派发。** 主 agent 写好任务说明，调用 `agent_open`、`agent_dispatch`。拿到 bridge 返回的 `task_id` 后，追加一行 `task`，保存要求、配置和输入快照。
 2. **执行。** 执行 agent 修改和自测。主 agent 用 `agent_wait` 等待，再用 `agent_result`、`agent_inspect` 核对状态和本次 `attempt_id`，追加一行 `task` 执行结果。
-3. **独立检查。** 状态为 `completed` 后，确认执行 agent 已停止写文件，再由脚本重跑测试并检查修改范围。检查期间文件变了，就重新检查。对于涉及代码修改（`workspace-write`）、多子任务并行合并或高风险结论的任务，除确定性检查脚本外，在调用 `agent_review(accepted)` 前**必须**按 [router-prompt.md](skills/cli-agent-bridge/resources/router-prompt.md) 的 `Checker` / `evaluator` 规范开启一个**零历史只读独立会话（`access="read-only"`）**（当 `agent_catalog` 中存在已验证且支持 `read-only` 的异构模型时必须选用与执行者不同的模型，且优先不同运行时；仅更换运行时但使用同一底层模型不算异构，Antigravity 不支持 `read-only` 故排除；仅无可用异构只读模型时允许同模型新只读会话），对照任务要求、`diff`、独立测试输出、执行回报中的 `deviations`/`assumptions`/`unverified`/`unresolved`（回报字段仅作待核实线索，不作为完成证明）以及并行任务合并前的 `conflicts` 做交叉核查；简单单步只读查询可由主会话直接核对。
+3. **独立检查。** 状态为 `completed` 后，确认执行 agent 已停止写文件，再由脚本重跑测试并检查修改范围。检查期间文件变了，就重新检查。对于涉及代码修改（`workspace-write`）、多子任务并行合并或高风险结论的任务，除确定性检查脚本外，在调用 `agent_review(accepted)` 前**必须**按 [router-prompt.md](skills/cli-agent-bridge/resources/router-prompt.md) 的 `Checker` / `evaluator` 规范开启一个**零历史只读独立会话（`access="read-only"`）**。如果 `agent_catalog` 中存在已验证且支持 `read-only` 的异构模型，必须选用与执行者不同的模型，且优先不同运行时（仅更换运行时但使用同一底层模型不算异构；Antigravity 不支持 `read-only`，故排除）；只有没有可用的异构只读模型时，才允许用同模型新建只读会话。审查时应对照任务要求、`diff`、独立测试输出、执行回报中的 `deviations`/`assumptions`/`unverified`/`unresolved`（回报字段只作待核实线索，不作为完成证明）以及并行任务合并前的 `conflicts` 做交叉核查；简单单步只读查询可由主会话直接核对。
 4. **审查判定。** 主 agent 对照任务要求阅读实际 diff 和检查结果（以及独立 `Checker` 结论），决定 `accepted` 或 `rejected`，调用 `agent_review`。测试失败、改了不允许的文件或要求未完成，都不能通过。
 5. **记录。** 确认 bridge 已保存审查结论后，追加一行 `review`，写清检查结果和原因，再按任务统计数量、通过率和耗时。上述扩展字段与独立审查结论仅用于主 agent 判断与可选本地审查摘要，**不改变**下文 `agent_review` 接口参数以及第 6 节的 `task`、`review` JSONL 记录 schema。
 
@@ -60,7 +60,7 @@ stop_if:
 
 执行失败、中断或取消时，将状态和原因写入 `task` 后停止，不调用 `agent_review`，也不写 `review`。`recovery_needed` 等结果不明的状态先保留，交给人核对。
 
-第一版基准台账固定记录单轮执行，该模式下失败或拒绝后不自动重派，由人决定是否另派新任务（使用新的 `task_id`，保留旧结果；要求变化也重新派发）。而在常规多 Agent 协作任务中，主 agent 可按 [router-prompt.md](skills/cli-agent-bridge/resources/router-prompt.md) 对首次 `FAIL` 的子任务执行最多 1 次定点修复（若新开可写会话，Git 模式须以原执行 worktree 根目录为新会话 `cwd` 并通过相对 `snapshot_files` 移交已改/未跟踪/已删除文件、核对 `workspace.snapshot_tree` 与实际内容；`workspace_mode="copy"` 模式须以原副本目录为 `cwd` 并在 `snapshot_files` 列出全部现存必要输入及已改/新增文件、不传已删除文件，核对 `workspace.manifest` 与实际内容后再修改；修复后均须重新全量只读独立复审；若同步记入第一版台账，该次修复按新 `task_id` 记录并计入该子任务的唯一一次修正额度）。
+第一版基准台账固定记录单轮执行，该模式下失败或拒绝后不自动重派，由人决定是否另派新任务（使用新的 `task_id`，保留旧结果；要求变化也重新派发）。在常规多 Agent 协作任务中，主 agent 可按 [router-prompt.md](skills/cli-agent-bridge/resources/router-prompt.md) 对首次 `FAIL` 的子任务执行最多 1 次定点修复。如果新开可写会话：Git 模式须将新会话 `cwd` 设为原执行 worktree 根目录，通过相对路径 `snapshot_files` 移交已修改、未跟踪和已删除文件，并核对 `workspace.snapshot_tree` 与实际内容；`workspace_mode="copy"` 模式须将 `cwd` 设为原副本目录，在 `snapshot_files` 中列出全部现存必要输入及已修改或新增文件（不传已删除文件），核对 `workspace.manifest` 与实际内容后再修改。修复完成后都必须重新做全量只读独立复审；如果同步记入第一版台账，该次修复按新 `task_id` 记录，并计入该子任务的唯一一次修正额度。
 
 `agent_review` 只接收下面这些参数，详见 [接口定义](../../src/agent_bridge/mcp_server.py) 和 [审查条件](../../src/agent_bridge/store.py)：
 
