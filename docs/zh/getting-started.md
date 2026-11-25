@@ -2,7 +2,7 @@
 
 # 安装与使用
 
-初次使用见[简短步骤](README.md)。本文介绍配置、结果、后台服务与运行细节。移除程序见[卸载](uninstall.md)。
+初次使用见[命令行指南](cli.md)或[对话示例](agent-demo.md)。本文介绍配置、结果、后台服务与运行细节。移除程序见[卸载](uninstall.md)。
 
 ## 环境与安装
 
@@ -71,6 +71,7 @@ uv run agent-bridge serve
 | 3) Projects | 本地项目 ID 和已存在的绝对目录；远端派单会使用 |
 | 4) Remote hosts | 可选 SSH 目标、远端程序与状态目录、SSH 参数；单机使用留空 |
 | 5) Services & OTA | 可选 broker 服务、固定程序入口、发布更新定时器；只有明确选择后才启动 |
+| 6) 高级设置 | 默认语言、路由规则、通知路径、OTA 镜像和托管 Web |
 
 首次只读任务使用名为 `local` 的 Codex、Claude Code 或 Pi 配置，填写已登录 CLI 支持的完整模型 ID。未经推理检查的配置可以明确指定；自动选择仅考虑 `verified: true` 的配置。Antigravity 只支持写入权限，见下文。
 
@@ -121,7 +122,7 @@ agent-bridge monitor --lang zh-CN --once
 AGENT_BRIDGE_LANG=zh-CN agent-bridge init
 ```
 
-可选值为 `en`、`zh-CN` 和 `auto`。`auto` 依次读取 `LC_ALL`、`LC_MESSAGES`、`LANG`；不支持的语言使用英文。要保存默认语言，在私有 `config.json` 顶层加入 `"language": "zh-CN"`，保留其他设置。缺少该字段或值为 `null` 时默认英文。优先级为 CLI 参数、`AGENT_BRIDGE_LANG`、配置文件、英文。配置向导会保留该字段；临时选择显示语言不会改写配置。父任务通知采用 broker 的语言，已经排队的通知保留原正文。
+可选值为 `en`、`zh-CN` 和 `auto`。`auto` 依次读取 `LC_ALL`、`LC_MESSAGES`、`LANG`。不支持的语言使用英文。用配置向导的 **6) 高级设置** 或 [`init` 参数](cli.md#用-init-配置-bridge)保存默认语言。优先级为 CLI 参数、`AGENT_BRIDGE_LANG`、配置文件、英文。父任务通知采用 broker 的语言，已经排队的通知保留原正文。
 
 仪表盘和登录页可选择 Auto、English 和简体中文，浏览器会记住选择。Auto 按浏览器语言显示，不支持时使用英文。切换语言只改变显示，不发送、重试或取消任务。
 
@@ -183,7 +184,7 @@ codex mcp add cli-agent-bridge -- "$(command -v agent-bridge)" --state "$HOME/.l
 <a id="results-and-review"></a>
 ## 结果与检查
 
-[README](README.md#派发第一个任务)演示了一次简单的只读任务。保存返回的 ID，不要照抄别处安装的 ID。`request_id` 对相同请求去重；同一 ID 改变参数会报冲突。换新 ID 重做任务可能再次计费。
+[命令行指南](cli.md#派发第一个任务)演示了一次简单的只读任务。保存返回的 ID，不要照抄别处安装的 ID。`request_id` 对相同请求去重；同一 ID 改变参数会报冲突。换新 ID 重做任务可能再次计费。
 
 `agent_result(task_id=...)` 返回回答、attempt 历史、文件修改和用量。`queued`、`assigned`、`running` 尚未结束；`waiting_input` 需要在过期前答复；`failed`、`cancelled`、`interrupted` 需要检查后决定是否明确重试。`recovery_needed` 要先核实执行结果，再用 `agent_control(action="resolve", ...)` 处理，不要直接重发。
 
@@ -451,7 +452,7 @@ Codex 恢复时缺少本轮执行前的累计值，会将本轮用量标为不�
 <a id="off-peak-routing"></a>
 ## 低峰时段规则
 
-本机新任务可以按低峰时段自动选择配置。在 `config.json` 顶层加入可选的 `routing`，保留已有的 `profiles` 和其他设置。下面的示例优先使用处于低峰的 Ollama Cloud（通过 Claude Code），再考虑处于低峰的 DeepSeek（通过 Pi 或 Claude Code）。启用前核对账号适用的时段和价格。[Ollama 定价](https://ollama.com/pricing) · [DeepSeek 定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+本机新任务可以按低峰时段自动选择配置。把下面示例中 `routing` 的值保存为 JSON 文件，再通过 [`init` 参数](cli.md#用-init-配置-bridge)导入。示例优先使用处于低峰的 Ollama Cloud（通过 Claude Code），再考虑处于低峰的 DeepSeek（通过 Pi 或 Claude Code）。启用前核对账号适用的时段和价格。[Ollama 定价](https://ollama.com/pricing) · [DeepSeek 定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
 
 ```json
 {

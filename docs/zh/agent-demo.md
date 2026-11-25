@@ -6,8 +6,8 @@ Pi 在独立的 Bridge 会话里检查你改过的代码。稍后回到同一个
 
 ## 准备 Codex 和 Pi
 
-1. 用已登录的 Pi CLI 和可用的模型配置 Bridge，然后启动 broker。见 [配置](getting-started.md#配置)。
-2. 给 Codex 安装 Bridge MCP 和 skill，再在有本地改动的 Git 仓库里打开一个新的 Codex 对话。见 [MCP 设置](getting-started.md#mcp-setup)。
+1. 用已登录的 Pi CLI 和可用的模型配置 Bridge，然后启动 broker。见[配置与检查](cli.md#配置与检查)。
+2. 给 Codex 安装 Bridge MCP 和 skill，再在有本地改动的 Git 仓库里打开一个新的 Codex 对话。见 [MCP 接入](cli.md#接入-mcp)。
 
 ## 派发任务
 

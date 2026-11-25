@@ -2,7 +2,7 @@
 
 # Installation and use
 
-Start with the [short walkthrough](../README.md). This guide covers configuration, results, background services, and operating details. For removal, see [uninstall](uninstall.md).
+Start with the [command-line guide](cli.md) or the [agent chat demo](agent-demo.md). This guide covers configuration, results, background services, and operating details. For removal, see [uninstall](uninstall.md).
 
 ## Requirements and installation
 
@@ -71,6 +71,7 @@ For the rest of this guide, source installations should use `uv run agent-bridge
 | 3) Projects | Local project identifiers and existing absolute directories; useful for remote dispatch |
 | 4) Remote hosts | Optional SSH target, remote executable/state directory, and SSH options; leave empty for local use |
 | 5) Services & OTA | Optional broker service, managed launcher, and release update timer; nothing starts unless selected |
+| 6) Advanced settings | Default language, routing rules, notification paths, OTA mirror, and managed Web |
 
 For the first read-only task, configure a Codex, Claude Code, or Pi profile named `local`. Use the model ID supported by that logged-in CLI. An unverified profile can be targeted explicitly; automatic selection only considers verified profiles. Antigravity only supports writable access; see its section below.
 
@@ -120,7 +121,7 @@ agent-bridge monitor --lang zh-CN --once
 AGENT_BRIDGE_LANG=zh-CN agent-bridge init
 ```
 
-Choices are `en`, `zh-CN`, and `auto`. `auto` reads `LC_ALL`, then `LC_MESSAGES`, then `LANG`; unsupported locales use English. For a persistent default, merge `"language": "zh-CN"` into the top-level private `config.json`, preserving its other settings. A missing or `null` value keeps the English default. The order is CLI option, `AGENT_BRIDGE_LANG`, config, then English. The configuration wizard preserves this setting; selecting a display language does not rewrite config. Parent task notices use the broker's language; notices already queued keep their original body.
+Choices are `en`, `zh-CN`, and `auto`. `auto` reads `LC_ALL`, then `LC_MESSAGES`, then `LANG`. Unsupported locales use English. Use **6) Advanced settings** in the wizard or the [`init` configuration flags](cli.md#configure-bridge-with-init) to save a default. The order is CLI option, `AGENT_BRIDGE_LANG`, config, then English. Parent task notices use the broker's language. Notices already queued keep their original body.
 
 The dashboard and login page offer Auto, English, and 简体中文. The choice is stored in that browser; Auto follows browser language preferences and falls back to English. Switching language only changes the display and does not send, retry, or cancel tasks.
 
@@ -182,7 +183,7 @@ After enabling managed updates, use `$HOME/.local/share/cli-agent-bridge/bin/age
 <a id="results-and-review"></a>
 ## Results and review
 
-The [README walkthrough](../README.md#send-a-first-task) sends a small read-only task. Preserve returned IDs instead of copying IDs from another installation. `request_id` deduplicates exact requests; changing parameters with the same ID causes a conflict. A repeated task with a new ID may incur a new charge.
+The [command-line walkthrough](cli.md#send-a-first-task) sends a small read-only task. Preserve returned IDs instead of copying IDs from another installation. `request_id` deduplicates exact requests; changing parameters with the same ID causes a conflict. A repeated task with a new ID may incur a new charge.
 
 Use `agent_result(task_id=...)` to read the answer, attempt history, file changes, and usage. `queued`, `assigned`, and `running` are unfinished. `waiting_input` requires a response before its expiry. `failed`, `cancelled`, and `interrupted` need inspection before any explicit retry. `recovery_needed` means the outcome must be verified before `agent_control(action="resolve", ...)`; do not blindly resend.
 
@@ -419,7 +420,7 @@ A profile price can use `price={"currency":"USD","source":"pricing reference","a
 
 ## Off-Peak Routing
 
-For new local tasks, add the optional top-level `routing` key to `config.json`. Keep your existing `profiles` and other settings. This example gives Claude Code through Ollama Cloud first preference when it is off-peak, then Pi or Claude Code through DeepSeek when DeepSeek is off-peak. Confirm the applicable terms and hours for your accounts. [Ollama pricing](https://ollama.com/pricing) · [DeepSeek pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+For new local tasks, you can load the optional routing rules from a JSON file using the [`init` configuration flags](cli.md#configure-bridge-with-init). Save the value of `routing` from the example below as the file. This example gives Claude Code through Ollama Cloud first preference when it is off-peak, then Pi or Claude Code through DeepSeek when DeepSeek is off-peak. Confirm the applicable terms and hours for your accounts. [Ollama pricing](https://ollama.com/pricing) · [DeepSeek pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
 
 ```json
 {

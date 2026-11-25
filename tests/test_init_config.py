@@ -41,6 +41,100 @@ class InitConfigTests(unittest.TestCase):
         self.assertEqual(1, err.exception.code)
         self.assertFalse((self.state / "config.json").exists())
 
+    def test_init_sets_replaces_and_clears_routing_and_default_language(self):
+        path = self.state / "config.json"
+        routing = {
+            "windows": {"workday": {"timezone": "UTC", "ranges": [
+                {"days": ["mon"], "start": "12:00", "end": "18:00"},
+            ]}},
+            "preferences": [
+                {"id": "flash", "when": {"kinds": ["flash"]}, "prefer": [
+                    {"match": {"profile": "local"}, "window": "workday"},
+                ]},
+            ],
+        }
+        routing_file = self.home / "routing.json"
+        routing_file.write_text(json.dumps(routing))
+        options = ["init", "--non-interactive", "--routing-file", str(routing_file),
+                   "--config-language", "zh-CN", "--profile", "name=local,runtime=codex,model=gpt-5"]
+        self.assertEqual(0, self._run_cli(options)[0])
+        loaded = Config.load(path)
+        self.assertEqual("zh-CN", loaded.language)
+        self.assertEqual(1, len(loaded.routing))
+        before = path.read_bytes()
+        self.assertFalse(self._run_cli(options)[1]["config_changed"])
+        routing_file.write_text('{"preferences": [{"id": "broken"}]}')
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(1, self._run_cli(options)[0])
+        self.assertEqual(before, path.read_bytes())
+
+        self.assertEqual(0, self._run_cli(["init", "--non-interactive", "--clear-routing", "--config-language", "none"])[0])
+        loaded = Config.load(path)
+        self.assertEqual((), loaded.routing)
+        self.assertIsNone(loaded.language)
+        self.assertEqual("gpt-5", loaded.profiles["local"].model)
+
+    def test_init_advanced_menu_stages_settings_until_save(self):
+        routing_file = self.home / "routing.json"
+        routing_file.write_text('{"preferences": []}')
+        args = cli.build_parser().parse_args(["init"])
+        self.assertEqual(0, self._run_cli([
+            "init", "--non-interactive", "--profile", "name=local,runtime=codex,model=gpt-5",
+        ])[0])
+        path = self.state / "config.json"
+        before = path.read_bytes()
+        for finish in ("q", "s"):
+            replies = iter(["6", "zh-CN", str(routing_file), "/example/async-python", "/example/telegram.sqlite",
+                            "", "", finish])
+            result = init_config.run_init(
+                self.state, args, input_fn=lambda _, replies=replies: next(replies),
+                output_fn=lambda _: None, is_tty=True,
+            )
+            if finish == "q":
+                self.assertEqual("aborted", result["status"])
+                self.assertEqual(before, path.read_bytes())
+            else:
+                self.assertEqual("configured", result["status"])
+        loaded = Config.load(path)
+        self.assertEqual("zh-CN", loaded.language)
+        self.assertEqual("/example/async-python", loaded.codex_async_python)
+        self.assertEqual("/example/telegram.sqlite", loaded.telegram_database)
+        self.assertEqual({"preferences": []}, json.loads(path.read_text())["routing"])
+
+    def test_init_prepares_web_and_sets_preserves_and_clears_ota_mirror(self):
+        mirror = "https://updates.example.test/bridge"
+        update = self.state / "update.json"
+        config = self.state / "config.json"
+        install = ["init", "--non-interactive", "--service-kind", "systemd", "--ota-root", str(self.root),
+                   "--ota-release-url", mirror, "--install-web"]
+        with patch.object(updater, "_run") as service:
+            code, result = self._run_cli(install)
+        self.assertEqual(0, code)
+        service.assert_not_called()
+        web = Path(result["web_service"]["service_path"])
+        self.assertFalse(result["web_service"]["enabled"])
+        self.assertIn("127.0.0.1", web.read_text())
+        self.assertEqual(mirror, updater.load_settings(self.state)["release_url"])
+
+        self.assertEqual(0, self._run_cli(["init", "--non-interactive", "--ota-interval", "700"])[0])
+        self.assertEqual(mirror, updater.load_settings(self.state)["release_url"])
+        self.assertEqual(700, updater.load_settings(self.state)["interval"])
+        before = config.read_bytes(), update.read_bytes()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(1, self._run_cli([
+                "init", "--non-interactive", "--parallel-limit", "12", "--ota-release-url", "http://example.test",
+            ])[0])
+        self.assertEqual(before, (config.read_bytes(), update.read_bytes()))
+        self.assertEqual(0, self._run_cli(["init", "--non-interactive", "--ota-release-url", ""])[0])
+        self.assertNotIn("release_url", updater.load_settings(self.state))
+
+        web.write_text("unrelated service")
+        before = config.read_bytes()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(1, self._run_cli(["init", "--non-interactive", "--parallel-limit", "12", "--install-web"])[0])
+        self.assertEqual("unrelated service", web.read_text())
+        self.assertEqual(before, config.read_bytes())
+
     def test_non_interactive_init_creates_reloads_and_preserves_metadata_idempotently(self):
         code, created = self._run_cli(
             [
@@ -520,7 +614,7 @@ class InitConfigTests(unittest.TestCase):
         before = (self.state / "config.json").read_bytes()
 
         def _eof_in_submenu(prompt: str) -> str:
-            if "Select [1-5]" in prompt:
+            if "Select [1-6]" in prompt:
                 return "1"
             if "Action" in prompt:
                 return "a"

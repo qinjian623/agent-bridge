@@ -1369,8 +1369,12 @@ def validate_update_install(
     root=None,
     interval=3600,
     update_existing: bool = False,
+    release_url: str | None = None,
 ) -> tuple[Path, str, str, dict[str, object]]:
-    """Validate updater configuration and check file conflicts without mutating disk."""
+    """Validate updater configuration and file conflicts without writing.
+
+    Pass an empty release_url to clear a mirror. None keeps the existing one.
+    """
     if type(interval) is not int or interval < 300:
         raise ValueError("Update interval must be at least 300 seconds")
     _validate_repository(repository)
@@ -1406,7 +1410,10 @@ def validate_update_install(
     }
     if isinstance(existing, dict) and "release_url" in existing:
         validate_release_url(existing["release_url"])
-        settings["release_url"] = existing["release_url"]
+        if release_url is None:
+            settings["release_url"] = existing["release_url"]
+    if release_url not in (None, ""):
+        settings["release_url"] = validate_release_url(release_url)
     _validate_write_target(path, label="update.json", stop_at=state)
     if kind == "systemd":
         directory = Path.home() / ".config/systemd/user"
@@ -1437,6 +1444,7 @@ def install(
     *,
     update_existing: bool = False,
     on_write: Any = None,
+    release_url: str | None = None,
 ):
     """Write launchers and timer only; migrating an existing broker service is a separate, deliberate step."""
     resolved_root, kind, name, settings = validate_update_install(
@@ -1447,6 +1455,7 @@ def install(
         root=root,
         interval=interval,
         update_existing=update_existing,
+        release_url=release_url,
     )
     if enable and not _probe_broker_service_state(kind, name, str(resolved_root / "bin/agent-bridge"))[2]:
         raise ValueError("Migrate the broker service to its managed launcher before enabling updates")
@@ -1569,6 +1578,22 @@ def _web_service_spec(state: Path, settings: dict[str, Any]) -> tuple[Path, byte
     return path, content
 
 
+def validate_web_service_install(
+    state: Path, settings: dict[str, Any], *, require_launcher: bool = True,
+) -> tuple[Path, bytes]:
+    """Check the planned managed Web service without writing its unit file."""
+    launcher = Path(settings["root"]) / "bin/agent-bridge"
+    if require_launcher and not os.access(launcher, os.X_OK):
+        raise ValueError("Install the managed broker launcher before installing Web")
+    path, content = _web_service_spec(state, settings)
+    _validate_write_target(path, label="Web service file")
+    if path.exists():
+        _private(path)
+        if path.read_bytes() != content:
+            raise ValueError("Refusing to overwrite an unrelated Web service")
+    return path, content
+
+
 def _wait_for_web_service() -> None:
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
@@ -1585,23 +1610,18 @@ def _wait_for_web_service() -> None:
     raise RuntimeError("Managed Web did not become ready on 127.0.0.1:8080")
 
 
-def install_web_service(state: Path, *, enable: bool = False) -> dict[str, object]:
+def install_web_service(state: Path, *, enable: bool = False, on_write: Any = None) -> dict[str, object]:
     settings = load_settings(state)
     root = Path(settings["root"])
     launcher = str(root / "bin/agent-bridge")
-    if not os.access(launcher, os.X_OK):
-        raise ValueError("Install the managed broker launcher before installing Web")
     with _acquire_update_lock(root):
         kind = settings["service_kind"]
-        path, content = _web_service_spec(state, settings)
-        _validate_write_target(path, label="Web service file")
-        if path.exists():
-            _private(path)
-            if path.read_bytes() != content:
-                raise ValueError("Refusing to overwrite an unrelated Web service")
-        else:
+        path, content = validate_web_service_install(state, settings)
+        if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             _write_bytes(path, content)
+            if on_write is not None:
+                on_write("web_service")
         if enable and kind == "systemd":
             _run(["systemctl", "--user", "daemon-reload"], timeout=15)
             _run(["systemctl", "--user", "enable", "--now", path.name], timeout=15)

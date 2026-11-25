@@ -6,8 +6,8 @@ In this example, Pi reviews your changes in a separate Bridge session. You ask f
 
 ## Set up the agent and worker
 
-1. Configure a Bridge profile for a signed-in Pi CLI with a model you can use, then start the broker with that configuration. See [configuration](getting-started.md#configuration).
-2. Install Bridge MCP and the skill for Codex, then open a new Codex chat in a Git repository with local changes. See [MCP setup](getting-started.md#mcp-setup).
+1. Configure a Bridge profile for a signed-in Pi CLI with a model you can use, then start the broker with that configuration. See [configure and check](cli.md#configure-and-check).
+2. Install Bridge MCP and the skill for Codex, then open a new Codex chat in a Git repository with local changes. See [connect MCP](cli.md#connect-mcp).
 
 ## Send a task
 

@@ -23,14 +23,18 @@ from .config import Config
 from .errors import BridgeError
 from .hosts import clear_persisted_host_pins as _hosts_clear_persisted_pins
 from .i18n import translate as _
+from .i18n import validate_language
 from .updater import (
     REPOSITORY,
     Updater,
     install,
     install_broker_service,
+    install_web_service,
     load_settings,
     validate_broker_service_install,
+    validate_release_url,
     validate_update_install,
+    validate_web_service_install,
 )
 
 _RUNTIMES = ("codex", "claude", "pi", "antigravity")
@@ -783,6 +787,21 @@ def _apply_cli_flags(
 ) -> tuple[bool, bool]:
     """Apply explicit non-interactive/scripted CLI mutations. Returns (has_config_edits, has_ota_edits)."""
     config_edited = False
+    routing_file = getattr(args, "routing_file", None)
+    if routing_file is not None:
+        try:
+            routing = json.loads(routing_file.expanduser().read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise BridgeError("invalid_config", _("Could not read the routing JSON file")) from error
+        config["routing"] = routing
+        config_edited = True
+    elif getattr(args, "clear_routing", False):
+        config["routing"] = None
+        config_edited = True
+    language = getattr(args, "config_language", None)
+    if language is not None:
+        config["language"] = None if language == "none" else validate_language(language)
+        config_edited = True
     for pname in getattr(args, "remove_profile", None) or ():
         config["profiles"].pop(pname, None)
         config_edited = True
@@ -857,13 +876,20 @@ def _apply_cli_flags(
     for arg_name, ota_key in (
         ("ota_repo", "repository"),
         ("ota_root", "root"),
+        ("ota_release_url", "release_url"),
         ("service_kind", "service_kind"),
         ("service_name", "service_name"),
         ("ota_interval", "interval"),
     ):
         val = getattr(args, arg_name, None)
         if val is not None:
-            ota_plan[ota_key] = str(val) if arg_name == "ota_root" else val
+            if arg_name == "ota_root":
+                val = str(val)
+            elif arg_name == "ota_release_url" and val:
+                val = validate_release_url(val)
+            ota_plan[ota_key] = val
+            if arg_name.startswith("ota_"):
+                ota_plan["install_updater"] = True
             ota_edited = True
     if getattr(args, "install_broker_service", False) or getattr(args, "enable_broker_service", False):
         ota_plan["install_broker_service"] = True
@@ -880,7 +906,45 @@ def _apply_cli_flags(
     if getattr(args, "enable_updater", False):
         ota_plan["enable_updater"] = True
         ota_edited = True
+    if ota_edited and ota_plan.get("install_updater"):
+        ota_plan["apply_updater"] = True
+    enable_web = getattr(args, "enable_web", False)
+    if getattr(args, "install_web", False) or enable_web:
+        ota_plan["install_web"] = True
+        ota_plan["enable_web"] = ota_plan.get("enable_web", False) or enable_web
+        ota_edited = True
     return config_edited, ota_edited
+
+
+def _edit_advanced_menu(
+    config: dict[str, Any],
+    ota_plan: dict[str, Any],
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> None:
+    output_fn(_("Press Enter to keep a setting. Type '-' to clear a text field."))
+    language = _prompt(input_fn, output_fn, _("Default language (en/zh-CN/auto)"))
+    routing = _prompt(input_fn, output_fn, _("Routing JSON file"))
+    async_python = _prompt(input_fn, output_fn, _("codex-async Python path"))
+    telegram = _prompt(input_fn, output_fn, _("Telegram database path"))
+    mirror = _prompt(input_fn, output_fn, _("OTA release mirror URL"))
+    web = _prompt(input_fn, output_fn, _("Managed Web (install/enable; Enter keeps current)"))
+    if web not in {"", "install", "enable"}:
+        raise ValueError(_("Managed Web must be 'install' or 'enable'"))
+    if language and language != "-":
+        language = validate_language(language)
+    if mirror and mirror != "-":
+        mirror = validate_release_url(mirror)
+    _apply_cli_flags(config, ota_plan, argparse.Namespace(
+        config_language="none" if language == "-" else language or None,
+        routing_file=Path(routing) if routing and routing != "-" else None,
+        clear_routing=routing == "-",
+        codex_async_python="" if async_python == "-" else async_python or None,
+        telegram_database="" if telegram == "-" else telegram or None,
+        ota_release_url="" if mirror == "-" else mirror or None,
+        install_web=web == "install",
+        enable_web=web == "enable",
+    ))
 
 
 def _stale_pin_hosts(
@@ -990,8 +1054,9 @@ def _validate_all_changes(
     will_apply_updater = bool(ota_plan.get("install_updater")) and (
         bool(ota_plan.get("apply_updater")) or not (state / "update.json").exists()
     )
+    update_settings = None
     if will_apply_updater:
-        validate_update_install(
+        _, _, _, update_settings = validate_update_install(
             state,
             repository=ota_plan["repository"],
             service_kind=kind,
@@ -999,9 +1064,18 @@ def _validate_all_changes(
             root=root,
             interval=int(ota_plan["interval"]),
             update_existing=True,
+            release_url=ota_plan.get("release_url"),
         )
         if ota_plan.get("enable_updater") and not will_install_broker and not Updater(state).service_managed():
             raise ValueError(_('Migrate the broker service to its managed launcher before enabling updates'))
+    if ota_plan.get("install_web"):
+        if update_settings is None:
+            if not (state / "update.json").exists():
+                raise ValueError(_("Set up the managed updater before installing Web"))
+            update_settings = load_settings(state)
+        validate_web_service_install(
+            state, update_settings, require_launcher=not (will_apply_updater or will_install_broker),
+        )
 
 
 def _commit_changes(
@@ -1104,11 +1178,16 @@ def _commit_changes(
                     enable=bool(ota_plan.get("enable_updater")),
                     update_existing=True,
                     on_write=_record_applied,
+                    release_url=ota_plan.get("release_url"),
                 )
                 _record_applied("updater")
             elif (state / "update.json").exists():
                 with contextlib.suppress(OSError, ValueError):
                     Updater(state).service_managed()
+            if ota_plan.get("install_web"):
+                result["web_service"] = install_web_service(
+                    state, enable=bool(ota_plan.get("enable_web")), on_write=_record_applied,
+                )
         except KeyboardInterrupt as error:
             if applied:
                 raise BridgeError(
@@ -1147,6 +1226,13 @@ def add_init_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task-timeout", type=float)
     parser.add_argument("--interrupt-timeout", type=float)
     parser.add_argument("--token-budget", help=_("Positive integer token budget, or 'none' to clear"))
+    parser.add_argument(
+        "--config-language", choices=["en", "zh-CN", "auto", "none"],
+        help=_("Persistent default language ('none' restores the default)"),
+    )
+    routing = parser.add_mutually_exclusive_group()
+    routing.add_argument("--routing-file", type=Path, help=_("Replace routing rules from a JSON file"))
+    routing.add_argument("--clear-routing", action="store_true", help=_("Clear configured routing rules"))
     parser.add_argument("--project", action="append", metavar="ID=PATH", help=_('Add/update a local project root'))
     parser.add_argument("--remove-project", action="append", metavar="ID", help=_('Remove a project mapping'))
     parser.add_argument(
@@ -1159,6 +1245,7 @@ def add_init_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-async-python", help=_("Optional codex-async Python path (pass '' to clear)"))
     parser.add_argument("--telegram-database", help=_("Optional telegram.sqlite path (pass '' to clear)"))
     parser.add_argument("--ota-repo", help=_('GitHub repository owner/name for OTA updates'))
+    parser.add_argument("--ota-release-url", help=_("OTA release mirror URL (pass '' to use GitHub)"))
     parser.add_argument("--ota-root", type=Path, help=_('Managed OTA releases directory'))
     parser.add_argument("--ota-interval", type=int, help=_('OTA update check interval in seconds (>=300)'))
     parser.add_argument("--service-kind", choices=["systemd", "launchd"])
@@ -1168,6 +1255,8 @@ def add_init_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force-broker-service", action="store_true")
     parser.add_argument("--install-updater", action="store_true")
     parser.add_argument("--enable-updater", action="store_true")
+    parser.add_argument("--install-web", action="store_true", help=_("Install the managed loopback Web service"))
+    parser.add_argument("--enable-web", action="store_true", help=_("Install and start the managed loopback Web service"))
 
 
 def run_init(
@@ -1208,8 +1297,6 @@ def run_init(
         "apply_updater": False,
     }
     config_edited, ota_edited = _apply_cli_flags(config, ota_plan, args, removed_hosts=removed_hosts)
-    if ota_edited and ota_plan.get("install_updater"):
-        ota_plan["apply_updater"] = True
     interactive = (not getattr(args, "non_interactive", False)) and (
         sys.stdin.isatty() and sys.stdout.isatty() if is_tty is None else is_tty
     )
@@ -1234,7 +1321,8 @@ def run_init(
         while True:
             _print_summary(state, config, env, ota_plan, output_fn)
             output_fn(_('1) Profiles  2) Runtime defaults  3) Projects  4) Remote hosts  5) Services & OTA'))
-            choice = input_fn(_('Select [1-5], [s]ave & apply, or [q]uit without saving: ')).strip().lower()
+            output_fn(_('6) Advanced settings'))
+            choice = input_fn(_('Select [1-6], [s]ave & apply, or [q]uit without saving: ')).strip().lower()
             if choice == "1":
                 _edit_profiles_menu(config, env, input_fn, output_fn)
             elif choice == "2":
@@ -1246,6 +1334,11 @@ def run_init(
             elif choice == "5":
                 _edit_service_ota_menu(state, ota_plan, input_fn, output_fn)
                 ota_plan["apply_updater"] = bool(ota_plan.get("install_updater"))
+            elif choice == "6":
+                try:
+                    _edit_advanced_menu(config, ota_plan, input_fn, output_fn)
+                except (BridgeError, OSError, ValueError) as error:
+                    output_fn(_('Configuration validation error: {error}', error=_(str(error))))
             elif choice == "q":
                 return {"status": "aborted", "config": str(state / "config.json"), "config_changed": False}
             elif choice == "s":

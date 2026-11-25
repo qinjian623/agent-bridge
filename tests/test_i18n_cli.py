@@ -242,7 +242,7 @@ class InitLanguageTests(unittest.TestCase):
         self.assertIn("Name", "\n".join(output))
         self.assertIn("model=Status", "\n".join(output))
         self.assertIn("Running", "\n".join(output))
-        self.assertIn("选择 [1-5]、[s]", prompts[0])
+        self.assertIn("选择 [1-6]、[s]", prompts[0])
         self.assertIn("[a] 添加/编辑", prompts[1])
         self.assertIn("  选择无效。", output)
 
