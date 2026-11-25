@@ -2,6 +2,12 @@
 
 # Changes
 
+## 0.3.13 — 2026-11-25
+
+- Configure the default language, routing rules, notification paths, OTA mirrors, and managed Web from the init wizard.
+- Set the same options from scripts with `init --non-interactive`.
+- Put installation, quick setup, agent integration, and chat delegation in the README. See the separate CLI guide for detailed terminal workflows.
+
 ## 0.3.12 — 2026-11-25
 
 - Add `agent-bridge integrate list` to show supported agent CLIs and their Bridge installation commands.
