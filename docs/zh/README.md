@@ -44,11 +44,11 @@ agent-bridge integrate codex
 
 ## 在 agent 对话里派发任务
 
-在已接入 Bridge MCP 的 agent 里打开项目，发送下面这段话。配置名按实际情况替换 `local`。
+在已加载 Bridge MCP 和 skill 的 agent 里打开项目。配好 Pi 后，直接说：
 
-> 用 Agent Bridge 把一条只读任务交给 `local` 配置。请它读当前项目的 README，总结怎么安装和运行测试。任务入队后就告诉我任务 ID。
+> 用 Bridge 让 Pi 看下这次改动，有没有问题。
 
-想看结果时，回到同一个对话，让 agent 查询这个任务 ID。[完整对话示例](agent-demo.md) 展示了 Codex 如何派发给 Pi、怎样追问结果，以及每一步调用的 MCP 工具。
+想看结果时，在同一个对话里问“Pi 看完了么？”配置步骤和 agent 会做的事见[完整对话示例](agent-demo.md)。
 
 ## 派发第一个任务
 

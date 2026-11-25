@@ -44,11 +44,11 @@ Start a new Codex session to load the tools. For Claude Code, Pi, or Antigravity
 
 ## Delegate from an agent chat
 
-Open your project in an agent with Bridge MCP configured. Paste this into the chat and replace `local` with your Bridge profile if needed.
+Open your project in an agent with Bridge MCP and the skill loaded. If you have a Pi profile, ask:
 
-> Use Agent Bridge to send one read-only task to the `local` profile. Ask the worker to read this project's README and summarize how to install and test the project. Give me the task ID as soon as the task is queued.
+> Have Pi review my changes with Bridge.
 
-When you want the answer, ask the same agent to check that task ID. The [agent chat demo](docs/agent-demo.md) walks through a Codex chat delegating to Pi, including the follow-up prompt and the MCP tools behind it.
+Later in the same chat, ask “What did Pi find?” See the [agent chat demo](docs/agent-demo.md) for setup and what the agent does for you.
 
 ## Send a first task
 
