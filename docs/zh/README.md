@@ -42,6 +42,14 @@ agent-bridge integrate codex
 
 新建一个 Codex 会话以加载工具。Claude Code、Pi 或 Antigravity 可将 `codex` 换成 `claude`、`pi` 或 `agy`。其他 MCP 客户端将命令设为 `agent-bridge` 的绝对路径，参数设为 `["mcp"]`。broker 需要保持运行。自定义状态目录和托管入口见 [MCP 设置](getting-started.md#mcp-setup)。
 
+## 在 agent 对话里派发任务
+
+在已接入 Bridge MCP 的 agent 里打开项目，发送下面这段话。配置名按实际情况替换 `local`。
+
+> 用 Agent Bridge 把一条只读任务交给 `local` 配置。请它读当前项目的 README，总结怎么安装和运行测试。任务入队后就告诉我任务 ID。
+
+想看结果时，回到同一个对话，让 agent 查询这个任务 ID。[完整对话示例](agent-demo.md) 展示了 Codex 如何派发给 Pi、怎样追问结果，以及每一步调用的 MCP 工具。
+
 ## 派发第一个任务
 
 命令行与 MCP 使用相同工具。把 `/absolute/path/to/project` 替换为真实项目目录；配置名不叫 `local` 时也要修改。下面会实际调用模型，可能产生费用：
@@ -50,7 +58,7 @@ agent-bridge integrate codex
 agent-bridge call agent_dispatch --json '{"profile":"local","cwd":"/absolute/path/to/project","access":"read-only","instruction":"Read the project README and summarize how to run it. Do not modify files.","request_id":"quickstart-task-1"}'
 ```
 
-保存返回的 `task_id` 和 `session_id`。相同参数与 `request_id` 重试会返回同一个任务；每个新任务使用新的 ID。通过 MCP 使用时，可以让助手先调用 `agent_catalog`，再用 `profile="local"` 和真实项目目录派发同一条只读任务。
+保存返回的 `task_id` 和 `session_id`。相同参数与 `request_id` 重试会返回同一个任务；每个新任务使用新的 ID。
 
 本机新任务自动选择配置时，可使用[低峰时段规则](getting-started.md#off-peak-routing)。
 

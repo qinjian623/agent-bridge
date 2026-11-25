@@ -42,6 +42,14 @@ agent-bridge integrate codex
 
 Start a new Codex session to load the tools. For Claude Code, Pi, or Antigravity, replace `codex` with `claude`, `pi`, or `agy`. For another MCP client, use the absolute `agent-bridge` executable as the command and `["mcp"]` as its arguments. The broker must be running. See [MCP setup](docs/getting-started.md#mcp-setup) for custom state directories and managed launchers.
 
+## Delegate from an agent chat
+
+Open your project in an agent with Bridge MCP configured. Paste this into the chat and replace `local` with your Bridge profile if needed.
+
+> Use Agent Bridge to send one read-only task to the `local` profile. Ask the worker to read this project's README and summarize how to install and test the project. Give me the task ID as soon as the task is queued.
+
+When you want the answer, ask the same agent to check that task ID. The [agent chat demo](docs/agent-demo.md) walks through a Codex chat delegating to Pi, including the follow-up prompt and the MCP tools behind it.
+
 ## Send a first task
 
 The CLI uses the same tools as MCP. Replace `/absolute/path/to/project` with a real project directory, and `local` if you chose a different profile name. This command starts a real model task and may incur charges:
@@ -50,7 +58,7 @@ The CLI uses the same tools as MCP. Replace `/absolute/path/to/project` with a r
 agent-bridge call agent_dispatch --json '{"profile":"local","cwd":"/absolute/path/to/project","access":"read-only","instruction":"Read the project README and summarize how to run it. Do not modify files.","request_id":"quickstart-task-1"}'
 ```
 
-Save the returned `task_id` and `session_id`. Repeating the exact request with the same `request_id` returns the same task; give each new task a new ID. Through MCP, ask your assistant to call `agent_catalog`, then dispatch the same read-only task with `profile="local"` and your project directory.
+Save the returned `task_id` and `session_id`. Repeating the exact request with the same `request_id` returns the same task; give each new task a new ID.
 
 For automatic profile selection on new local tasks, see [off-peak routing](docs/getting-started.md#off-peak-routing).
 
